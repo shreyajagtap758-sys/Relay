@@ -420,3 +420,177 @@ worker A -> job#101 -> lease: 30 sec -> after 25 sec -> heartbeat: lease extend(
 ```
 
 ### (there are still some edge cases that cant guarantee job lost recovery in this architecture)
+
+## File Descriptors :
+- fd is a number/handle by os that represent any open resource.
+- when relay opens connection with postgres/redis, os makes fd for that connection.
+- relay -> postgres connection : fd 21, redis socket : fd 22, log/file : fd 23..
+- fd is like an access card for resources connections.
+- fd is limited : a process cant use unlimited resources(fd).
+- also number of workers and pool size (connection limit) matters, f relay as 20 workers a pool size for each is 20 = so 20x20 = 400 connections open +   fd consumption.
+
+- so scaling doesn't mean : more workers or more connections per worker.
+- connection lifecycle management is important, else fd leak, relay failures.
+```text
+flow : DB connection -> TCP socket -> FD
+```
+
+## TCP SOCKET :
+- when sQlalchemy needs connection with PostgreSQL:
+- relay : make connection with PostgreSQL -> os creates socket -> socket gets FD; eg: fd 21 -> now TCP connection establish(makes actual connection b/w them) -> now relay can send sQl to postgres DB and PostgreSQL can send response -> when connection closes: socket/FD releases.
+```text
+- python - sQlalchemy - TCP Socket - FD - OS - Network - PostgreSQL.
+```
+```text
+SOCKET: communication point
+TCP: rules that transfer data reliably.
+OS gives FD to relay to access the socket.
+```
+
+### CONNECTION POOL INTERNALS:
+-> without connection pool : job -> new tcp connection each time -> postgres -> connection close.
+- this is expensive to create 1000 connections create/close.
+
+- each time to create connection : socket create - TCP connection establish - resource connection.
+
+- keep some connections ready and reuse it :
+```text
+connection pool : C1, C2, C3 -> PostgreSQL.
+
+so if relay needs db work - job - pool connection - got c1 - Query run - return connection pool.
+
+if pool_size = 4, 4 jobs has all connections, then incoming job will wait till one connection gets free.
+
+-> many jobs -> limited conn pool -> db.
+```
+
+### POOL EXHAUSTION:
+- pool_size = 3 reusable connections.
+- 3 jobs took 3 connections.
+- now what if 97 jobs are waiting = pool exhaustion.
+- this seems relay/postgres/network is slow but in real connection is not available.
+```text
+- if process takes much time/stuck - connection doesn't return -> pool fills - exhaustion - new job wait/fail.
+```
+### POOL CONFIGURATION :
+- *increasing pool size != better*.
+- 100 relay workers x pool_size = 50 = 5000 DB connections = PostgreSQL cant handle them.
+
+#### 1. pool size :
+how many reusable connections to put in the pool.
+
+#### 2. max overflow :
+if heavy traffic, then extra temporary connection allowed.
+eg: poolsize = 5, max_overflow = 3, heavy traffic : 5 + 3 = 8 max connections.
+
+#### 3. pool_timeout :
+max time to wait if connection is not free. eg: pool_timeout = 5,
+-job - pool - no conn - 5 sec wait - timeout error.
+
+#### 4. pool_recycle :
+using same connection for longer time can mean the connection is broken, so set how much a connection can get old. replaces old connections.
+
+
+### FAST FAILURE :
+- in pool_timeout : wait x seconds, got conn? yes : continue | no : error.
+
+instead blocking 30 sec and waiting more process, let say pool_timeout = 1 :
+```text
+- 100 jobs - 1 sec wait - no conn - fail/retry mechanism(fast failure).
+```
+fast failure doesn't make system healthy but prevents unnecessary wait for unavailable resource.
+
+- this doesn't mean everytime pool_timeout = 1, in default if conn takes 2-3 sec, 1 sec wait makes unnecessary failures.
+```text
+- so this can be decided seeing matrics : pool utilization? pool timeout errors? etc
+- if 99% request, connection takes 100ms, then pool_timeout = 1
+- if normally 2 sec conn time occasionally 5 sec, then put timeout=30 is okay.
+```
+
+
+### CONNECTION LEAKS :
+- when process took connection, but didnt return properly.
+```text
+- eg : pool -> C1,C2,C3,C4,C5
+     : job -> C1 -> (bug)didnt return to pool (conn leak)
+```
+- now pool has 4 conn only, if bug repeats -> empty pool : no conn.
+
+#### "SILENT KILLER" : this conn leak happened at 1 conn leak, then gradually increased later - pool exhausted.
+
+this makes postgres/relay slow in reality connections were lost.
+
+##### GROUND TRUTH : for this postgresQl has built in view - "pg_stat_activity" where we can see how many conn, how many conn active, Query, whos idle, time Query/conn running.
+
+## common code mistakes - make conn leaks :
+```text
+1. conn = pool.acQuire()
+   await conn.execute(..)
+   // didnt do : conn.release()
+
+2. conn = pool.acQuire()
+   await conn.execute("..") // exeception
+   conn.release() // before release
+
+3. conn.pool.aQuire()
+   if something_wrong: return
+   // conn dont return !
+   conn.release()
+
+4. conn = await acQuire()
+   await long_operation()
+   await release()
+// acQuire() - long operation - task cancelled - release skipped = conn leak.
+```
+## Bad pattern:
+```text
+DB connection acquire
+ ↓
+DB query
+ ↓
+OpenAI API call — 20 sec
+ ↓
+some processing
+ ↓
+DB update
+ ↓
+release
+```
+- unnecessary conn hold for too long.
+
+## Better conceptual flow:
+```text
+DB connection
+ ↓
+DB work
+ ↓
+release
+
+OpenAI call
+ ↓
+DB connection
+ ↓
+DB work
+ ↓
+release
+```
+
+## REAL INCIDENT : 
+- 100 jobs -> conn pool = 10 -> 10 conn busy -> 90 job waiting -> db timeout.
+
+- db slow/issue - wrong
+- application couldn't take db conn
+
+### so there must be some of these reason when application/db feels slow :
+```text
+Slow query
+OR
+Pool too small
+OR
+Connections leaked
+OR
+Connections unnecessarily held
+OR
+DB genuinely overloaded
+```
+### so we trust truth : application pool matrics + pg_stat_activity + query latency + root cause.
