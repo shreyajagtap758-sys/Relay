@@ -594,3 +594,208 @@ OR
 DB genuinely overloaded
 ```
 ### so we trust truth : application pool matrics + pg_stat_activity + query latency + root cause.
+```text 
+Whichever is smallest breaks first. This matters for Relay later: if I run 10 workers each with pool_size=20, that is 200 connections against a max_connections of 100. The pool would think everything is fine, and Postgres would refuse new connections with a completely different error: FATAL: sorry, too many clients already. Different layer, different error, different fix. So capacity planning means keeping workers × pool_size below max_connections.
+```
+
+---
+
+## TCP DEEP DOWN:
+### TCP 3-WAY HANDSHAKE:
+- a PostgreSQL conn is basically TCP conn.
+- "await engine.connect()" -> establish tcp conn to PostgreSQL.
+- tcp establishes an agreement (confirmation) before application data starts flowing.
+- as tcp is two-way, it needs to take agreement from both sides.
+```text 
+- relay          postgresQl
+   |       SYN  ->       |
+
+   |   <-  SYN+ACK       |
+
+   |       ACK   ->      |
+
+       Connection Ready
+```
+-> SYN : "i want to establish TCP conn"
+
+-> SYN-ACK : "i received reQ, i am willing to establish the conn"
+
+-> ACK : "received response"
+
+- NOW tcp considers the conn established.
+
+- db conn is not free, and without pooling , every job does :
+```text
+create TCP CONN, 3 way handshake, talk to postgres, finish job, close conn.
+```
+-repreatedly paying conn-establish cost = expensive.
+- so, as conn pooling has multiple conn open and can be reused, tcp handshake only happens when conn established, and every job uses it.
+
+### 1 RTT(round trip time):
+- how long it takes for a message to travel from relay -> postgres and response to come back.
+
+- eg = relaye to postgres = 10ms, postgres to relay = 10ms => RRT = 20ms.
+
+- a system creating 100 connections would take much RTT(under load), so thats why creating new tcp establish, new postgres conn setup etc would cost much, instead use pooling for every reQuest.
+
+-> so, if pool_size = 2, only 2 conn exist in cool and 10 reQ, only 2 job work and 8 waits, then why not simply create more connections? -> creating conn itself has cost.
+```text 
+too few conn
+-> reQuests wait
+
+too many conn
+-> conn establish, db, os/network resources increase.
+```
+#### "the more != the better"
+- this was when tcp establishes the connection, what about when closing it?
+
+### TCP CONN TEARDOWN:
+- conn is not just "closed/deleted" after the work is over.
+- when conn is closed, its 4-step teardown :
+```text 
+RELAY          POSTGRESQL
+  |      FIN ->      | "no more data sending"
+
+  |      <- ACK      | "got the message"
+
+
+  |       <- FIN     | "postgres is also done, no data sending"
+
+  |        ACK ->    | "got it"
+
+   CONN GRACEFULLY CLOSED
+```
+
+### TIME-WAIT:
+- after conn close, tcp immediately dont forget everything, instead it stays into time-wait state temporarily.
+```text 
+- ACTIVE CONN - FIN/ACK - CONN CLOSED - TIME-WAIT~60 sec - wait - FULLY GONE.
+```
+- ensures that any delayed or stray packets from a closed connection safely expire in the network.
+
+### WHY NEED TIME-WAIT?
+- suppose a conn is established and relay sent data, but network delayed that packet(data), meanwhile conn got closed. 
+- now the old/delayed packet can show up and interfere a newly opened connection sharing exact same source and address pair. 
+- without handling this : if new conn has same ip address and port, it may use these old packets, causing data corruption and application-level error.
+
+### PREVENTATION:
+- so old connections are not removed immediately, instead its identity stays in time-wait so no conn with same resource/port/identity is created, 
+- so old delayed packets gets disappeared from network, and new conn flow is safe(safe reuse).
+
+#### this is network correctness/safety mechanism.
+
+
+### EPHEMERAL PORT : when relay makes tcp conn with postgres, relay side gets temporary source port(ephemeral port) by os.
+
+- if pool dont exist : 100 req, new tcp connections, close, 100 time-wait.
+- so pool is essential.
+
+- if 10 req and pool_size = 100 for future traffic then it costs much more : 100 tcp conn, 100 sockets, 100 FD, postgres resources.
+
+- as pool keeps connections alive for reuse, TCP conn is not closed.
+- these connections are not alive forever : it can be closed when : application shutdown, pool disposal, conn invalidation, database/network failures.
+
+#### FIX: use conn pooling, no time-wait.
+```text
+so normal conn flow: job - use existing conn - query - return to pool.
+
+when conn close: pool shutdown/conn invalide - TCP teardown - TIME-WAIT - temporary network-resource occupancy etc
+```
+#### so conn management affects : application, TCP, os resources/sockets/FD, network, postgres
+
+
+### TCP RETRANSMISSION:
+- if packet sent by relay gets lost in the network:
+```text
+relay : packet sent, wait for ack
+postgres : no data received, no ack
+```
+- relay didn't get expected response/ACK back from postgres
+
+#### TCP dont immediately starts packet resend, it wait as network/packet delayed, so tcp uses a timer : RTO(RETRANSMISSION TIMEOUT).
+
+- RTO = 200 ms. so relay sends data - wait 200 ms - no ACK - RETRANSMIT.
+
+-> what if second packet also gets lost : retry immediately, retry immediately, retry... packet resending makes more congestion instead solving.
+
+- this sequence needs *Exponential backoff* (attempt 1 : wait 200ms - lost, attempt 2 : wait 400ms - lost, attempt 3 : wait 800ms - lost...)
+
+- if network packet temporarily lost/delayed # TCP INTERNALLY HANDLES THIS(not application) and wait/retramists if needed.
+
+-> BUT, when network completely dead : retry, retry, retry... timeout
+- now application has "no response", so application-level timeouts are important too.
+```text
+- TCP RETRY : packet retransmit/backoff(packet lost : wait 200ms, 400, 800...)
+- APPLICATION RETRY : try:
+                  await db.execute(...)
+                      except:
+                  await db.execute(...), backoff(job failed : wait 1s, retry job, wait 2s, retry...)
+```
+
+### RETRIES CAREFULLY DESIGN:
+```text
+when relay -> PostgreSQL
+"update job set status='done'" ->
+PostgreSQL executes it ->
+response gets lost ->
+relay sees timeout
+```
+- relay thinks operation failed while database has operation succeeded, relay cant blindly retry job(duplicate side effect), so retry must be carefully designed.
+
+### responsibilities:
+```text
+TCP : make communication reliable, packet lost - retransmission.
+
+CONNECTION POOL : manage/reuse connection, conn invalid - pool must discard/replace it.
+```
+
+-> lets say packet sent at t=0s
+
+-> now its t=1s
+possible:
+- response late, traveling network
+- packet lost
+- PostgreSQL slow/dead
+- network path broken
+
+-> application only says : no response yet
+
+### so we need read timeout:
+- eg : read timeout = 30 sec
+- 0s -> reQ sent -> wait -> 10s -> wait -> ..30s -> timeout.
+
+- now application makes decision : response time limit cross. this cant identify the actual cause.
+
+### timeout != operation definitely failed.
+
+```text
+Situation        	       Actual reality	                      Application sees
+ ------                          --------                               ----------------
+Slow network	           packets eventually arrive                  	response late
+Temporary packet loss        	TCP retries	                               delay
+Slow PostgreSQL              	DB takes time	                        response late
+Dead network	              packets never arrive	                     no response
+Dead PostgreSQL                  no response	                         no response
+```
+
+-> when slow : read timeout decides how much to wait.
+- timeout too long : system waits more
+- timeout too short: slow operations gets killed.
+
+```text
+Relay
+  │
+  │ ① Connect timeout
+  ↓
+PostgreSQL
+  │
+  │ ② Read timeout
+  ↓
+Relay
+```
+#### Connect timeout(postgres unreachable/wrong host/network route broken) : MAX WAIT TO ESTABLISH TCP CONNECTION. if 5-10 sec and conn didn't establish : ConnectTimeout. this should be kept short.
+
+#### Read timeout(query waiting for lock/db overloaded/query expensive) : MAX WAIT TO RECEIVE RESPONSE/DATA TO RELAY. when connection and query is sent but response is taking time. this should be kept longer.
+
+---
+
