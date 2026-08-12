@@ -799,3 +799,218 @@ Relay
 
 ---
 
+## TRANSACTION:
+```text
+Client -> API -> Postgres -> jobs table(job_id, status) -> worker.
+
+worker's work : find job, claim job, status update = running, work, status=complete.
+```
+#### transaction : database operation logical unit where database works in a controlled operation.
+```text
+BEGIN -> DATABASE OPERATION -> COMMIT
+
+BEGIN -> status=running -> something fails -> ROLLBACK -> status=queue
+```
+
+### CONCURRENT TRANSACTION : 
+- job 101 = queue
+
+-> worker A sees job 101 is queue.
+-> worker B sees same job queue.
+
+- both BEGIN -> read job 101 -> take it
+
+- we need to handle concurrency and race conditions even though transaction exist.
+
+### TYPE OF PROBLEMS :
+
+### assume :
+```text
+jobs table
+----------
+id    status
+101   queue
+102   queue
+```
+
+### DIRTY READ (read uncommitted data of other transaction) :
+- worker A BEGIN -> update jobs, set status = 'running', where id = 101;
+
+- worker A didn't commit anything yet.
+
+- worker B sees status = running for job 101.
+
+-> now worker A got problem -> rollback, now job 101 = queue.
+- while worker B saw status 'running'.
+
+-thats dirty read (reading uncommitted changes)
+
+### NON-REPEATABLE READ (different outputs in the same transaction) :
+- worker A begin(transaction), select status from jobs where id = 101; 
+- it shows = queue(first read).
+
+-> meanwhile B : update jobs, set status = 'running' where id = 101, commit;
+
+- now in same transaction of worker A now status shows = 'running'(second read), while it showed 'queue' before in the same transaction.
+
+### PHANTOM READ (different rows(new/deleted) appear in same transaction) :
+
+-> lets say job 101 = queue and job 102 = running.
+
+- worker A -> BEGIN, select * from jobs where status = 'queue'.
+- worker A gets job 101.
+
+-> while worker B has job 102 which is running, it inserts a row : insert into jobs(id, status) values (103, 'queue'), COMMIT.
+
+- in same transaction of worker A, now if it executes same query status = 'queue' -> this gives 101, 103, while it showed only 101 before.
+
+### WRITE SKEW :
+-> IMAGINE relay has business rule : at least one worker must remain available.
+```text
+database : workerA = available, workerB = available.
+```
+- now transaction A reads both workerA AND B available, so it occupies workerA
+- simultaneously transaction B reads both available and occupies worker
+```text
+now database : workerA = UNAVAILABLE, worker = UNAVAILABLE.
+```
+### This is write skew.
+
+## ISOLATION (four levels):
+### how much one transaction has visibility of activity of another concurrent transaction?
+
+### READ UNCOMMITTED :
+-> this is the weakest isolation property, when one transaction can read another transaction's uncommitted changes. how it works:
+
+- worker A transaction -> update row 1 (not committed)
+
+- worker B transaction -> reads updated row 1(read uncommitted)
+
+#### RISK : dirty read, non-repeatable, phantom, write skew problems.
+
+
+### READ COMMITTED : 
+-> this is default isolation level for postgres.
+- dont read uncommitted changes of another transactions, only read the committed data.
+
+#### RISK : non-repeatable, phantom, write skew problems.
+
+
+### REPEATABLE READ :
+-  if a transaction reads a row once, it will see the exact same values if it reads that row again later in the same transaction. Even if other concurrent transactions modify and commit changes to that row in the meantime, those changes remain completely invisible to the current transaction.
+-> prevents data from changing mid-transaction by taking a snapshot (at the transaction beginning) of data or holding locks on read rows.
+
+#### RISK : write skew problems
+
+
+### SERIALIZABLE :
+-> this is the strongest isolation level with no dirty read, non-repeatable, phantom, write skew problems.
+-> completely isolates transactions from each other, even though they work simultaneously. done by database itself.
+
+- transactions a and b run concurrently, unblocked. A finishes work and COMMIT. B also calls COMMIT, database identifies transaction B's write overlaps with transaction A read, so it aborts transaction B (serialization failure error), so application must catch this error and must RETRY.
+```text
+B
+ ↓
+SerializationError
+ ↓
+ROLLBACK
+ ↓
+WAIT briefly
+ ↓
+retry
+ ↓
+read latest data
+ ↓
+make decision again
+```
+### "concurrent transaction final result should be safe"
+
+### trade offs : 
+- transactions frequently wait for others to finish : blocking and high latency.
+- transaction failures/deadlocks/must have retry mechanism.
+
+```text
+Level                  	Dirty Read        	Non-Repeatable     Read	Phantom     	Write Skew
+READ UNCOMMITTED	       ✅	           ✅	            ✅                  ✅
+READ COMMITTED	               ❌                  ✅	            ✅                 	✅
+REPEATABLE READ	               ❌	            ❌	            ❌                 	✅
+SERIALIZABLE	               ❌                  ❌	            ❌	                ❌
+```
+
+### MVCC (MULTI-VERSION CONCURRENCY CONTROL) :
+- if database locks each rows for workers, many workers waits(unnecessarily blocking) which can congest and take longer time.
+
+-> instead locking normal reads unnecessarily, maintain versions of the data and show the visible version to each transaction according to its snapshot(multi-version).
+
+- suppose job 101 status = queue.
+- worker A starts transaction -> snapshot -> updates status = running.
+- now job 101 --> version1 : queue, version2 : running.
+- worker B can still read version 1 = queue in its snapshot.
+- so worker A sees the same snapshot it was working on, no other updates from other transactions.
+
+-> both read and write operations are unblocking.
+
+### WHAT MVCC COSTS? :
+- postgres doesn't immediately remove old row-versions until active transaction needs it.
+#### BLOAT : 
+- creating multiple updated old versions and it dont die/clean then higher database storage, high table bloat, less performance.
+- this can be solved by 'VACUUM' in postgres.
+
+#### MVCC CLAIMS 'CONCURRENT TRANSACTION GETS WHAT VERSION OF DATA', IT DOES NOT CLAIM 'IF TWO WORKERS WANTS TO CLAIM THE SAME JOB, WHICH ONE WILL GET IT'.
+
+#### MVCC ≠ "only one worker can modify this row"
+
+- thats why we need explicit locking :
+
+-> IF TWO WORKERS WANTS TO CLAIM THE SAME JOB :
+
+### LOST UPDATE (change silently overwritten) :
+```text
+- worker A : x + y
+ UPDATE attempt = 1
+
+- worker B : x + y (same, concurrently)
+ UPDATE attempt = 1
+
+FINAL ATTEMPTS = 1
+EXPECTED = 2
+```
+-> error didn't show up, but first transaction update silently got overwritten by second transaction - silently wrong data while database shows success.
+
+
+### FOR UPDATE - LOCKING :
+- to avoid duplicate work/lost update/business-rule violation(write skew), we use temporary lock row.
+
+- worker A takes job 101 -> temporary lock till transaction completion, no other worker can update/lock this row. other transaction waits till lock release.
+```text
+so worker 1 has job 101
+   worker 2 waits for lock release
+   worker 3 waits...
+```
+-> BUT THIS CAN BE INEFFICIENT BECAUSE WORKER 1,2,3,4.. ALL WANTS JOB 101 WHILE JOB 102,103.. ARE FREE.
+
+### FOR UPDATE SKIP LOCK :
+-> finds Queue jobs that are free and lock them while skipping jobs that are already locked by other transactions.
+```text
+so worker 1 has job 101
+   worker 2 has job 102 (skip 101)
+   worker 3 has job 103 (skip 101, 102)
+```
+```text
+BEGIN
+ ↓
+claim job
+ ↓
+mark running
+ ↓
+COMMIT
+ ↓
+lock released
+ ↓
+process job
+```
+
+#### SO NOW, even if worker A skip locked and worker dead mid-way, lease-reaper-heartbeat handles this.
+
+---
+
