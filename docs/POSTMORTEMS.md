@@ -1014,3 +1014,143 @@ process job
 
 ---
 
+# ingestion API setup (post/get)
+
+```text
+HTTP STATUS CODES :
+
+       Client                        Relay API Server                  Postgres DB
+         |                                  |                               |
+         | --- POST /jobs (Create Job) ---> |                               |
+         |                                  | --- INSERT INTO jobs ... ---> |
+         |                                  | <--- COMMIT Confirmed ------- |
+         | <--- 202 Accepted -------------- |                               |
+ (Job queued, execution deferred)
+```
+
+## 200 OK :
+-> REQUEST SUCCESSFULLY processed, and requested operation is fully finished with sync execution.
+
+- use for synchronous operations. eg : GET/users/42 or POST/calcie/add_operation. 
+
+## CONTRACT VIOLATION :
+- for the reQuest, a job does this : 
+```text
+Client
+  |
+  | POST /jobs
+  ↓
+Relay API
+  |
+  | validate
+  | create job
+  | enqueue job
+  ↓
+Queue
+  |
+  | then
+  ↓
+Worker
+  |
+  | execute
+  ↓
+Email sent
+```
+
+- API only did job accept + enqueue, actual execution is done by worker.
+
+-> now 200 can be problematic :
+```text
+- server actual state : request received - validated - job created - job enqueued - waiting for worker
+
+- while client gets : request received - job executed(assume) - DONE.
+```
+- this is mismatch, in real the worker never did the job while client sees 200 ok(confirmed/successfully processed job).
+
+-> Eg : POST/jobs : client request(send email)
+- backend : API - create email job - push to redis - return response(200).
+- in redis : job_123, status=queued.
+- worker didn't touch the job yet, while API returned 200 ok.
+- client may assume - email successfully sent. (not sent yet)
+- worker may fail later, email never sent, but claimed 200 ok.
+
+### SO WHAT FITS HERE? 
+- 202 ACCEPTED(req accepted for processing, but processing isn't complete).
+```text
+Client
+  ↓
+POST /jobs
+  ↓
+Relay accepts request
+  ↓
+Job created
+  ↓
+Job queued
+  ↓
+202 Accepted
+```
+- request accepted - yes
+- job completed - NO
+
+
+## 201 CREATED :
+- client : POST/users/{id} (create user acct)
+```text
+request - validate user data - INSERT INTO users - user created - 201 Created.
+```
+- 201 Created -> New resource exists.
+- this doesn't mean - job execution completed.(job status = pending still).
+
+
+## 202 ACCEPTED :
+- use for async tasks.
+- Accepted job is never lost : this ensures job is safe even though execution is not started yet, job_id status poll is given, track you job status.
+
+
+# 'ACCEPTED' PROBLEM :
+## MEMORY FIRST, DB LATER :
+- suppose relay receives job from client :
+```text
+client - FastAPI - memory Queue - 202 ACCEPTED - later-> PostgreSQL
+```
+-> problem : client got 202, job is stored in RAM - API crash - RAM CLEAR - job lost.
+```text
+client - fastapi - memeory Queue - 202 accepted(client assumed request accepted done, now job wont lose) - before entering db, API CRASH - job lost
+```
+- while client got wrong information.
+- RULE #1 : ACCEPTED JOB NEVER LOSE - broken.
+
+-> MEMORY - 202 - DB INSERT
+
+DB COMMIT FIRST :
+```text
+client - FASTAPI - POSTGRESQL INSERT - commit - 202 accepted - worker later picks this job.
+```
+- client got 202 when job is safely persisted in DB (no job lost) even when API crash.
+
+-> DB - COMMIT - 202
+
+### DB COMMIT FIRST IS SAFER , BUT LATENCY DIFFERENCE IS HIGH :
+
+```text
+Metric	Memory-First (Option A)	DB-Commit-First (Option B)
+Enqueue Latency	~2-5 ms	~20-50 ms
+Crash Safety	❌ Data Loss Risk	✅ Zero Data Loss
+Durability Level	Volatile (In-Memory)	Non-Volatile (ACID Committed)
+Relay Contract Compliance	❌ Violates Rule #1	✅ Strictly Satisfies Rule #1
+```
+
+### SO - relay chooses persist safely, then accept(DB FIRST COMMIT) - core is to ensure durability, not minimize enqueue latency only(durability costs latency).
+
+```text
+Verification Tests — Final Summary :
+
+Test                              	Kya test kiya?	                                                    Success ka meaning
+1. POST /jobs — Valid Enqueue.	    Valid job request accept + DB mein save ho rahi hai ya nahi.    	Job successfully create/persist hui
+2. GET /jobs/{id} — Status Query.	Existing job ko ID se retrieve kar sakte hain ya nahi.	            Job lookup/status endpoint working hai
+3. GET /jobs/{invalid-id}—Not Found.	Non-existing job ko correctly handle kar raha hai ya nahi.  	404 error handling correct hai; API fake data return nahi karti
+4. POST /jobs — Invalid Body.    	Input validation properly reject kar rahi hai ya nahi.             	Pydantic validation working hai; invalid request DB tak nahi jaati
+5. Durability / Crash Test       	API restart ke baad committed job survive karti hai ya nahi      	Data API process ki memory mein nahi, PostgreSQL mein durably persisted hai
+```
+
+---

@@ -170,3 +170,77 @@ Two concrete carry-forwards:
 - **Long-lived `idle in transaction` is a monitorable signal**, and the query to detect it is now known. Worth adding to whatever Week 4 observability exists, because its symptom (unrelated things hanging with no errors anywhere) is otherwise close to undiagnosable.
 
 **Open:** the abandoned sessions survived at least one `docker compose` uptime period ("Up 2 days" while the container was created 5 days ago), which suggests the container restarted while the client sessions... could not have survived that. So the exact age of those transactions is **not established** — they may be from a later Day 5 re-run rather than the original. The states and PID roles match the Day 5 log exactly, but **"five days" is an upper bound inferred from container age, not a measured transaction age.** `xact_start` from `pg_stat_activity` would have settled it and was not captured before the sessions were terminated. Recording the uncertainty rather than the round number.
+
+---
+
+## P-07 — `202 Accepted` promises durability, but it cannot promise that the caller ever learns it
+
+**Status: the window is structural, not measured.** No duplicate was produced today. What *was* measured is the ordering that creates the window: `INSERT ... RETURNING` → `COMMIT` → *then* the response is serialised and written. Everything after that `COMMIT` is outside the transaction's protection.
+
+**The problem:** `POST /jobs` commits the row and then returns `202` with a `job_id`. If the response is lost after the commit, the client has no way to distinguish "the job was accepted" from "the request never landed". It retries. Relay accepts the retry as a new, entirely legitimate job. Two rows now exist, both correct-looking, with nothing linking them. If the job type is `charge_credit_card`, the card is charged twice — and both executions are, from Relay's point of view, exactly what it was asked to do.
+
+**The framing that matters, and it is easy to get wrong:** the client does **not** conclude that the request failed to arrive. `P-01` established the distinction with a measurement: *connect timeout = pahuncha nahi* (safe to retry), *read timeout = **pata nahi***. After a read timeout the information simply does not exist on the client's side. So the retry is not a mistake made on bad information — it is a **deliberate choice to risk duplicate work in exchange for a chance at completion**, made in the absence of information.
+
+That difference decides whether Week 3 is necessary. If the client merely had *wrong* information, better error reporting would fix it. Because the client has *no* information, nothing on the sending side can fix it, and safety has to come from the receiving side being idempotent.
+
+**The gap is not the network — it is "after `COMMIT`".** This is the part that is easy to miss, and it showed up concretely during Din 2's code review. An earlier version of `create_job` called `await db.refresh(job)` after `commit()`. Had that `refresh` failed (pool timeout, connection drop), the client would have received a `500` while the row sat committed in the database. Same duplicate-inducing shape, with no network involved at all. Anything between `COMMIT` and the client receiving bytes belongs to this problem: response serialisation, the socket write, the process staying alive, the client staying alive.
+
+So the window cannot be closed by making the post-commit path shorter. Removing `refresh()` **narrowed** it. Nothing **closes** it.
+
+**Why this is interesting:** it is the first place in Relay where the contract is provably incomplete rather than merely unimplemented. Contract #1 says *an accepted job is never lost*. Din 2 measured that this holds — rows survived `SIGKILL` of the database. But the contract says nothing about a job the client does not know was accepted, and that silence is not an oversight in the wording; it is a real gap in what any amount of durability can buy. Durability protects the row. It does not protect the *acknowledgement*.
+
+**Why it matters for Relay:** this is Week 3's problem statement, and `D-03` already decided the shape of the answer. The tempting fix — let the client supply the primary key, so a retry collides — was rejected there on the grounds that **a primary key and an idempotency key are different concerns**: a PK has no time window, and dedup should be opt-in rather than imposed by storage identity. So the answer is a separate nullable `idempotency_key text UNIQUE` supplied by the caller, and `id` stays internal and DB-owned.
+
+**Open — and this is genuinely undecided:**
+- **Who mints the key: caller or Relay?** A caller-supplied key is honest about intent but requires the caller to be disciplined. A payload-derived hash needs no cooperation, but then two *legitimately* identical jobs collapse into one, which `D-03` explicitly listed as a cost.
+- **If it is a payload hash, `jsonb` already helps.** `D-05` chose `jsonb` partly for this: normalisation means `{"a":1,"b":2}` and `{"b":2,"a":1}` hash identically. Under `json` they would not.
+- **What is the dedup window?** `D-03` noted a PK has none. A separate column needs an explicit answer: minutes, hours, forever? And what happens to a replay that arrives after the window closes?
+- **What should a duplicate request receive?** `202` with the *original* `job_id` (idempotent, pretends nothing happened) or `409 Conflict` (honest, but now the client must handle a second code path)? These are different contracts, not different implementations.
+
+---
+
+## P-08 — The payload limit is enforced by a header the sender controls
+
+**Status: MEASURED**, both before and after the fix, on Din 2.
+
+**The problem:** `POST /jobs` bounds request size by reading `Content-Length` and rejecting anything over 266,240 bytes with `413`. The check is cheap and it works — for clients that send the header. `Content-Length` is absent under `Transfer-Encoding: chunked`, and optional in HTTP/2. A sender that wants to push a large body past the limit does not need to defeat anything; it just omits the header, and `if content_length:` is skipped.
+
+So the limit's threat model is **an honest client that made a mistake**, not an adversary. It protects against accidents. It does not protect against attacks, and the difference is invisible from reading the code.
+
+**Two measurements, and the first one was a real bug.**
+
+Initially the check lived inside the handler, after the `job_in: JobCreate` parameter. FastAPI resolves body parameters *before* the function body runs, so the check ran after the body had been read and parsed. Three requests, each ~306 KB, distinguished it:
+
+| Request | Result |
+|---|---|
+| oversized, valid JSON | `413` |
+| oversized, `type: ""` | `422` `string_too_short` |
+| oversized, malformed JSON | `422` `json_invalid`, `loc: ["body", 306274]` |
+
+The third line is the evidence: the JSON parser reached **character offset 306,274**, so the whole body was buffered and parse was attempted before any size check. Two consequences — the memory/CPU protection the limit was supposed to provide did not exist, and the status code for an oversized body depended on whether the body happened to be valid.
+
+Moving the check into HTTP middleware fixed it. Same three requests:
+
+| Request | Result |
+|---|---|
+| oversized, valid JSON | `413` |
+| oversized, `type: ""` | **`413`** |
+| oversized, malformed JSON | **`413`**, and the `loc` offset is gone |
+
+The disappearance of the offset is the confirmation: no parse was attempted. Size now decides the outcome, independent of content.
+
+**Why this is interesting:** it is `P-04` arriving from a new direction. That entry's claim was that *a constraint enforcing part of an invariant is more dangerous than no constraint*, because the confidence is real and the protection is not. Here the invariant is "no request body exceeds 260 KB", and the enforcement covers exactly the subset of senders who volunteer their size. The code reads like a limit. `413` responses in testing confirm it behaves like a limit. It is a limit only by the sender's cooperation.
+
+There is a second, sharper lesson specific to this bug, and it generalises past HTTP: **a check placed after the work it was meant to avoid is not a weak check, it is a decorative one.** Reading the code, the `413` looked like protection. It ran reliably. It returned the right status. It simply ran after 306 KB had already been read and parsed — which was the entire thing it existed to prevent. Week 0's Day 1 measurement is the reason this matters here rather than being a style note: a large `json.loads` is CPU-bound synchronous work inside an async event loop, and `6.04s vs 2.04s` measured what that does — one request stalls every other request in the process. So the cost of a missing ingress bound is not "this request is slow", it is "the whole API is unavailable while it happens", available to an attacker for the price of one connection.
+
+**Why it matters for Relay — and why it is deliberately not fixed:**
+
+Closing it requires counting bytes as the stream arrives and aborting mid-body, which is ASGI-level work. That was written on Din 2, then deleted, because it is Week 4 hardening and it made a 60-line day unreadable. `D-04`'s own heuristic applies: *prefer the option that does not block you and tighten only once real pain appears.* There is no real pain — the only client today is the developer.
+
+What matters is that the gap is **recorded rather than believed away**. Two concrete carry-forwards:
+
+- **The eventual fix is also bounded, not absolute.** Stream counting aborts at *limit + one chunk*, because a chunk has to be received before it can be measured. So even the "real" fix has a stated overshoot, and that number should be written down when it lands rather than described as a limit.
+- **The DB is unbounded regardless.** `D-05` deliberately put the limit at the API layer, which means anything writing to `jobs` by another path — and Din 4 and Din 5 insert directly via `psql` — is not bounded at all. The limit constrains one entry point, not the column.
+
+**Open:** the honest-client framing suggests a different question that has not been asked yet. If the purpose is preventing accidental oversized payloads, is `413` even the right response, or should the API instead tell callers that large inputs belong in object storage with the payload carrying only a reference? That is a contract decision rather than a hardening one, and it would make the limit meaningful rather than merely enforced.
+
