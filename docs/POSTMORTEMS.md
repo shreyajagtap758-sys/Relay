@@ -1154,3 +1154,222 @@ Test                              	Kya test kiya?	                              
 ```
 
 ---
+
+# WORKER 3 STEP LIFECYCLE :
+```text
+CLAIM  -->  EXECUTE -->  MARK
+```
+
+## CLAIM : 
+- find oldest Queue job(pending), lock it so no other worker takes it, make status 'pending -> running' mark, and commit transaction.
+
+-> RULE : whole work must be in one atomic transaction.
+
+
+## EXECUTE :
+- execute business logic of job(eg: image resize, email send).
+
+-> RULE : while executing, NO database transaction should be opened.
+
+
+## MARK :
+- after execution finishes, save job's final outcome in database.
+
+-> successfully work done : 
+- status = 'succeeded'
+- else status = 'failed'
+
+-> RULE : this update must commit in a fresh, independent database transaction.
+
+
+## THREE CRITICAL CONCURRENCY TRAPS :
+
+### TRAP 1 :
+-> WHY CLAIM QUERY MUST BE IN "ONE" TRANSACTION ?
+
+- worker must "see" job and "claim" it in one db transaction, else 2 workers can 'see' same job and execute same.
+
+- problem : db has job 101 = pending
+- two workers : 1 and 2
+
+-> (two separate transactions) :
+```text
+transaction 1(only SELECT) :
+
+SELECT id
+FROM jobs
+WHERE status = 'pending'
+LIMIT 1;
+```
+- worker 1 and 2 does same query, and both gets job 101, then both :
+```text
+transaction 2(UPDATE) :
+
+Worker A:
+UPDATE jobs SET status = 'running' WHERE id = 101;
+
+Worker B:
+UPDATE jobs SET status = 'running' WHERE id = 101;
+```
+-> PROBLEM : 'UPDATE' statement didn't decide which worker's job it is.
+
+-> duplicate execution, LOST UPDATE.
+
+#### CORRECT APPROACH :
+-> start transaction :
+```text
+BEGIN;
+SELECT id
+FROM jobs
+WHERE status = 'pending'
+ORDER BY created_at ASC
+LIMIT 1
+FOR UPDATE;
+```
+-> so worker 1 got job 101, does FOR UPDATE : worker 1 is claiming this job, other worker wait for this row.
+
+```text
+Worker A
+   ↓
+SELECT ... FOR UPDATE
+   ↓
+Job 101 LOCKED 🔒
+```
+
+-> IMMEDIATELY in the same transaction :
+```text
+UPDATE jobs
+SET status = 'running'
+WHERE id = 101;
+COMMIT;
+```
+- now, job 101 - running, then lock - released.
+
+```text
+FLOW : 
+worker 1 took job (SELECT FOR UPDATE)
+
+worker 2 does same, but job 101 locked, so waits.
+
+worker 1 UPDATE STATUS = RUNNING
+COMMIT (lock released)
+
+worker 2 ready to take job as lock releases, but sees status = running, so doesn't execute it.(no duplication running)
+```
+
+- so when in two transaction (select COMMIT then UPDATE set running), two worker may do update the same job = running as lock is released in middle, so this must be in one transaction.
+
+
+### TRAP 2 :
+ -> CLAIM AND EXECUTE - WHY IN DIFFERENT TRANSACTIONS ?
+
+```text
+-> WRONG (Anti-Pattern):
+[ BEGIN -> SELECT FOR UPDATE -> UPDATE running ---- EXECUTE (2-10 sec sleep) ----> COMMIT ]
+  ^                                                 ^
+  |                                                 |
+  Tx Starts                                         Holding locks! DB connection busy!
+                                                    State = "idle in transaction"
+
+
+
+-> CORRECT:
+[ BEGIN -> SELECT FOR UPDATE -> UPDATE running -> COMMIT ] ---- [ EXECUTE (No Trans) ] ---- [ BEGIN -> UPDATE succeeded -> COMMIT ]
+```
+
+#### PROBLEM IF COMBINED :
+- PERSPECTIVE OF POSTGRES : worker opened transaction, did lock, now its doing nothing(idle in transaction). meanwhile its executing python code(business logic), for which postgres connection status becomes : idle in transaction.
+
+- job didn't release the lock even though its not working on that row, so no other process/worker can touch that row till lock release.
+
+- worker's db connections stays occupied in connection pool even though its not working on db, so other workers or API connections starves.
+
+- lock is released while worker is executing(job=running), but worker may die/crash in this state, now db doesn't know this and job stays 'running' forever, thats why we have : lease - reaper - heartbeat architecture.
+
+
+### TRAP 3 :
+ -> ORDER BY + LIMIT 1 + FOR UPDATE - SUBTLE INTERACTION :
+
+- THE QUERY:
+```text
+SELECT * FROM jobs 
+WHERE status = 'pending' 
+ORDER BY created_at ASC 
+LIMIT 1 
+FOR UPDATE;
+```
+
+---> subtlety(without SKIP LOCKED what happens?) :
+
+-> when multiple workers concurrently runs this query :
+- two workers scan table and finds same(oldest pending job 1).
+- worker 1 does FOR UPDATE lock on that job.
+- worker 2 does same query, postgres query planner first executes ORDER BY and LIMIT 1 and selects row 1, and tries taking lock on that row.
+- it sees row 1 is already locked by other worker, so worker 2 BLOCK(freezes).
+- even if queue had 100 other pending jobs, worker 2 is next available only for this job(waits till worker 1 commits).
+
+
+## SEPARATE PROCESS AND FAILURE DOMAINS :
+
+-> why worker is a completely separate process(relay/worker) :
+
+- In relay architecture, API and Worker are two different OS processes.
+
+```text
+[ OS Process 1: FastAPI API ]  <--- (Independent Failure Domain)
+         |
+    (Writes to DB)
+         |
+         v
+    [ Postgres ]
+         ^
+         |
+    (Reads from DB)
+         |
+[ OS Process 2: Worker Loop ]  <--- (Independent Failure Domain)
+```
+
+## FAILURE DOMAIN ISOLATION :
+- if a bad job does C-extension segfault or MEMORY LEAK(OOM) in payload worker, so only worker process dies. API process is alive to take/accept new jobs.
+- if API process crashes on traffic spike, worker process continues executing existing jobs in background.
+
+```text
+WORKER LOOP LIFECYCLE :
+
+         +---------------------------------------+
+         |                                       |
+         v                                       |
+[ Start Loop ] ---> [ Claim Next Job (Tx 1) ]    |
+                           |                     |
+                  Job mila?|                     |
+                 /         \                     |
+             (YES)         (NO)                  |
+              /               \                  |
+    [ Execute Handler ]   [ Sleep (Poll Interval)]
+            |                     |
+    [ Mark Status (Tx 2)]         |
+            |                     |
+            +---------------------+
+```
+
+- when job is not found and queue is empty, worker should not burn CPU(busy-looping). worker does : sleep(poll_interval), no worker available -> sleep.
+
+-> busy looping : worker continuously checking for available jobs. CPU high usage and unnecessary DB queries.
+
+---> TRADE-OFF for sleep/polling :
+- worker : sleep(2 sec)
+- just after sleep starts, job arrives.
+- after worker's 2 sec sleep, if executes job, job waited 2 sec extra.
+- job-start latency.
+
+> so sleep/polling costs latency.
+
+
+### pg_stat_activity state(transaction hygiene monitoring) :
+- state='active' : when worker is claiming or marking.
+- when worker in 2-sec sleep/polling : connection pool state : idle (transaction closed)
+- while execution if state = 'idle in transaction', then transaction is open and locks are holding(trap 2 failure).
+
+---
+
+
