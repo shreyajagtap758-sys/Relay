@@ -495,6 +495,18 @@ Loose payload validation is enforced at API level (verifying type string structu
 Problem: If the API validates every task type separately, it becomes tightly connected to the workers. Every new task type would require changes in the API.
 Decision: The API will only validate the basic structure: type must be a string and payload must be a JSON object. Task-specific validation will be handled by the worker.
 Result: The API stays generic and workers can be added or changed without modifying the API.
+
+
+Relay validates:
+✓ type exists
+✓ payload is valid JSON
+✓ payload size <= limit
+
+Handler validates:
+✓ send_email requires `to`
+✓ resize_image requires `image_id`
+✓ payment requires `amount`  
+etc.
 ```
 
 ### Entry 4: Heavy Payloads Limit

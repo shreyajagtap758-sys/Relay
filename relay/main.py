@@ -1,20 +1,26 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, text
+
 
 from relay.db import get_db
 from relay.models import Job
+from relay.middleware import limit_payload_size
 from relay.schema import JobCreateRequest, JobCreateResponse, JobStatusResponse
+
 
 app = FastAPI(title="Relay API")
 
+#register ingress middleware
+app.middleware("http")(limit_payload_size)
+#check size before doing anything
 
 @app.post(
     "/jobs",
     response_model=JobCreateResponse,
     status_code=status.HTTP_202_ACCEPTED # success response default : 202(accepted) not 200 (ok)
 )
-async def enqueue_job(
+async def create_job(
         request_data: JobCreateRequest,
         db: AsyncSession = Depends(get_db)
 ):
@@ -26,8 +32,6 @@ async def enqueue_job(
     db.add(new_job)
 
     try:
-        # Jab commit call hoga, Postgres RETURNING statement se auto-incremented ID fetch
-        # karke new_job object me map kar dega.
         await db.commit()
     except Exception as e:
         await db.rollback()
@@ -36,7 +40,6 @@ async def enqueue_job(
             detail="Failed to enqueue job securely."
         )
 
-    # new_job.id ab populated hai humare response ke liye
     return JobCreateResponse(
         job_id=new_job.id,
         status=new_job.status
