@@ -403,3 +403,191 @@ That reframes what `202` actually promised. It promised the *record* is safe, ne
 
 Second, smaller, and it follows from correction #12: the plan's checklist item *"over-limit payload → `413`"* passed against a limit that protected nothing. The checklist was satisfied and the mechanism was absent. So for Din 3, what is the equivalent trap — a check whose passing tells me nothing? The obvious candidate is *"`pg_stat_activity` shows no `idle in transaction`"*: with a single worker and a fast fake handler, that check passes whether or not I committed the claim before executing, because the window is too small to observe. Worth designing the verification so it can actually fail before trusting it.
 
+---
+
+## Day 3 — Worker loop: `claim → execute → mark` (2026-08-16)
+
+**Original goal (from the plan):** a separate worker process that claims one `pending` job in a single transaction (`FOR UPDATE`, no `SKIP LOCKED`), commits the claim, executes a fake handler, then marks the terminal status in a second guarded transaction. Failure path via a handler registry. Graceful shutdown with finish-current semantics. No lease, no reaper, no retry, no second worker.
+
+**Goal met?** Yes, for the build. `src/worker.py` does claim → execute → mark with the compare-and-set guard on **both** writes, and the emitted SQL confirms the claim is one transaction. C1–C5 were verified; C6 was run by me but its numbers were **not recorded by the reviewer** (see provenance).
+
+**Anything else learned?** Yes, two things that were not on the plan. The idle poll is **a transaction per poll**, not a bare `SELECT` — visible in the echo, and it is the raw material `D-01` was waiting for. And today's system turns out to be **at-most-once** on worker death, which is the inverse of the week's title (`P-09`).
+
+> **Provenance — read before trusting the numbers below.**
+>
+> I wrote every line of `src/worker.py` myself. I answered Part B from my own head first and ran C1–C6 myself; for some questions I could not answer, I resolved them from the KEY file after running the step, and a few concepts came via Gemini. **At my own request, no per-question score was computed for this day** — this is a deliberate deviation from the protocol's scoring rule, recorded here so the absence is not mistaken for a `0` or for a clean sheet.
+>
+> Every measurement below marked `[R]` was re-run by the reviewer on a clean bench, independently of my own run. **C6's exit code and elapsed times are mine and were not re-measured** — they are therefore listed as *not recorded* rather than given values.
+
+---
+
+### 📊 Measured / Observed
+
+Starting bench `[R]`: 14 rows, all terminal (11 `succeeded`, 3 `failed`), nothing in `running`, `attempts = 0` everywhere. The brief's stated 9 `pending` rows had already been consumed by my own Day 3 run, so the reviewer's arithmetic starts from 14, not from 9.
+
+**M1 — `EXPLAIN` for the claim query** `[R]`, on the live table:
+
+```
+Limit  (cost=1.16..1.17 rows=1 width=33)
+  ->  LockRows  (cost=1.16..1.17 rows=1 width=33)
+        ->  Sort  (cost=1.16..1.16 rows=1 width=33)
+              Sort Key: created_at
+              ->  Seq Scan on jobs  (cost=0.00..1.15 rows=1 width=33)
+                    Filter: (status = 'pending'::text)
+```
+
+`LockRows` sits **below** `Limit`. Execution order bottom-up: scan → sort → **lock** → `Limit` stops. So the row is locked *before* `Limit` has decided it has enough rows. `Seq Scan` at this size is correct and is not evidence about indexing — that stays `P-03`, Week 4.
+
+**M2 — C1, the claim is one transaction** `[R]`. From the worker's own SQL echo, verbatim shape:
+
+```
+BEGIN (implicit)
+SELECT jobs.id, jobs.type, jobs.payload FROM jobs
+  WHERE jobs.status = $1::VARCHAR ORDER BY jobs.created_at LIMIT $2::INTEGER FOR UPDATE
+UPDATE jobs SET status=$1::VARCHAR WHERE jobs.id = $2::BIGINT AND jobs.status = $3::VARCHAR
+  -- params: ('running', 16, 'pending')
+COMMIT
+```
+
+**Affected row counts, as numbers:** claim `rowcount=1`, mark `rowcount=1` (`('succeeded', 16, 'running')`). Both statements carry the guard. **K1 did not happen** — the compare-and-set survived into the emitted SQL, because the code uses an explicit Core `update()` rather than ORM attribute mutation. This was verified by reading the SQL, not by reading the code.
+
+**M3 — the idle poll is a transaction, not a query** `[R]`. Unplanned, and the most reusable number of the day. With no work available the echo repeats, once per interval:
+
+```
+BEGIN (implicit)
+SELECT ... FOR UPDATE   [cached since 8.305s ago] ('pending', 1)
+COMMIT
+```
+
+So at `POLL_INTERVAL_SECONDS = 2.0`, one idle worker costs **0.5 transactions/second, indefinitely**, each one a `Seq Scan` plus a `BEGIN`/`COMMIT` round trip. Two further observations from the same log: the statement is reported `cached`, so SQLAlchemy is reusing the prepared statement rather than re-planning; and the poll is read-only, so it writes no WAL. **This is `D-01`'s missing cost figure** — measured for one worker at one interval on this machine, not a general claim.
+
+**M4 — C2, the transition guard is load-bearing** `[R]`. Job 20, a `sleep` job. A server-side probe polled until the row went `running`, then applied interference inside the handler's window:
+
+```sql
+UPDATE jobs SET status='failed' WHERE id=20 AND status='running';   -- the other writer
+```
+
+Worker's response, verbatim:
+
+```
+UPDATE jobs SET status=$1::VARCHAR WHERE jobs.id = $2::BIGINT AND jobs.status = $3::VARCHAR
+  [cached since 186.8s ago] ('succeeded', 20, 'running')
+[worker-20168] Conflict on mark: Job 20 status was modified by another transaction (rowcount=0).
+COMMIT
+```
+
+Final status of job 20: **`failed`**. The guarded implementation got `rowcount=0`, logged the conflict, and did **not** overwrite the other writer's decision. An unguarded `WHERE id=20` would have returned `1` and silently converted it to `succeeded`. This is the check that Day 2's `413` lesson demanded: it can actually fail, and it was run against interference rather than against a happy path.
+
+**M5 — C3, the `running` state is observable through the API** `[R]`. Job 27, polled through `GET /jobs/{id}` at 200 ms intervals while the worker held it:
+
+```
+POST /jobs -> job_id=27, status=pending
+GET  /jobs/27 over time -> pending -> running -> succeeded
+```
+
+All three states visible externally, so contract point 5 (*"it can always say where a job is"*) is met for the happy path — not merely satisfied in `psql`. Note the sampling caveat: at a 2 s handler and 200 ms polling the window is wide; a faster handler would make `running` easy to miss, and missing it would not mean it never happened.
+
+**M6 — C4, failure path and unknown type** `[R]`. Enqueued in this order, deliberately failing job first:
+
+| id | `type` | Final status | Worker afterwards |
+|---|---|---|---|
+| 21 | `boom` | `failed` | kept polling |
+| 22 | `sleep` | `succeeded` | proves the loop survived the exception |
+| 23 | `does_not_exist` | `failed` | one mark, then back to polling |
+
+The unregistered type did **not** produce a hot loop: it is claimed, marked `failed` once, and never seen again. That is the direct consequence of the chosen option, and its cost is now recorded against `D-04`.
+
+**M7 — C5, the differential that establishes the check can fail** `[R]`. Run A used a throwaway probe (`labs/probe_din3_runA.py`, deliberately wrong, since deleted) which held the claim transaction open across a 12 s handler. Run B is `src/worker.py` unmodified. Both rows are real `pg_stat_activity` output:
+
+| | PID | `state` | `wait_event_type` / `wait_event` | `xact_start` | last `query` |
+|---|---|---|---|---|---|
+| **Run A** — transaction held open across the handler | 845 | **`idle in transaction`** | `Client` / `ClientRead` | present, age **`00:00:11.295`** | the claim `UPDATE` |
+| **Run B** — claim committed before executing | 751 | **`idle`** | `Client` / `ClientRead` | **`NULL`** | `COMMIT` |
+
+`wait_event` is **identical in both rows**, which is exactly why a check written on the wait event would prove nothing. The discriminators are `state` and `xact_start`. Run A is the same row shape as Day 1's PID 53 in `P-06` — reproduced deliberately, in my own worker, instead of by accident five days later.
+
+**M8 — day-close state** `[R]`:
+
+```
+failed | 6        running: 0 rows
+succeeded | 21    jobs with attempts <> 0: 0
+```
+
+Arithmetic: started at 14 terminal rows; the reviewer enqueued 13 more (ids 15–27) across C1–C5; `14 + 13 = 27 = 6 + 21`. It closes exactly. Nothing left in `running`, `attempts` untouched at `0` everywhere, and no probe columns were added to the table (`information_schema` check returned `0`).
+
+**Not established — an attempt that failed, recorded as such.** I tried to convert the KEY's *inference* that Run A's open transaction would queue behind routine DDL into a measurement, using `LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE` with `lock_timeout='3s'` against a live Run A. **The lock was granted immediately**, because the probe process was not actually running at that moment — a reused terminal handed back a stale, already-exited process. So the result says nothing about the hazard. `D-07`'s `ACCESS EXCLUSIVE` lock-queue item remains **inference**, unchanged since Day 1. A clean test needs the lock attempt issued while a confirmed `idle in transaction` row is visible in `pg_stat_activity`.
+
+**Not recorded — C6.** I ran the Ctrl+C tests myself, mid-job and idle-polling, and the reviewer did not re-measure them. The four fields the brief asked for — exit code, elapsed time to exit in each case, and the `running` count after exit — are therefore **not in this log as values**. The `running` count at day close is `0` (M8), which is consistent with finish-current but was measured after everything had stopped, so it does not isolate the shutdown path.
+
+---
+
+### 💡 What I Understood
+
+**The day is one sentence: committing the claim buys visibility and costs protection.** Before the commit, the row is locked and nobody else can touch it — but the transaction is open, so the worker is `P-06`'s culprit, holding locks across a sleep for reasons the database cannot see. After the commit, the lock is gone, the `running` state is visible to everyone including `GET /jobs/{id}`, and the job has **nothing** guarding it. Day 2's ordering created a guarantee; the same ordering here removes one. That is not a bug to fix today — it is Week 2's problem statement, and Part D was explicit that leaving it broken is the deliverable.
+
+**`FOR UPDATE` is not what makes the claim correct — the compare-and-set is.** With one worker, `FOR UPDATE` protected against exactly one competitor: a human at the `psql` prompt. What actually defended the transition was `AND status='running'` plus reading `rowcount`, and M4 is the proof, because interference came from outside the lock's protection window entirely. The two mechanisms do different jobs: the guard is *correctness*, the lock is *ordering under contention*. Which of them costs what with two real workers is Din 4, and it stays unanswered here.
+
+**`rowcount = 0` means "my belief about this job is stale", and the only correct response is to stop writing.** M4 makes the abstract rule concrete: another writer had better information, and forcing the write would have destroyed a decision. Same shape as `alembic check` — an assertion that is boring on correct code and is the only signal on broken code.
+
+**Polling has a measurable price and I now have the number.** M3 turns the poll interval from a preference into a trade: 0.5 tx/s per idle worker at 2 s, against an upper bound on enqueue-to-start latency of roughly the same 2 s. Neither figure is right or wrong; the interval is where one is spent to buy the other. Two consequences worth carrying: the cost scales with worker count, not with job count, so an idle fleet is not free; and because the loop sleeps the whole interval in a single `await`, **the poll interval also bounds shutdown latency** — a coupling that matters the moment a 10 s Docker grace period is involved (`P-10`).
+
+**Today's worker is at-most-once, which is the opposite of the week's title.** If the process dies after the claim commits, the row sits in `running` forever, and the claim query filters on `pending`, so no restart will ever re-execute it. There is no path to a second execution today — not because duplication was prevented, but because **recovery does not exist**. Duplicate execution is the price of adding recovery, not a defect that appears on its own. Written up as `P-09`, because it reframes contract points 1 and 2 as being in tension rather than in sequence.
+
+**The RabbitMQ mapping, in my own words.** A broker can redeliver because it holds a connection to the consumer and notices when it breaks. Postgres holds a connection to my worker too, and notices — but it has no idea that connection was supposed to *finish a job*, so noticing buys nothing. Committing the claim is therefore not `auto-ack` (that would be marking `succeeded` before running the handler); it is manual-ack semantics **with the redelivery mechanism missing**. Relay's replacement for "the broker noticed" has to be a deadline, not a connection, which is why the reaper must be timeout-based.
+
+**Reviewer's code review of `src/worker.py` — findings, not opinions:**
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | Claim is one transaction; guard present on **both** the claim and the mark; `rowcount` checked on both. K1 avoided | ✅ `[MEASURED]` in the echo (M2) |
+| 2 | Claim commits before the handler runs — Trap 2 avoided | ✅ `[MEASURED]` (M7 Run B) |
+| 3 | `except Exception`, not `BaseException`, so `CancelledError`/`KeyboardInterrupt` are not swallowed by the handler's error path | ✅ correct as written `[INFERRED from code]` |
+| 4 | Shutdown flag is checked only at the top of the loop, and the idle wait is a single `await asyncio.sleep(2.0)`. Idle shutdown latency is therefore bounded by the poll interval, up to ~2 s | ⚠️ `[INFERRED from code]`, elapsed time **not recorded** |
+| 5 | `signal.SIGBREAK` (21) is not registered. `SIGTERM` is registered but is not deliverable on this platform (KEY T-c), so on Windows only `SIGINT` is live. Keeping `SIGTERM` is still right — it is the one that matters inside Docker | ⚠️ real gap, small |
+| 6 | `ORDER BY created_at` has **no tiebreak**. `now()` is per-transaction (K2), so any single-statement bulk seed gives identical `created_at` and "which job was picked" becomes unfalsifiable | ⚠️ **blocks Din 4** unless jobs are inserted one statement each, or the order becomes `(created_at, id)` |
+| 7 | `sys.exit(0)` is called from inside the coroutine, raising `SystemExit` through `asyncio.run` | works; exit code **not recorded** by the reviewer |
+| 8 | Unknown `type` consumes the claim and marks `failed` — one mark, no hot loop | ✅ `[MEASURED]` (M6), cost recorded against `D-04` |
+
+---
+
+### 🧠 Self-Check
+
+**No per-question score this day, at my request.** Rules 1–2 of the reviewer contract were deliberately not applied, so this entry cannot be compared with Day 1's `0/9` or Day 2's `62%`. That break in the series is the honest cost of skipping it, and it is recorded rather than papered over.
+
+What is true and worth keeping: Part B was attempted from my own head before each step, several answers were `idk`, and those were resolved **after** running the step, from the KEY — which is the protocol working as intended. The KEY was also used for some vocabulary, which is allowed. Some concept help came from Gemini.
+
+**Corrections — where reality differed from what the KEY or I had assumed:**
+
+| # | Claim | Actual | Lesson |
+|---|---|---|---|
+| 1 | The brief's bench state: *"9 rows, all `status='pending'`"* | `[R]` At review time: 14 rows, **0 pending**, 11 `succeeded` + 3 `failed`. My own run had already consumed them | A stated bench state has a timestamp attached. `K6`'s warning was correct in form and stale in content |
+| 2 | KEY 2.3's `EXPLAIN`, captured on the 9-row table | Same node order, different row estimates (`rows=1` throughout, M1). The **shape** is what transferred, not the numbers | Plan shape is stable at this size; costs are not. Quoting a cost from a different table state would have been wrong |
+| 3 | KEY 5.3: Run A's open transaction *would* queue behind `ACCESS EXCLUSIVE` DDL | Attempted and **not established** — the lock was granted because no Run A was live at the time | A measurement that did not land is not a measurement. Recorded as failed, per rule 15 |
+| 4 | The idle poll is a `SELECT` | It is `BEGIN` + `SELECT ... FOR UPDATE` + `COMMIT` — a full transaction per poll (M3) | The cost of polling is a transaction rate, not a query rate. Neither the plan nor the KEY stated this |
+
+---
+
+### 🚧 Unresolved / Follow-ups
+
+**New, from today:**
+- **`P-09` — today's engine is at-most-once, and at-least-once requires building the thing that duplicates.** Din 4 supplies one route (two claimers), Week 2 the other (a reaper resetting `running → pending`).
+- **`P-10` — the poll interval bounds shutdown latency as well as enqueue latency.** One `await` per interval means the flag is observed up to a full interval late. At 2 s inside Docker's 10 s grace period there is headroom; the coupling is what matters, not today's margin. Fix (slice the sleep, or wait on an `asyncio.Event`) is Week 2 shutdown hardening.
+- **C6's four fields are not recorded** — exit code (mid-job and idle), elapsed time to exit in both cases. Cheap to redo, and `P-10`'s idle-case claim of "up to one poll interval" is currently `[INFERRED from code]`.
+- **`ORDER BY created_at` has no tiebreak** (review finding 6). This must be settled **before** Din 4 seeds ten jobs, or Din 4's central question — *which* job the second worker got — becomes unanswerable.
+- **`SIGBREAK` unregistered** (review finding 5). Small, and it decides whether `Ctrl+Break` is graceful or fatal.
+
+**Carried, still open:**
+- **`D-07`'s `ACCESS EXCLUSIVE` lock-queue hazard** — still inference, and today's attempt to close it failed (M7 note). Now has a known-good test procedure attached.
+- **`P-03` claim-query index** — Week 4, `EXPLAIN ANALYZE`. M1's `Seq Scan` is *not* evidence either way at 27 rows.
+- **`P-05`'s dangerous half** (id order ≠ commit order) — Din 4's two workers will produce it naturally.
+- **`P-07`, `P-08`, ≈11 ms unexplained enqueue latency, `fsync`-to-media, `idle_in_transaction_session_timeout`, `POSTMORTEMS.md` entry #2, Week 0 Day 4 Exp B, Week 0 Day 3 Exp D, Day 2's `137`** — all unchanged.
+- **DDIA Ch 7 second pass (pages 233–251)** — the brief scheduled RabbitMQ acks first and said DDIA may slip to Din 5. It slipped. **Recorded as a deliberate slip, not an omission.**
+
+---
+
+### ❓ Question / Next Thought
+
+Din 4 runs two workers against one queue with `FOR UPDATE` and no `SKIP LOCKED`, and M1 is what makes the question sharp: `LockRows` sits **below** `Limit`, so the lock is taken before the limit is satisfied. Worker B therefore blocks inside a query that has not yet decided which row it wants. When A commits and B wakes up, what does B see — the same row (now `running`, so it no longer matches the filter), a different row, or nothing at all? I have three plausible answers and no basis to choose between them, which is exactly the right state to run the experiment in.
+
+The sharper trap is one Day 2 already taught. Whatever Din 4 measures, the `jobs` table **cannot** show a double execution: both workers would write the same value to the same column and the row would look perfect — my own Week 0 words, *"dono ne same value likhi, row bilkul theek dikhi."* So the measurement instrument has to exist before the experiment, and it cannot be the `jobs` table. That is why `job_executions` gets built first tomorrow, and it is a general rule worth stating plainly: **a failure I cannot observe does not exist for me**, and building the observer is part of the experiment rather than overhead before it.
+

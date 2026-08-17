@@ -244,3 +244,80 @@ What matters is that the gap is **recorded rather than believed away**. Two conc
 
 **Open:** the honest-client framing suggests a different question that has not been asked yet. If the purpose is preventing accidental oversized payloads, is `413` even the right response, or should the API instead tell callers that large inputs belong in object storage with the payload carrying only a reference? That is a contract decision rather than a hardening one, and it would make the limit meaningful rather than merely enforced.
 
+## P-09 — Week 1 is called "at-least-once" and Din 3 built at-most-once
+
+**Status: partly MEASURED** on Din 3. What is measured is that the claim commits before the handler runs, that a `running` row is not reachable by the claim query, and that nothing in the repository moves a row out of `running`. What is *not* measured yet is the stuck row surviving a real crash — that is Din 5's job.
+
+**The problem:** the worker's order of operations is `claim → commit → execute → mark`. Committing the claim is forced: holding the transaction open across execution reproduces `P-06` exactly, and Din 3's Run A measured that shape in my own worker (`state = idle in transaction`, `xact_start` ageing, last statement the claim `UPDATE`).
+
+But the commit is also what removes every protection the job had:
+
+| Moment | What protects the job |
+|---|---|
+| Inside the claim transaction | The row lock. Nobody else can take it |
+| After the claim commits | **Nothing.** The row says `running` and no mechanism watches it |
+
+Now kill the worker in that second state. Three already-measured facts combine:
+
+- Week 0 Day 2: on `SIGKILL` the handler never runs, so the worker cannot clean up after itself.
+- Week 0 Day 3: Postgres notices the dead connection and rolls back its **open** transaction. The claim was committed, so there is nothing to roll back.
+- Week 0 Day 5: nothing outside the worker can distinguish *dead* from *slow*.
+
+The row stays `running` forever. And because the claim query filters `status='pending'`, **no restart will ever re-execute it.** Restart the worker a hundred times: the handler ran at most once.
+
+**Why this is interesting:** the week's title is *"at-least-once ka matlab dekho"*, and the honest reading of Din 3 is that the engine currently delivers **at-most-once** on worker death. The absence of duplicates is not a safety property that was engineered — it is a symptom of having no recovery at all. Nothing puts a job back, so nothing can run it twice.
+
+That inverts how the contract's first two points relate to each other:
+
+> 1. An accepted job is never lost.
+> 2. The side effect happens exactly once, even if the worker crashes five times.
+
+These read like two independent goals. They are not: **the only routes to satisfying (1) after a crash are routes that create the risk in (2).** There are exactly two, and neither exists yet:
+
+| Route to a second execution | Arrives in |
+|---|---|
+| Two workers claiming the same job | Din 4 (`FOR UPDATE` alone, no `SKIP LOCKED`) |
+| Something resetting `running → pending` on a timeout | Week 2 (the reaper) |
+
+So duplicate execution is **the price of recovery**, not a bug that shows up on its own. A single status column plus a crash cannot give both "never lost" and "never duplicated", and the tension is structural rather than an implementation gap. That is also why (2) has to be delivered by idempotency at the side-effect boundary (Week 3) rather than by trying to make the claim cleverer.
+
+**Why it matters for Relay:** it fixes the order of the remaining weeks and explains why they cannot be reordered. Week 2 deliberately introduces the duplicate-execution risk in exchange for recovery; Week 3 then bounds the damage. Building Week 3's idempotency first would be protecting against a failure mode the system does not yet have — and, worse, would make Week 2's reaper feel safe before its cost had ever been observed.
+
+**Open:** the reaper's decision has to be made on a deadline, because a deadline is the only thing available — Postgres notices the dead connection but has no idea that connection owed a job. So what happens when the deadline is wrong in the *safe-looking* direction: the worker is alive, merely slow, its lease expires, the reaper requeues, and two executions now proceed with both being legitimate? `P-02` already established that a timeout bounds intent rather than reality, which means the reaper cannot stop the first worker — only outrun it. Unresolved, and Week 2's central question.
+
+---
+
+## P-10 — The poll interval is not one knob; it prices latency, database load, and shutdown at the same time
+
+**Status: MEASURED** for the load half on Din 3, `[INFERRED from code]` for the shutdown half — the elapsed-time measurement was not recorded.
+
+**The problem:** a database is not a broker. A broker pushes work at consumers; a table has to be **asked**. So the worker loop sleeps and asks again, and one number decides how often. It looks like a tuning preference. It is three prices at once.
+
+**What was measured (Din 3, one idle worker, `POLL_INTERVAL_SECONDS = 2.0`):** the idle poll is not a bare `SELECT`. The SQL echo shows, once per interval, forever:
+
+```
+BEGIN (implicit)
+SELECT jobs.id, jobs.type, jobs.payload FROM jobs
+  WHERE jobs.status = $1 ORDER BY jobs.created_at LIMIT $2 FOR UPDATE
+COMMIT
+```
+
+That is **a full transaction per poll** — 0.5 transactions/second per idle worker at this interval, each one a `Seq Scan` and two extra round trips. Two qualifiers, both real: the statement is reported `cached`, so it is not being re-planned, and the poll is read-only, so it writes no WAL. The load scales with **worker count and interval**, not with job count, so an idle fleet is not free.
+
+**The three prices:**
+
+| Direction | What gets worse |
+|---|---|
+| Short (10 ms) | Transaction rate per worker rises to ~100/s, all `Seq Scan`, all against a table with no index today (`P-03`). It also makes the SQL echo useless as evidence, which matters because the echo is the project's primary diagnostic |
+| Long (10 s) | The interval is an upper bound on enqueue-to-start latency for an idle queue. A job posted just after a poll waits nearly the whole interval before anything begins |
+| Long (10 s), second cost | **Shutdown latency.** The loop checks its shutdown flag only at the top, and sleeps the whole interval in a single `await`. The flag is set immediately on signal and observed up to a full interval later |
+
+**Why this is interesting:** the third row is the one that is easy to miss, because it couples a queue-tuning number to a *deployment* constraint. Docker's default `stop` grace period is 10 s — measured in Week 0 Day 2, including the `137` when it was exceeded. A 10 s poll interval inside a 10 s grace period is a `SIGKILL` waiting to be scheduled, and the job it kills is one that nobody was even working on: an idle worker that had already agreed to shut down. So the constraint is not "pick a good interval", it is:
+
+> **poll interval ≤ shutdown budget**, and the shutdown budget is set by whoever runs the container, not by the worker.
+
+The fixes are known and cheap — sleep in small slices, or wait on an `asyncio.Event` the signal handler can set, which makes shutdown observation immediate while leaving the poll rate unchanged. Deliberately not applied on Din 3, because at 2 s inside a 10 s grace period there is headroom, and because Week 2 owns shutdown hardening. Noticing the coupling was the point.
+
+**Why it matters for Relay:** this is the concrete content of `D-01`'s Cost field. *"Postgres as a queue requires polling"* is a statement anyone can make; *"polling costs one transaction per worker per interval, and the interval simultaneously bounds start latency and shutdown latency"* is the version that survives an interview follow-up. The number above is one worker at one interval on this machine — not a general throughput claim, and not a substitute for Week 4's measurements.
+
+**Open:** `LISTEN`/`NOTIFY` gives Postgres a push mechanism, which would decouple latency from poll rate. It does not remove the need for polling as a backstop — a notification delivered while no worker is connected is simply lost, so the table must still be swept. Whether the added coupling is worth the latency it buys is a Month 2 question at the earliest; it is recorded here so it is not discovered late and mistaken for a free win.
