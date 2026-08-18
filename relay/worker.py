@@ -24,7 +24,7 @@ def request_shutdown(signum: int, frame: Any) -> None:
 
 
 async def handle_sleep(payload: dict) -> None:
-    await asyncio.sleep(2.0)
+    await asyncio.sleep(20)
 
 
 async def handle_boom(payload: dict) -> None:

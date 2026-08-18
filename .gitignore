@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 
+docs/revision.md
 
 __pycache__/
 *.py[cod]

@@ -11,7 +11,7 @@ from sqlalchemy import text
 from relay.db import async_session
 
 
-async def seed_jobs(n: int = 10, job_type: str = "sleep") -> tuple[int, int]:
+async def seed_jobs(n: int = 20, job_type: str = "sleep") -> tuple[int, int]:
     async with async_session() as session:
         async with session.begin():
             stmt = text("""
@@ -29,5 +29,5 @@ async def seed_jobs(n: int = 10, job_type: str = "sleep") -> tuple[int, int]:
 
 
 if __name__ == "__main__":
-    count = int(sys.argv[1]) if len(sys.argv) > 1 else 10
+    count = int(sys.argv[1]) if len(sys.argv) > 1 else 20
     asyncio.run(seed_jobs(count))

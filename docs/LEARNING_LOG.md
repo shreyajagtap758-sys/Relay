@@ -133,3 +133,110 @@ job_executions
 
 #### and with SKIP LOCKED ? duplicate execution ? total runtime ? worker blocking ?
 => duplicates : 0, runtime : lower. blocking : no.
+
+
+## PREDICTIONS : 
+## p1 :
+-> if worker gets kill -9 in mid execution, what status will it get?
+- MY GUESS => status='running' forever.
+
+## p2 :
+-> how much time will it take to recover?
+- MY GUESS => we need exclusive retry logic for this(reaper,lease,heartbeat), other wise, job stuck forever.
+
+## p3 :
+-> SIGTERM sent, whats different than kill -9?
+- MY GUESS => sigterm is basically saying worker to stop, but we can use gradual steps(complete mid execution first, then stop) in our code.
+
+## p4 :
+-> 20 jobs, 3 workers, in middle one worker gets kill -9, now how many jobs will be stuck forever?
+- MY GUESS => as one worker got kill -9, idk if one worker gets kill -9 or after kill -9 every worker stops its work, but if one worker gets it, maybe other worker dont care, one job will be lost.
+
+## p5 :
+-> in job_executions table, will that stuck job does entry in the table?
+- MY GUESS => as job is inserted in job_execution table after CLAIM and before COMMIT(during execution), maybe it will have entry, but just lock was released from claim and something crashes before entry in table, maybe no entry then.
+
+
+## EXPERIMENT 1 : do kill-9 mid-job.
+
+- I expanded job handler time to 10 sec, start worker, and did kill -9 <worker_id> in mid execution.
+
+- when i immediately after search for job status=running : it showed the killed job
+
+- when i saw status of all jobs after some minutes :killed job = running still.
+
+-> does new worker picks that pending job that was died? => NO, status is not pending anymore for that job so no-one can pick it.
+
+
+## EXPERIMENT 2 :
+
+- enqueue 20 jobs, and run 3 workers concurrently. give kill -9 to one worker, let others complete their work.
+- how many jobs are stuck in running ?
+````
+- Seeded 20 jobs (sleep): IDs [1..20]
+// made 20 jobs.
+
+- python -m relay.worker
+// in three diff terminals, made three workers and noted one of the worker's id.
+
+- after a worker claims job and starts executing, stop-process -id <worker_pid> -force (kill -9)
+````
+
+> OUTPUT :
+````
+id |  status   
+----+-----------
+  1 | running  -> killed
+  2 | succeeded
+  3 | succeeded
+  4 | succeeded
+  5 | succeeded
+  6 | succeeded
+  7 | succeeded
+  8 | succeeded
+  9 | succeeded
+````
+````
+status   | count 
+-----------+-------
+ succeeded |     9
+ pending   |    10 -> i didn't wait
+ running   |     1 -> killed
+(3 rows)
+````
+````
+SIGTERM / Ctrl+C
+      ↓
+worker says "finishing current job"
+      ↓
+handler completes
+      ↓
+job = succeeded
+      ↓
+clean shutdown
+
+- exit 0
+````
+> EXAMPLE TERMINAL : 
+````
+[worker-7420] Executing job 9 (type=sleep)...
+
+[worker-7420] Signal SIGINT received. Finishing current job before shutdown...
+[worker-7420] Finished execution for job 9.
+2026-08-18 23:42:36,439 INFO sqlalchemy.engine.Engine BEGIN (implicit)
+2026-08-18 23:42:36,440 INFO sqlalchemy.engine.Engine UPDATE jobs SET status=$1::VARCHAR WHERE jobs.id = $2::BIGINT AND jobs.status = $3::VARCHAR
+2026-08-18 23:42:36,440 INFO sqlalchemy.engine.Engine [cached since 80.3s ago] ('succeeded', 9, 'running')
+[worker-7420] Marked job 9 as 'succeeded' (rowcount=1).
+2026-08-18 23:42:36,443 INFO sqlalchemy.engine.Engine COMMIT
+[worker-7420] Clean shutdown complete. Exiting with code 0.
+````
+````
+Metric	                          kill -9	                                   SIGTERM
+------------                  ------------------------------             -------------------------
+Handler chala?	       Haan, agar kill execution ke beech hua tha   	Haan, current job finish hone diya gaya
+Job complete hui?                     	Nahi	                              Haan
+Final status	                      running                              	succeeded
+running me atke jobs	      1 (jo killed worker ne claim ki)	                    0
+Exit code	                   Non-zero / forcibly terminated	                   0
+Recovery kisne kiya?	      Kisi ne nahi — job stuck reh gayi        	Worker itself — graceful shutdown ne current job finish ki
+````
