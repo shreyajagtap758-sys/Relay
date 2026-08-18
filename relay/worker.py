@@ -5,8 +5,9 @@ import sys
 from collections.abc import Callable, Coroutine
 from typing import Any
 from sqlalchemy import select, update
+
 from relay.db import async_session
-from relay.models import Job
+from relay.models import Job, JobExecution
 
 POLL_INTERVAL_SECONDS = 2.0
 WORKER_ID = f"worker-{os.getpid()}"
@@ -80,7 +81,18 @@ async def run_worker() -> None:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
             continue
 
+
         job_id, job_type, payload = claimed_job
+
+        async with async_session() as session:
+            async with session.begin():
+                execution = JobExecution(
+                    job_id=job_id,
+                    worker_id=WORKER_ID,
+                )
+                session.add(execution)
+
+
         handler = REGISTRY.get(job_type)
 
         if not handler:

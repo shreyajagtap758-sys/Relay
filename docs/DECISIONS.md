@@ -519,3 +519,42 @@ Result: The database stays lightweight, while large data is handled by appropria
 
 ---
 
+## Entry-1 : `job_executions` is an append-only instrument table, written *before* the handler runs, in its own transaction, with no foreign key and no index
+
+*(Week 1, Din 4. Numbered `D-21` because `D-09`..`D-20` belong to the Month 2–4 roadmap — see the numbering note at the top of this file.)*
+
+**Problem:** Relay's contract says a job's side effects must not be duplicated. Din 4 had to test that, and `jobs` alone **cannot** answer the question: `status` is a single column that gets overwritten, so `succeeded` looks identical whether one worker ran the job or five did. An `UPDATE` destroys the evidence of the previous writer by design. So the day needed a place where a second execution cannot erase the first one's record.
+
+**Options:**
+- (a) Append-only table, one row per execution, `(job_id, worker_id, executed_at)`
+- (b) An `executions integer` counter column on `jobs`, incremented per run
+- (c) The execution row written in the **same** transaction as the terminal `succeeded`/`failed` mark
+- (d) (a) plus `FOREIGN KEY (job_id) REFERENCES jobs(id)` and an index on `job_id`
+
+**Chose:** (a), with three specific placement decisions that matter more than the schema:
+
+1. **Written after the claim commits, before `await handler(payload)`.** So the row means *"a handler was entered for this job"*.
+2. **Written in its own session and its own transaction** (`record_execution()`), not inside the claim transaction and not inside the mark transaction.
+3. **No foreign key, no index on `job_id`.**
+
+**Why (1) — the ordering is the whole design.** A row written at *mark* time is evidence of completion, and a worker killed mid-handler leaves no trace at all — exactly the case Din 5 exists to observe. A row written at *claim* time would be evidence of intent, and would count jobs that never reached a handler. Writing it immediately before dispatch is the only position where the row means "work started", which is what a duplicate-execution test needs: two rows mean the handler ran twice, whatever `jobs` says.
+
+**Why (2) — evidence must not share a fate with the thing it is evidence about.** If the execution row is written in the same transaction as the terminal mark, then a failed mark rolls back the proof that the job ran (`P-11`'s starting point, and Din 4's own Step 1 prediction question). Committing separately means the two records can disagree — and that disagreement is the diagnostic. `job_executions` says the handler ran; `jobs` says `running`; the truthful reading is *"it ran and nobody recorded how it ended"*, which is precisely Week 2's problem.
+
+**Why (3) — measured to cost nothing yet, and both parts are reversible.** At 58 jobs and 30 execution rows the duplicate query (`GROUP BY job_id HAVING count(*) > 1`) is a sequential scan over a table of tens of rows. Adding an index today would be `P-03`'s mistake in miniature: freezing a guess before the data shape exists. The FK is a real decision rather than an omission, argued below.
+
+**Cost — all four of these are measured, not theoretical:**
+
+1. **It records handler dispatch, not claims.** `[MEASURED]` A job with an unregistered `type` is claimed, marked `failed`, and leaves **no** row (job `58`); a job whose handler raises leaves one (job `57`, `type = boom`). So "claimed" and "executed" are different populations, and only the second is instrumented. Consequence: the table cannot detect a job that was claimed and lost before dispatch.
+2. **`count(*) > 1` is a duplicate test only while retries do not exist.** Week 2's retry legitimately produces several rows for one job. The test expires the moment retries land, and the fix is another column (attempt number, or a claim id), not another query. Tracked as `P-11`.
+3. **No FK means orphan rows are accepted.** `[MEASURED]` `INSERT INTO job_executions (job_id, worker_id) VALUES (999999, 'probe-orphan')` succeeded. The instrument can therefore assert an execution of a job that never existed, and nothing catches a typo'd `job_id` in a manual probe. *(Probe row deleted; it consumed `id = 31`.)*
+4. **A crash between the claim commit and the execution row's commit under-counts.** `[INFERRED from code]` The gap is milliseconds wide and has not been reproduced deliberately, but in it a job is `running` with no execution row — the mirror image of Cost 1.
+
+**Rejected:**
+- **(b) counter column on `jobs`** — an `UPDATE` again, so it inherits the exact problem it was meant to solve: it cannot say *which* worker ran the job, or *when*, and a lost update loses the count silently. It also cannot support Din 4's actual use: `executed_at` is what made it possible to reconstruct a finished experiment's timeline and discover that the two workers barely overlapped (`P-12`). A counter would have hidden that permanently.
+- **(c) same transaction as the terminal mark** — kills the evidence exactly when it is most needed (mark fails, DB restarts, worker dies after the handler). Also makes the killed-mid-handler case indistinguishable from the never-started case, which is Din 5's entire subject.
+- **(d) FK + index — deferred, not dismissed.** The FK would buy referential honesty (Cost 3), and its price is a specific Week 4 conflict: deleting `jobs` rows older than 30 days then either fails on the FK, or needs `ON DELETE CASCADE`, which **deletes the execution history** — i.e. the audit trail disappears with the audited row, and an audit trail that vanishes with its subject is not much of an audit trail. The third option, `ON DELETE SET NULL`, needs a nullable `job_id` and turns the row into an orphan by design. That is a real decision with three unattractive branches, and it needs Week 4's retention policy to exist first. Recorded as deferred below.
+
+**Revisit when:** Week 2 adds retries (Cost 2 forces an attempt/claim identifier), or Week 4 defines job retention (forces the FK/cascade question), or the duplicate query gets slow enough to measure (then index `job_id`, with `EXPLAIN ANALYZE`, alongside `P-03`).
+
+---

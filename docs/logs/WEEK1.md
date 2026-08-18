@@ -591,3 +591,280 @@ Din 4 runs two workers against one queue with `FOR UPDATE` and no `SKIP LOCKED`,
 
 The sharper trap is one Day 2 already taught. Whatever Din 4 measures, the `jobs` table **cannot** show a double execution: both workers would write the same value to the same column and the row would look perfect — my own Week 0 words, *"dono ne same value likhi, row bilkul theek dikhi."* So the measurement instrument has to exist before the experiment, and it cannot be the `jobs` table. That is why `job_executions` gets built first tomorrow, and it is a general rule worth stating plainly: **a failure I cannot observe does not exist for me**, and building the observer is part of the experiment rather than overhead before it.
 
+---
+
+## Day 4 — Two workers, one job: build the instrument, then break the queue (2026-08-17)
+
+**Original goal (from the plan):** build the measuring instrument (`job_executions`) *before* running anything, then run two workers against one queue — first without `SKIP LOCKED`, then with it — and record what the second worker actually does.
+
+**Goal met?** The instrument was built, was **proven** able to catch a duplicate, and both variants were run end to end with a clean arithmetic reconciliation. But the comparison between the two variants is **weaker than it looks**, and that is the day's most important finding: in *both* "two worker" runs the second worker started late, so the contention the day existed to create barely happened (M4). The measurement was correct. The experiment was under-powered.
+
+**Anything else learned?** Yes, four things that were on nobody's plan:
+- the instrument does not record every claim — an unregistered job type is claimed, marked `failed`, and leaves **no** row behind (M7);
+- the table has no foreign key, so it happily records an execution of a job that does not exist (M8);
+- **four worker processes from the session were still alive 38 minutes later, still polling, and still claiming jobs** — two of them silently ate the reviewer's verification jobs (M9);
+- job `41` has been sitting in `running` since 19:2x with nothing in the system able to move it, which is Day 5's problem statement showing up a day early (M10).
+
+> **Provenance — read before trusting the numbers below.**
+>
+> Every line of `src/`, `labs/seed.py` and `labs/probe_hold.py` is the user's. **The user ran every Day 4 experiment himself** (C0–C6) and recorded the dossier; none of those experiments were re-run by the reviewer. The reviewer's job today was verification only, and everything marked `[R]` below is a reviewer-run check or a reviewer-run *new* probe: M2, M3 (timeline reconstruction), M4, M5, M6, M7, M8, M9, M10.
+>
+> **Prediction answers were deliberately not scored** this time, at the user's request. The self-check therefore records what the day *established* and what it only *appeared* to establish, with no number attached.
+>
+> Two of the day's recorded conclusions are **narrowed** by reviewer measurement (M4), and one is **confirmed by a new differential** (M6). Both are recorded in place rather than quietly corrected.
+
+---
+
+### 📊 Measured / Observed
+
+**M1 — The instrument exists, and the model matches the database.** `[MEASURED]` (migration + cycle by the user, drift check by the reviewer `[R]`)
+
+```
+Table "public.job_executions"
+ id          | bigint                   | not null | nextval('job_executions_id_seq'::regclass)
+ job_id      | bigint                   | not null |
+ worker_id   | text                     | not null |
+ executed_at | timestamp with time zone | not null | now()
+Indexes:
+    "job_executions_pkey" PRIMARY KEY, btree (id)
+```
+
+Migration `4bc263254b10`, reversibility cycle `downgrade -1 → upgrade head` clean, and `alembic check` → **`No new upgrade operations detected.`** Din 1's lesson holds: a green `check` is only boring on correct code.
+
+Two things the output says that the plan did not ask for, and both matter later: **no foreign key** to `jobs`, and **no index on `job_id`** — the only index is the primary key. See M8 and `D-21`.
+
+**M2 — Day-close state reconciles exactly with the user's C6.** `[R]`
+
+| Reading | User's dossier | Reviewer's re-query | Match |
+|---|---|---|---|
+| `jobs` total / `max(id)` | 54 / 54 | 54 / 54 | ✅ |
+| `succeeded` / `failed` / `running` / `pending` | 47 / 6 / 1 / 0 | 47 / 6 / 1 / 0 | ✅ |
+| `attempts <> 0` | 0 | 0 | ✅ |
+| `job_executions` rows | 27 | 27 (26 distinct jobs) | ✅ |
+| duplicate `job_id` | `44` ×2 | `44` ×2 | ✅ |
+
+One extra number the reviewer added, because it is the check that would have caught a fabricated reconciliation: **21 `succeeded` jobs have no execution row at all.** Those are the pre-instrument jobs (`id` 1..27). `47 succeeded − 21 = 26`, which is exactly the distinct-job count in `job_executions`. The arithmetic closes from two directions, not one.
+
+**M3 — Duplicate detection works, and it was proven the only honest way: by forcing a duplicate.** `[MEASURED]` (user)
+
+Natural duplicates across the whole day: **0**. So the instrument's core claim was untested until job `44` was reset to `pending` by hand and re-claimed:
+
+```
+job_id 44 → 2 executions
+  id 16 | worker-12940 | 19:28:19.899
+  id 17 | worker-12940 | 19:35:14.120
+```
+
+This is the step that makes every other "0 duplicates" line in the day worth reading. A detector that has never fired is indistinguishable from a broken one.
+
+**M4 — The two "two-worker" runs never really overlapped. This narrows the day's headline result.** `[R]` — reconstructed from `job_executions.executed_at`, which is why building the instrument first paid off in a way the plan did not anticipate.
+
+*Step 2, without `SKIP LOCKED`* (jobs 29–38, IST):
+
+```
+19:21:23.744  worker-20816  job 29     <- second worker not present yet
+19:21:26.161  worker-20816  job 30
+19:21:28.436  worker-20816  job 31
+19:21:30.517  worker-20816  job 32
+19:21:32.570  worker-20816  job 33
+19:21:33.866  worker-21708  job 34     <- second worker's FIRST execution, 10.1 s in
+19:21:34.696  worker-20816  job 35
+19:21:35.915  worker-21708  job 36
+19:21:36.787  worker-20816  job 37
+19:21:37.958  worker-21708  job 38
+```
+
+The 7/3 split is real, but **5 of the 10 jobs were processed by one worker alone.** Genuine overlap: the last ~4.1 s of a 14.2 s run — and inside that window the interleaving is tight and clean (alternating claims ~1.2 s apart with a 2 s handler, zero duplicates). So Step 2 *does* contain real contention evidence; it is just five jobs' worth, not ten.
+
+*Step 5, with `SKIP LOCKED`* (jobs 45–54, IST):
+
+```
+19:39:33.559  worker-12940  job 45
+19:39:35.609  worker-12940  job 46
+   ... 2.05 s apart, strictly serial ...
+19:39:48.378  worker-12940  job 52
+19:39:57.894  worker-28276  job 53     <- 9.5 s gap; PID 28276 was created 19:39:56
+19:39:59.974  worker-28276  job 54
+```
+
+Worker `28276`'s process start time is **19:39:56**, i.e. ~23 s after worker `12940` began working, and `12940` had already drained 8 of the 10 jobs by then. **The 8/2 split is a start-time artifact, and the overlap in Step 5 is approximately zero.**
+
+What that costs the day's conclusion, stated precisely:
+
+| Claim | Status after M4 |
+|---|---|
+| `SKIP LOCKED` produces 0 duplicates | ✅ true, but obtained with ~no contention, so it demonstrates nothing yet |
+| `SKIP LOCKED` "removed lock wait" vs Step 2 | ❌ **not shown by the C5 run** — there was no second claimer to wait. Shown separately by M6 |
+| Step 2 (`FOR UPDATE` only) survives real contention with 0 duplicates | ✅ for 5 of 10 jobs, and that part is solid |
+| The 7/3 vs 8/2 splits mean anything about the two strategies | ❌ they are start-time artifacts, not results |
+
+The rule this produces is a measurement-design rule, not a Postgres one: **an experiment about concurrency has to prove the concurrency happened.** Written up as `P-12`, including how to make it falsifiable next time.
+
+**M5 — The one moment of genuine simultaneity in the whole dataset: 6 ms.** `[R]`
+
+```
+19:25:57.802419  worker-21708  job 39
+19:25:57.808388  worker-20816  job 40
+```
+
+Two different workers, two different rows, **6 ms apart**, and this was *without* `SKIP LOCKED`. Nothing duplicated, nothing blocked, and the two claims came out with different job ids. That single pair is stronger evidence for "the compare-and-set claim holds under contention" than either of the ten-job runs.
+
+**M6 — `SKIP LOCKED` versus a held lock: the differential the C5 run could not give.** `[R]` — new probe run today, using the user's own `labs/probe_hold.py nochange` against the *current* (`skip_locked=True`) worker.
+
+The probe seeds two jobs, then holds `SELECT ... FOR UPDATE` on the **older** one for 6 s without changing its status.
+
+| Event | Time (IST) |
+|---|---|
+| Probe takes lock on job **55** (older) | 20:17:11.737 |
+| Worker executes job **56** (younger) | **20:17:12.990** — 1.25 s *inside* the lock window |
+| Probe commits, lock released | 20:17:17.754 |
+| Worker executes job **55** | **20:17:19.403** — 1.65 s after release, on a later poll |
+
+Read against Day 4's own Step 3 Case 2, which ran the *blocking* query in the same situation:
+
+| | `FOR UPDATE` (Step 3, Case 2) | `FOR UPDATE SKIP LOCKED` (today) |
+|---|---|---|
+| While the older row is locked | worker **waits** the full ~6 s | worker skips it and works, at t+1.25 s |
+| Which row it gets first | the previously-locked row, on wake | the **younger** unlocked row |
+| Locked row afterwards | claimed after release | still `pending`, claimed on a later poll — **not lost** |
+| Wasted time | ~6 s of doing nothing | none |
+
+That is the causal statement the day was after: `SKIP LOCKED` does not change *what* eventually runs, it changes *whether a worker sits idle in front of a row someone else is holding.* And the skipped row is deferred by up to one poll interval, not dropped — which is also the honest cost: `SKIP LOCKED` **weakens FIFO further** on top of `P-05`.
+
+**M7 — The instrument records handler dispatch, not claims. Two `failed` jobs, only one row.** `[R]`
+
+Two jobs inserted straight into `jobs`, one poll cycle apart:
+
+| Job | `type` | Final status | Row in `job_executions`? |
+|---|---|---|---|
+| 57 | `boom` (handler exists, raises) | `failed` | **Yes** — `worker-28276`, 20:20:10 |
+| 58 | `does_not_exist` (no handler) | `failed` | **No** |
+
+This follows exactly from where `record_execution()` sits in `run_worker()`: after the registry lookup succeeds, before `await handler(payload)`. So the table means *"a handler was entered for this job"* — not *"this job was claimed"*, and not *"this job finished"*. Both readings are useful, but only if the difference is written down, because two failures that look identical in `jobs` are distinguishable in `job_executions` and vice versa. `P-11`.
+
+The second half of `P-11` is more consequential: `count(*) > 1` currently means "duplicate", and it will stop meaning that the moment Week 2 adds retries, because a retried job legitimately produces several rows.
+
+**M8 — No foreign key, so the instrument accepts an execution of a job that never existed.** `[R]`
+
+```sql
+INSERT INTO job_executions (job_id, worker_id) VALUES (999999, 'probe-orphan');  -- INSERT 0 1
+SELECT count(*) FROM job_executions e
+  WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = e.job_id);                 -- 1
+DELETE FROM job_executions WHERE worker_id = 'probe-orphan';                     -- DELETE 1
+```
+
+Accepted, no error. Not a bug — an unpriced decision, now priced in `D-21`. It also means deleting old `jobs` rows (a Week 4 want) would leave the evidence behind rather than blocking, which is one of the two things a FK would have changed. *(Probe row removed; it consumed `job_executions.id = 31`, so the next real row will be `32`. Sequence gap, same as `P-05`.)*
+
+**M9 — Four worker processes outlived the experiments by 38 minutes and were still claiming jobs.** `[R]` — the day's most operationally embarrassing finding, and the reviewer only noticed it because the probe jobs in M6 were executed by the *wrong* worker ids.
+
+```
+PID 29228  started 2026-08-17 19:39:56  python -m src.worker
+PID 28276  started 2026-08-17 19:39:56  python -m src.worker
+PID 19172  started 2026-08-17 19:39:58  python -m src.worker
+PID 28344  started 2026-08-17 19:39:59  python -m src.worker
+```
+
+Still alive at 20:17, still polling every 2 s. Consequences, all measured:
+
+1. **They participated in experiments they were not invited to.** Jobs `55`, `56` (M6) and `57` (M7) were claimed by `worker-28276` and `worker-28344` — processes the reviewer did not start.
+2. **They explain M4's Step 5 anomaly.** Four workers were launched when the day's design called for two, which is also why two of them never claimed anything: the queue was drained before they got to it.
+3. **Idle cost, measured:** connections to `relay` in `pg_stat_activity` went **4 → 1** after killing them. Three idle connections held for nothing, plus ~2 tx/s of pointless claim polling (4 workers × 0.5 tx/s, `P-10`'s "an idle fleet is not free", now measured by accident rather than by design).
+
+All worker processes were terminated; `0` remain. Same shape as `P-06`: nothing in the system cleans up after a forgotten process, and the cleanup has to come from outside it.
+
+**M10 — Job 41 is still `running`, an hour later, and nothing in the repository can move it.** `[R]`
+
+```
+ id | status  | type
+ 41 | running | sleep
+```
+
+Set to `running` by the Step 3 Case 1 probe at ~19:25 and untouched since. No reaper exists, and the claim query only looks at `pending`, so it is invisible to every worker. This is exactly Day 5's `kill -9` outcome, produced accidentally by a lock probe — the stuck row does not need a crash, it only needs *any* path that commits `running` and then stops.
+
+**Day-close bench state, after the reviewer's probes** `[R]` — this is Day 5's starting count, not the dossier's C6:
+
+| Reading | Value |
+|---|---|
+| `jobs` | **58** rows — 49 `succeeded`, 8 `failed`, **1 `running` (job 41)**, 0 `pending`; `max(id) = 58` |
+| `attempts <> 0` | 0 |
+| `job_executions` | **30** rows, `max(id) = 30`, next id will be `32` |
+| duplicates | one pair, job `44` |
+| worker processes running | 0 |
+| jobs 55–58 | reviewer probe jobs, **kept on purpose** — deleting them would leave orphan execution rows (M8) and break the reconciliation trail |
+
+---
+
+### 💡 What I Understood
+
+> **Written by the reviewer from what the session established. Rewrite these in your own words before treating them as yours** — Day 1's log is explicit about the difference between recognisable and recallable.
+
+**The instrument was the actual deliverable, and it earned its place twice.** `jobs` can never show a double execution, because an `UPDATE` overwrites the old value — `status = 'succeeded'` looks identical whether one worker or five got there. Only an append-only table can hold a history that a second writer cannot erase. And the instrument then did something better than its job description: `executed_at` made it possible to **reconstruct the timeline of an experiment that had already finished** (M4, M5). The experiment's own record proved that the experiment was flawed, which no amount of re-reading the terminal output could have done.
+
+**The day's headline was nearly a false positive, and the cause was measurement design, not code.** "Two workers, 0 duplicates, `SKIP LOCKED` faster" was the expected sentence, and the numbers were consistent with it. M4 shows the second worker was mostly absent, so the run could not have produced a duplicate no matter what the code did. Same family as Din 2's `413` bug: *the test passed and the mechanism was untested*, and only a differential check separated the two. Din 2's rule was written for verification checks; today it turns out to apply to experiments as a whole. **An experiment about contention has to prove contention occurred — a start-time snapshot per worker, or a shared start barrier, is the cheapest proof.**
+
+**What `SKIP LOCKED` actually buys, in one line each — and the wording matters.** It does **not** prevent duplicate execution; the compare-and-set guard and `FOR UPDATE` were already doing that (M5's 6 ms pair, without `SKIP LOCKED`, no duplicate). What it removes is **wasted waiting**: with plain `FOR UPDATE`, a worker whose `LIMIT 1` lands on a row another session holds sits in `Lock`/`transactionid` doing nothing, even though nine other rows are free (Din 3 measured `LockRows` sitting *below* `Limit`, which is why the row is locked before the limit is satisfied). `SKIP LOCKED` says "not that one, next" — measured in M6 as work starting 1.25 s into a 6 s lock instead of after it. The cost is paid in ordering: the skipped row waits for a later poll, so best-effort FIFO (`P-05`) gets a bit more approximate.
+
+**`EvalPlanQual` is the name for the thing that made Step 3 confusing, and the confusion was the point.** Under `READ COMMITTED`, a blocked `SELECT ... FOR UPDATE` does not wake up holding a stale row: it re-checks the row against the `WHERE` clause using the *new* committed version. So Case 1 (probe set `running`) → the row no longer matches `status='pending'`, it is dropped, and the next pending row is returned instead. Case 2 (probe changed nothing) → the row still matches, and the waiting worker claims it. Same wait, same wake-up, two different outcomes, and the deciding factor is a value that changed *while* the worker was blocked. This is the single most useful mechanism the day taught, and it explains why `rowcount = 0` is rare rather than common: by the time the `UPDATE` runs, the row has already been re-validated.
+
+**A conflict branch that never fires is not proof of safety.** `rowcount = 0` did not occur naturally at any point today. With `skip_locked=True` it becomes even harder to reach, because a competitor's row is skipped rather than contended. That does not make the guard redundant — it is what makes the *mark* step safe, and it is the only defence if any future code path updates `status` without locking first. It does mean the branch is **untested code**, and the honest way to say it is: the guard's correctness is currently `[INFERRED]`, and the only place its behaviour was actually observed is Din 3's `M4`.
+
+**Blast radius of a dead worker is currently exactly one job, and that is a design property worth naming.** The worker claims one job at a time (no prefetch), so a crash strands one row in `running`. Claiming 50 would strand 50. That is the whole prefetch trade-off in Relay's terms: throughput up, recovery-time blast radius up by the same factor. Day 5's scale test can measure it directly — one killed worker should produce exactly one stuck job.
+
+**Processes are part of the experiment's state, and this repository has now been bitten by that three times.** `P-06` was four abandoned `psql` sessions holding locks for days. Din 3 was a worker in a foreground shell blocking its own terminal. Today it was four forgotten workers quietly claiming jobs during someone else's measurement (M9). The pattern: **nothing in the system cleans up after a process you forgot, and its effects surface as someone else's confusing result.** The cheap habit that fixes all three — count the processes and the connections *before* the run, and again after.
+
+---
+
+### 🧠 Self-Check
+
+**Not scored, by request.** So instead of a fraction, here is what the day established versus what it merely appeared to establish — which is the more useful audit anyway.
+
+| Claim from the day | Standing after review |
+|---|---|
+| The instrument records exactly one row per execution for a clean single run | ✅ measured (C1), and re-confirmed by M2's two-directional arithmetic |
+| A forced duplicate is detected | ✅ measured (M3) — the detector has fired at least once |
+| `FOR UPDATE` + compare-and-set produces no duplicate under contention | ✅ for the ~4 s that were genuinely contended, and M5's 6 ms pair |
+| Two workers, 10 jobs, 0 duplicates, both variants | ⚠️ true but under-powered — M4 shows most jobs were processed alone |
+| `SKIP LOCKED` "removed the lock wait" | ⚠️ **not** shown by C5; shown by M6's differential instead |
+| The 7/3 and 8/2 splits describe the two strategies | ❌ start-time artifacts |
+| `EvalPlanQual` behaviour in both Case 1 and Case 2 | ✅ measured, and it is the day's best finding |
+| The instrument sees every execution | ❌ it sees every **handler dispatch** (M7) |
+| The instrument's rows always refer to real jobs | ❌ no FK (M8) |
+
+**The one thing to be honest about:** the day's process discipline was better than Din 2's (the instrument came first, the reconciliation closed, the migration cycle was checked) and its *experimental* discipline was worse than it looked — four workers where the design said two, and no record of when each worker started. Nothing in the code was wrong. The setup was.
+
+---
+
+### 🚧 Unresolved / Follow-ups
+
+**New, from today:**
+- **`P-11` — the instrument measures dispatch, and `count(*) > 1` expires as a duplicate test the moment Week 2 adds retries.** Needs a way to separate "attempt 2 of a retry" from "second worker on attempt 1" — an attempt number or a claim id on the execution row. Week 2 owns it.
+- **`P-12` — the concurrency experiment did not prove concurrency.** Fix is procedural: start the workers from one command, record each worker's start time, and report the **overlap window** alongside the split. Day 5 Step 5 does this.
+- **`P-13` — worker processes outlive their experiment and keep claiming.** Also gives `P-10`'s idle-fleet cost a measured number (3 idle connections, ~2 tx/s, for zero work).
+- **`D-21` — `job_executions` written up**, including the two unpriced parts M1 exposed: no FK, no index on `job_id`.
+- **Job 41 is stuck in `running`** and is deliberately being left there as Day 5's baseline. Day 5's stuck-count arithmetic must **start from 1, not 0**.
+- **Reviewer probe jobs 55–58 remain in `jobs`.** Kept on purpose (M8: deleting them would orphan execution rows).
+
+**Not measured, still inference:**
+- **The crash window between the claim commit and the execution row's own commit.** `record_execution()` runs in its own transaction after the claim commits, so a crash inside that gap leaves a `running` job with **no** execution row — the instrument under-counts. Millisecond-wide and not deliberately reproduced. `[INFERRED from code]`
+- **`rowcount = 0` under `skip_locked=True`.** Argued to be near-unreachable via the claim path; never observed. The branch is untested code.
+- **Throughput comparison for `D-01`/`D-02`.** Still missing, because M4 disqualified today's two runs as a like-for-like comparison. Needs one clean run with a proven overlap window.
+
+**Carried over, unchanged:**
+- `P-03` claim-query index — Week 4, `EXPLAIN ANALYZE`, still not guessed.
+- `ACCESS EXCLUSIVE` lock-queue hazard (`D-07`) — inference; the test procedure is known.
+- Din 3's C6 shutdown numbers (exit code and elapsed time, mid-job and idle) — **still unrecorded.** Day 5 Step 4 closes this.
+- `signal.SIGBREAK` — now **registered** in `run_worker()` behind a `hasattr` guard, so this item is closed on the code side; whether `Ctrl+Break` is actually graceful is still unmeasured.
+- DDIA Ch 7 second pass — Day 5.
+
+---
+
+### ❓ Question / Next Thought
+
+Day 5 kills a worker mid-job, and today already produced the answer's shape by accident: job 41 has been `running` for an hour and no part of Relay can see it. So Day 5's interesting question is not *"does the job get stuck?"* — that is settled. It is **what evidence a stuck job leaves, and whether that evidence is enough for a recovery mechanism to act on.**
+
+Concretely, after a `kill -9` there will be a `running` row **and** a `job_executions` row (M7 says the row is written before the handler runs, so it will exist). Between those two facts, nothing says *when* the work started relative to now, nothing says how long the handler was supposed to take, and `attempts` is still `0`. A reaper reading that state can only ask "how long has this been `running`?" — and it cannot get that from `jobs` at all, because `created_at` is enqueue time, not claim time. **The missing column is the reaper's whole problem statement**, and it is better to notice that from the outside today than to add `lease_expires_at` on faith next week.
+
+Second, smaller, and it is the question `P-13` forces: if a forgotten worker can claim jobs during someone else's experiment, then "how many workers are running" is a fact about the system that Relay itself cannot answer. Day 5 kills one worker out of three. **What tells the truth about how many are left?**
+
+---
+

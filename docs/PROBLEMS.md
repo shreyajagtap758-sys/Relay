@@ -321,3 +321,99 @@ The fixes are known and cheap — sleep in small slices, or wait on an `asyncio.
 **Why it matters for Relay:** this is the concrete content of `D-01`'s Cost field. *"Postgres as a queue requires polling"* is a statement anyone can make; *"polling costs one transaction per worker per interval, and the interval simultaneously bounds start latency and shutdown latency"* is the version that survives an interview follow-up. The number above is one worker at one interval on this machine — not a general throughput claim, and not a substitute for Week 4's measurements.
 
 **Open:** `LISTEN`/`NOTIFY` gives Postgres a push mechanism, which would decouple latency from poll rate. It does not remove the need for polling as a backstop — a notification delivered while no worker is connected is simply lost, so the table must still be swept. Whether the added coupling is worth the latency it buys is a Month 2 question at the earliest; it is recorded here so it is not discovered late and mistaken for a free win.
+
+---
+
+## P-11 — The instrument counts handler dispatches, not executions, and its duplicate test has an expiry date
+
+**Status: MEASURED** on Din 4, with two jobs that both ended `failed` and left different evidence.
+
+**The problem:** `job_executions` was built to answer one question — *did this job run twice?* — and it does. But what it records is narrower than "an execution", and the gap only becomes visible when you compare two failures:
+
+| Job | `type` | Final `jobs.status` | Row in `job_executions`? |
+|---|---|---|---|
+| 57 | `boom` — handler exists and raises | `failed` | **Yes** |
+| 58 | `does_not_exist` — no handler registered | `failed` | **No** |
+
+Both look identical in `jobs`. Only one exists in the instrument. The reason is a single line's position in `run_worker()`: the registry lookup happens first, and `record_execution()` runs only on the path where a handler was found, just before `await handler(payload)`. So the table's real meaning is **"a handler was entered for this job"** — not "this job was claimed", and not "this job completed".
+
+That placement is deliberate and correct (`D-21` argues why: a row written at mark time disappears when the worker is killed mid-handler, which is the case Din 5 exists to see). The problem is not the placement, it is that **two different populations — claimed jobs and dispatched jobs — are easy to conflate when reading the numbers later.** Din 4's own reconciliation nearly did: 47 `succeeded` jobs against 26 distinct instrumented jobs looks like data loss until you remember that 21 of them predate the table, and that unregistered types never appear at all.
+
+**The second half is the one with a deadline.** The duplicate test is:
+
+```sql
+SELECT job_id, count(*) FROM job_executions GROUP BY job_id HAVING count(*) > 1;
+```
+
+This means "duplicate" **only while Relay never retries.** Week 2 adds bounded retry, and then a job that fails once and succeeds on attempt 2 produces two rows — legitimately. At that moment the query stops distinguishing *"one worker, two attempts"* from *"two workers, one attempt each"*, which is the exact distinction the instrument was built for. It will not fail loudly; it will start returning rows that mean something different, which is worse.
+
+**Why this is interesting:** it is a measuring instrument with a **shelf life**, and the expiry is caused by a feature that is already on the roadmap. That is a new shape for this project. `P-04` was about a constraint enforcing part of an invariant; this is about a *measurement* answering a question that is about to change underneath it. The confidence carries over; the meaning does not.
+
+There is also a smaller symmetry worth keeping: the instrument can **under-count** as well as mis-count. `record_execution()` commits in its own transaction after the claim commits, so a crash in that millisecond-wide gap leaves a `running` job with no execution row — `[INFERRED from code]`, not reproduced. Cost 1 and Cost 4 of `D-21` are the two directions of the same seam.
+
+**Why it matters for Relay:** the fix is a column, not a query — the execution row needs to say *which attempt it belongs to*, which means either an attempt number copied from `jobs.attempts` at dispatch, or a claim id minted per claim. The second is more honest (it identifies the claim, so two workers claiming the same row produce two claim ids even within one attempt), and it is more work. Week 2 owns the decision, and it should be taken **at the same time** as the retry logic, not after — otherwise the first retry-era duplicate report is unreadable.
+
+**Open:** should an unregistered type write a row too? Doing so would make the table mean "claimed", which loses the "work started" meaning that Din 5 needs. Two tables, or one table with a `dispatched boolean`, are both heavier than the problem currently justifies. Recording the question rather than inventing a schema for it.
+
+---
+
+## P-12 — A concurrency experiment where the concurrency barely happened
+
+**Status: MEASURED** on Din 4 — and measured *after* the conclusions had already been written down, which is the part worth remembering.
+
+**The problem:** Din 4's whole design was "two workers, one queue, count the duplicates". It ran twice — once with plain `FOR UPDATE`, once with `SKIP LOCKED` — and produced clean-looking results: 10 jobs, 0 duplicates, a 7/3 split, then a 8/2 split. The instrument's `executed_at` column then made it possible to reconstruct *when* each worker was actually working:
+
+| Run | First worker's first job | Second worker's first job | Real overlap |
+|---|---|---|---|
+| Step 2, `FOR UPDATE` | 19:21:23.744 | 19:21:33.866 (**+10.1 s**) | last ~4.1 s of a 14.2 s run — 5 of 10 jobs |
+| Step 5, `SKIP LOCKED` | 19:39:33.559 | 19:39:57.894 (**+24.3 s**, process created 19:39:56) | ~none — 8 jobs were already done |
+
+So the second run — the one whose purpose was to be compared against the first — had essentially **one** worker doing the work. Both splits are start-time artifacts. The 0-duplicate result is still true, and it demonstrates nothing about `SKIP LOCKED`, because no second claimer was present to be skipped.
+
+Worse, the *strongest* concurrency evidence of the day was not in either designed run. It was an incidental pair from a probe: two workers executing two different jobs **6 ms apart** (19:25:57.802 and 19:25:57.808), without `SKIP LOCKED`, no duplicate. The experiment that was designed to show contention showed less of it than the one that was not.
+
+**Why this is interesting:** it is Din 2's `413` bug wearing different clothes. There, a check ran *after* the work it was meant to prevent, so the test passed and the mechanism was absent. Here, an experiment ran *without* the condition it was meant to create, so the result was consistent with the hypothesis and had no power to contradict it. Din 2 produced the rule *"for each check, ask what wrong implementation would also pass this"*. Din 4 extends it: **for each experiment, ask what would produce this same result if the phenomenon never occurred.** For "two workers, 0 duplicates", the answer is "one worker" — which means the run must prove two were competing before its zero means anything.
+
+The second lesson is about *why* it was catchable at all. Nothing in the terminal output would have revealed it; the worker prints no timestamps and the splits looked plausible. It was catchable only because the instrument stored `executed_at`, i.e. because a table built to answer question A happened to record enough to audit the experiment itself. **Timestamps on evidence rows are cheap and they let you re-interrogate a run that is already over.**
+
+**Why it matters for Relay:** it blocks a decision. `D-02` (`SKIP LOCKED` vs alternatives) needs a Cost field with real throughput numbers, and Din 4's two runs cannot supply them — they are not like-for-like. `D-01` inherits the same gap. So the write-up on Din 6 must either say "not measured" or the run must be redone properly.
+
+Concrete method for next time, which Din 5 Step 5 uses:
+1. **Start the workers from one command**, not one terminal each, so start times are within milliseconds.
+2. **Record each worker's start instant** (the process creation time is enough) and report the **overlap window** next to the split — a split without an overlap window is uninterpretable.
+3. **Report jobs-per-worker *within* the overlap window**, not over the whole run.
+4. Size the queue so the run cannot drain before the last worker joins: with a 2 s handler and N workers, seed clearly more than N × (startup skew ÷ 2 s) jobs.
+
+**Open:** the honest version of Din 4's central question is still unanswered — *under real, proven contention, does `SKIP LOCKED` change total wall-clock time, and by how much?* One clean run answers it. Until then the only defensible statement is the mechanism one (measured, `M6`): `SKIP LOCKED` removes waiting in front of a locked row; it does not remove duplicates, because there were none to remove.
+
+---
+
+## P-13 — Worker processes outlive their experiment, keep claiming jobs, and contaminate the next measurement
+
+**Status: MEASURED** on Din 4, by accident, while verifying something else.
+
+**The problem:** four `python -m src.worker` processes started at 19:39:56–19:39:59 were **still running at 20:17**, 38 minutes after the experiments they belonged to had finished. They were not idle in a harmless sense — they were polling every 2 seconds and claiming whatever appeared:
+
+- The reviewer seeded two jobs for a `SKIP LOCKED` lock-contention probe. **Both were executed by workers the reviewer did not start** (`worker-28276`, `worker-28344`).
+- A `boom` job seeded to test instrument coverage was also taken by `worker-28276`.
+- Connections to the `relay` database dropped from **4 to 1** the moment the strays were killed, so three Postgres connections were being held for no work at all, plus roughly **2 tx/s** of claim polling (4 workers × 0.5 tx/s at a 2 s interval).
+- They also explain a puzzle in the day's data: the design called for two workers, four existed, and two of them never claimed anything because the queue drained before they got there (`P-12`).
+
+**Why this is interesting:** three separate incidents in this repository now share one cause. `P-06` was four abandoned `psql` sessions holding row locks for days, which eventually blocked an unrelated `DROP TABLE`. Din 3 was a worker started in a foreground shell, silently owning that terminal. Today it was forgotten workers quietly participating in someone else's experiment. The pattern: **a process you forgot is still a participant, and its effects surface as a confusing result somewhere else, with no visible link back to it.**
+
+The variant that makes it hard to catch is that the symptom is *not* an error. In `P-06` the symptom was a hang. Here the symptom was a plausible-looking measurement with the wrong `worker_id` in it. If the instrument had not recorded `worker_id`, the contamination would have been invisible — the jobs would have been done, the counts would have reconciled, and the conclusion would have been silently about a different fleet than the one under test.
+
+There is also a smaller consequence that is easy to miss: **"how many workers are running" is not a question Relay can answer.** Nothing in the database distinguishes a live worker from a dead one, or knows how many exist. `worker_id` is a PID string chosen by the process itself, so two hosts can collide, and a restarted process gets a new identity while its stranded row keeps the old one. Week 2's reaper will have to reason about liveness without a roster.
+
+**Why it matters for Relay:** it is a cheap habit that protects every future measurement, and it is directly load-bearing for Din 5, which kills one worker out of three and then counts stuck jobs. A stray fourth worker would make that count meaningless.
+
+Concrete carry-forwards:
+- **Before and after every worker experiment, count the processes and the connections.** `Get-CimInstance Win32_Process -Filter "Name='python.exe'"` filtered on `src.worker`, and `SELECT count(*) FROM pg_stat_activity WHERE datname='relay'`. Two commands, and they would have caught this in seconds.
+- **Report both counts in the log entry**, the way a starting row count is reported. An experiment's process list is part of its state.
+- This also gives `P-10`'s claim — *"an idle fleet is not free"* — its first measured number, obtained by accident rather than by design: 3 idle connections and ~2 tx/s for zero throughput.
+
+**Open:** `worker_id = f"worker-{os.getpid()}"` is a **local** identity. It is fine for a single-host experiment and wrong the moment two hosts run workers, because PIDs collide across machines. What the identity should be (host + PID, a UUID minted at startup, or a row in a `workers` table with a heartbeat) is a Week 2 question, and it is the same question as "who is alive?" — deliberately not answered here.
+
+---qqqqqqqqqqqqq
+
+
