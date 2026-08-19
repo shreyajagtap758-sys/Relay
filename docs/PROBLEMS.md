@@ -414,6 +414,133 @@ Concrete carry-forwards:
 
 **Open:** `worker_id = f"worker-{os.getpid()}"` is a **local** identity. It is fine for a single-host experiment and wrong the moment two hosts run workers, because PIDs collide across machines. What the identity should be (host + PID, a UUID minted at startup, or a row in a `workers` table with a heartbeat) is a Week 2 question, and it is the same question as "who is alive?" — deliberately not answered here.
 
----qqqqqqqqqqqqq
+----------
 
+## P-14 — Equal handler durations synchronise workers into a convoy, so contention is highest exactly where a benchmark will find it and lowest where it matters
 
+**Status: MEASURED** on Din 5, and measured *better than the experiment was designed to measure it* — the finding fell out of `job_executions.executed_at` after the run, not from the plan.
+
+**The problem:** Din 5 Step 5 started three workers from one command, seeded 9 jobs of the same `slow` type (an 8.0 s `asyncio.sleep`), and killed one worker mid-round. The intended result was a 4/4 split with 0 duplicates, and that is what happened. The unintended result is in the timestamps:
+
+```
+round 1   job 65 @ 28.184853   job 66 @ 28.194062   job 67 @ 28.197500     12.6 ms spread
+round 2                        job 69 @ 36.246402   job 68 @ 36.246398      4 µs apart
+round 3                        job 70 @ 44.303430   job 71 @ 44.303470     40 µs apart
+round 4                        job 73 @ 52.342706   job 72 @ 52.342702      4 µs apart
+```
+
+The two surviving workers did not drift apart over four rounds. They **converged**, and stayed converged, claiming **4 microseconds** apart on two of the three rounds. Din 4's best contention was 6 ms; this is three orders of magnitude tighter, and it was sustained rather than momentary.
+
+**Why it happens, and it is not luck.** The worker loop has no jitter anywhere in it. Two workers that start within 12 ms of each other and then run handlers of **identical** duration will finish within 12 ms of each other, re-poll within 12 ms of each other, and claim within 12 ms of each other — forever. Any variation that would separate them has to come from somewhere, and the only candidates are handler duration (identical here, by construction) and per-round overhead (measured at 39–57 ms, and it applies to both workers roughly equally). So the phase difference does not grow. Worse than that, it *shrank*: whichever worker is momentarily behind is competing for a queue that is one row shorter, and the loop has no backoff, so it catches up.
+
+This is the same shape as a thundering herd, arriving from an unusual direction. The usual herd is many clients waking on one event. Here nothing wakes them — they are **self-synchronising**, because a fixed-duration handler is a clock.
+
+**Why this is interesting: it inverts what the measurement means.** The instinct is to read "0 duplicates at 4 µs separation" as a stress test that the code passed, and it is that. But the *reason* the separation was 4 µs is that every job took exactly the same time, which is a property of a synthetic workload and of nothing else. A real workload — an 8 s email send next to a 40 ms cache invalidation — makes workers drift apart within one round and contend far less.
+
+So two conclusions that point in opposite directions, and both are true:
+
+1. **The safety result is stronger than a realistic workload would have produced.** 4 µs is close to the worst case the claim path will ever see. Passing it is worth more than passing a realistic run. Good news, honestly obtained.
+2. **The performance argument for `SKIP LOCKED` is weaker than this run suggests.** `SKIP LOCKED` earns its place by avoiding lock waits under contention. If production contention is much lower than benchmark contention, the benefit is smaller than the benchmark implies — which is the opposite of the usual assumption that benchmarks understate production load.
+
+**What is still `[INFERRED]`, and it is the important half.** From `job_executions` alone it is impossible to tell **which mechanism kept the 4 µs claims safe** — `SKIP LOCKED` steering the second worker to the next row, or the compare-and-set guard returning `rowcount = 0` and the worker moving on. The workers' stdout was not captured for that run, and `rowcount = 0` has never been observed in this project at all (Din 4 noted the same gap). So: *the claim path is safe at 4 µs separation* is measured. *`SKIP LOCKED` is what made it safe* is not.
+
+**Why it matters for Relay:**
+
+- **Any future concurrency measurement must state the handler-duration distribution**, not just the worker count. "3 workers, 9 jobs" is not a reproducible description of contention; "3 workers, 9 jobs, all handlers exactly 8.0 s" is. `P-12` established that an experiment about contention must prove contention occurred; this adds that it must also describe *why* the contention was that severe.
+- **`D-02`'s Cost field must not cite this as a throughput result.** It is a safety result under maximal contention. The throughput comparison between claim strategies still does not exist.
+- **Week 4's rate limiting and backoff work inherits a concrete question:** should the poll interval carry jitter? Nothing in Relay currently randomises anything, and this is the first measured evidence that lockstep is not hypothetical. The counter-argument is that jitter trades a small latency increase for reduced contention that `SKIP LOCKED` already handles cheaply — so it is a real trade-off, not an obvious fix.
+
+**Open:** whether the convoy survives unequal handler durations, and how quickly it breaks up. One run with handlers of 8 s and 2 s alternating would answer it, and it would also give `SKIP LOCKED` a more honest workload to be measured against.
+
+---
+
+## P-15 — Graceful shutdown is bounded by the slowest handler, Relay does not bound the handler, and so the graceful path degrades into the crash path
+
+**Status: MEASURED** on Din 5 by the reviewer, after the day reported both numbers as ranges. Din 3 asked for these numbers and Din 4 recorded them as still owed.
+
+**The problem:** `run_worker()` handles shutdown by setting a flag and letting the current job finish:
+
+```python
+def request_shutdown(signum, frame):
+    global SHUTDOWN_REQUESTED
+    SHUTDOWN_REQUESTED = True      # the handler does nothing else
+
+while not SHUTDOWN_REQUESTED:      # the flag is read here, and only here
+```
+
+This is deliberate and it is correct — it is what makes a graceful stop leave no stuck job. But it means the shutdown latency is *whatever the loop is currently doing*, and the loop does two very different things.
+
+**Measured, both cases, same method** (`CTRL_BREAK_EVENT` via `os.kill`, `perf_counter` around `Popen.wait()`):
+
+| Case | Signal → handler | Signal → exit | Exit code | Upper bound is set by |
+|---|---|---|---|---|
+| **idle**, between polls | 3 ms | **1.123 s** | `0` | `POLL_INTERVAL_SECONDS` = 2.0 s |
+| **mid-job**, 3 s into an 8 s handler | 2 ms | **5.167 s** | `0` | **the handler's own duration — unbounded** |
+
+The idle case decomposes exactly. The signal landed 1.041 s into a 2.0 s sleep, leaving 0.959 s; the shutdown line printed at 0.962 s. **3 ms apart.** That moves `P-10`'s *"the flag is observed up to one poll interval late"* from `[INFERRED from code]` to `[MEASURED]`, and it shows the delay is not in signal delivery — the handler ran in 3 ms. It is entirely in the loop not being able to check the flag while sitting in one `await asyncio.sleep(2.0)`.
+
+The mid-job case decomposes too: 4.998 s of remaining handler (arithmetic predicted 4.983 s), 5 ms for the mark transaction, 4 ms to the final print, then **160 ms of interpreter teardown** — and the idle run measured 161 ms for the same teardown, so that cost is stable rather than noise.
+
+**Why this is interesting: the two upper bounds are owned by different people.** The idle bound is a constant in this repository. The mid-job bound is *the handler's runtime*, and Relay has no execution timeout anywhere. So the honest statement of the mid-job bound is **"unbounded"**, and a handler that hangs forever means a worker that never shuts down gracefully.
+
+Which produces the actual finding, and it was not predicted:
+
+> Every process supervisor sends a graceful signal, waits a fixed grace period, and then sends `SIGKILL`. `docker stop` waits 10 s. Kubernetes defaults `terminationGracePeriodSeconds` to 30. **Whenever handler duration exceeds that grace period, the graceful path becomes the crash path** — signal, handler still running, grace expires, `SIGKILL`, and the row is left in `running` exactly like Din 5's job 63.
+
+So "Relay shuts down gracefully" is not a property of Relay's code. It is a property of Relay's code **and** a timeout owned by whatever supervises the process — and today's 8 s handler is already 80% of `docker stop`'s default budget. This is the same family as Din 2's `synchronous_commit` and `P-06`'s `idle_in_transaction_session_timeout`: *the guarantee lives partly in a default nobody in this repository owns.* Third instance, same lesson.
+
+It also very likely explains an open Week 0 item. Week 0 Day 2 recorded exit code `137` where the arithmetic predicted `0`, and `137` is `128 + 9` — SIGKILL. A handler outliving `docker stop`'s 10 s grace period produces exactly that. **Not confirmed** — it needs `Measure-Command { docker stop ... }` against a known handler duration — but it is now a specific hypothesis rather than an unexplained number.
+
+**Why it matters for Relay:**
+
+- **Week 2's shutdown hardening has two separate problems, not one.** Slicing the poll sleep (or replacing it with an `asyncio.Event`) fixes the idle case and brings 1.123 s down to milliseconds. It does **nothing** for the mid-job case. That one needs either a handler timeout (Relay decides how long a job may run) or a documented promise that Relay's grace period must exceed the slowest handler. These are different decisions with different costs and they should not be bundled.
+- **A handler timeout is not free, and `P-02` already says why.** *"You can request that something stop, but whether it stops promptly depends on whether the runtime can interrupt what is currently executing."* An `asyncio.wait_for` around the handler cancels at an `await` point; a handler doing CPU-bound work between awaits will not be interrupted, and Week 0 Day 1 measured what CPU-bound work inside the event loop costs (`6.04 s` vs `2.04 s`). So a timeout would bound *cooperative* handlers only, and stating it as a guarantee would repeat `P-04`'s mistake.
+- **The 160 ms teardown is a floor.** Any future claim like "the worker stops in under X" has to include it. Measured twice, consistently.
+
+**Signal caveat, and it must be carried wherever these numbers are cited.** Both measurements used **`SIGBREAK`**, not `SIGINT`, because `SIGINT` cannot be delivered to another process on Windows. `run_worker()` registers both to the same handler, so every line executed after the flag is set is identical, and the latency-determining line is the same in both cases. Two consequences: the numbers are sound as *loop* measurements, and this is also the **first evidence that the `SIGBREAK` registration works at all** — it was added in Din 4 behind a `hasattr` guard and never tested. A real `Ctrl+C` keypress remains untimed.
+
+**Open:** what a *second* signal should do while a handler is still running. Nothing in the code distinguishes the second from the first, so today a second `Ctrl+C` does nothing extra. Making it force-exit would trade contract #1 (an accepted job is not silently lost) for a faster stop, and would manufacture a stuck job on purpose. That is a real decision and it belongs in Week 2 alongside the reaper, because the reaper is what would make it survivable.
+
+---
+
+## P-16 — `status = 'running'` is one value covering two situations that differ in whether side effects happened, and the database currently cannot tell them apart
+
+**Status: MEASURED** on Din 5. Both situations are sitting in the `relay` database right now, which is what makes this concrete rather than theoretical.
+
+**The problem:** Din 5 finished with three rows in `running`, and they are not the same kind of thing:
+
+| Job | Status | `job_executions` row | What actually happened |
+|---|---|---|---|
+| **41** | `running` | **none** | Din 4 lock probe. The claim committed; the handler was **never entered** |
+| **63** | `running` | present (`worker-18960`) | `kill -9` ≈ 3 s into an 8 s handler |
+| **65** | `running` | present (`worker-24152`) | `kill -9` ≈ 3 s into an 8 s handler |
+
+Query `jobs` alone and all three are identical: `status = 'running'`, `attempts = 0`, a `created_at` that is **enqueue** time and says nothing about when the work started. A recovery mechanism reading only this table has no basis for treating them differently — and they must be treated differently, because job 41 definitely did nothing and job 63 ran arbitrary code for ~3 s.
+
+Job 41 also matters for a second reason: Din 4 identified the "claimed but no execution row" window as `[INFERRED from code]`, argued it was millisecond-wide, and never reproduced it. Job 41 shows the *state* is reachable by a completely different route. So a reaper cannot dismiss it as improbable.
+
+**Why this is interesting: it is `P-04` in a new costume, and the gap is in the schema rather than in a constraint.** `P-04`'s rule is that a constraint can only enforce an invariant that fits inside one row at one point in time. Here the problem is upstream of enforcement — **the information a reaper needs was never recorded.** Three questions, and `jobs` answers none of them:
+
+| What a reaper needs to know | What `jobs` can tell it |
+|---|---|
+| When did this job start executing? | Nothing. `created_at` is enqueue time |
+| Which worker holds it, and is that worker alive? | Nothing. `worker_id` is not in `jobs` |
+| Was the handler entered — might side effects exist? | Nothing |
+
+`job_executions` answers the third and partially the second, which is more than `jobs` does — but `D-21` deliberately built it as an **instrument**, with no foreign key and no index, and `P-11` established that it records *handler dispatches*, not executions. Making the reaper depend on it would quietly promote a debugging aid into a correctness-critical structure, which is a different decision than the one `D-21` actually made.
+
+And even with both tables, the fundamental question is unanswerable: **"is this worker dead, or just slow?"** Din 5 measured that the killed worker's connection vanished from `pg_stat_activity` immediately, so *at that moment* the answer was visible. It is not visible later, and it is not visible at all from the row — which is Week 0's recurring lesson for the fifth time (Day 2 could not tell a dead worker from a slow one; Day 3 a dead client from an idle one; Day 4 a down network from a slow one; `P-05` "created earlier" from "committed earlier"). Every one of them has the same root: *the only evidence available was recorded before the event that matters.*
+
+**Why it matters for Relay — this is Week 2's design constraint, stated as a constraint rather than a solution:**
+
+The reaper's decision rule wants to be something like *"reset to `pending` any job that has been `running` too long"*, and **no column exists to express "too long"**. That is the whole problem statement, and it is better to arrive at Week 2 knowing which column is missing than to add `lease_expires_at` on faith.
+
+Two consequences that are already visible:
+
+1. **Whatever the reaper does, it is a guess, and the direction of the guess decides which contract point breaks.** Reset a job whose worker is alive and merely slow → the job runs twice, and contract #2 (duplicate execution does not duplicate side effects) is what protects Relay, which is Week 3's work and does not exist yet. Refuse to reset until certain → the job never recovers, and contract #1 (accepted jobs are not silently lost) breaks instead. **There is no third option**, because the information needed to be certain does not exist. `P-01`'s framing applies exactly: this is not a decision made on bad information, it is a decision made in the *absence* of information, and safety has to come from the receiving side being idempotent.
+2. **Jobs 41, 63 and 65 are the test fixture.** They are deliberately left in the database. A reaper that handles 63 and 65 but not 41 handles the crash it was designed for and not the state that actually occurred first. Week 2's first commit should be measured against all three.
+
+**Open, and deliberately not decided here:**
+- **Does "handler finished" deserve a row?** Din 5 Step 1 asked this and it was not answered. Today the completion evidence is a `print` that dies with the terminal, which is why M3's differential — same database state, "finished" print present or absent, two entirely different truths — is currently only observable by a human watching a console. A completion row would let a reaper distinguish "finished but the mark was lost" from "died mid-handler". Cost: another write per job, and `D-21` already priced the symmetric decision for the *start* evidence.
+- **Which table owns the lease?** A `claimed_at` / `lease_expires_at` / `locked_by` on `jobs` keeps the reaper's query on one table and makes the claim a wider `UPDATE`. Putting it on `job_executions` reuses the append-only history but promotes an instrument to a load-bearing structure, against `D-21`'s stated intent.
+- **What is a sane lease duration when the handler has no timeout?** `P-15` shows Relay does not bound handler runtime, so any lease shorter than the slowest handler manufactures duplicate execution on purpose. The lease and the handler timeout are therefore **one decision, not two**, and neither exists yet.

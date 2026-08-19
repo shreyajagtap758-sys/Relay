@@ -868,3 +868,301 @@ Second, smaller, and it is the question `P-13` forces: if a forgotten worker can
 
 ---
 
+## Day 5 — `kill -9` mid-job: make a job disappear, then prove nobody can find it (2026-08-18)
+
+**Original goal (from the BRIEF):** seven steps. Add one slow handler and nothing else; kill a worker mid-handler; prove the row is stuck and that nothing recovers it; contrast that against a graceful `Ctrl+C` **and finally record the shutdown numbers Din 3 asked for twice**; run three genuinely-overlapping workers with one killed and report the overlap window; then write Week 2's problem statement in your own words and finish DDIA Ch 7.
+
+**Goal met?** **Steps 0–5: yes, and the experimental discipline was the best of the week.** Every count reconciles exactly, the bench was clean before and after, and the `P-12` debt from Din 4 is genuinely repaid — this time the workers really did overlap. **Steps 1, 4 and 6 are partially open**, and the day was handed over as *"100% COMPLETE & VERIFIED"*, which is not supportable. Specifically: Step 1's design judgement was not recorded, Step 4's two elapsed times are still ranges with no stated method (so Din 3's debt is **not** closed), and Step 6 — the four Week 2 questions and DDIA Ch 7 — has no evidence at all. Step 6 is the step that produces Din 6's input, so it is the expensive one to have skipped.
+
+**Anything else learned?** Yes, and two of them are better than anything on the plan. The three workers were not merely overlapping — they locked into **convoy**, claiming within **4 microseconds** of each other, repeatedly, with zero duplicates (`P-14`). And the graceful shutdown numbers, once actually measured, show that **graceful shutdown latency is bounded by the slowest handler and Relay has no handler timeout** — which means the graceful path degrades into today's crash path whenever a handler outlives the shutdown grace period (`P-15`). Neither was predicted.
+
+> **Provenance — read before trusting the numbers below.**
+>
+> I wrote every line of `src/` myself, and **M1–M6 are my own measurements** — the experiments, the kills, the snapshots, the arithmetic. That is the largest share of self-run measurement in any day this week.
+>
+> **M7–M13 are the reviewer's** and are marked `[R]`. They are of two kinds: verification of my closing bench state (M7, M13), and the measurements I reported as ranges rather than numbers (M11, M12) or derived incorrectly (M8, M9, M10).
+>
+> **One of my reported results was falsified:** the job-to-worker attribution in Step 5 (M8). **Two of my reported numbers were not measurements at all**, they were plausible ranges (M11, M12) — the BRIEF explicitly warned against exactly this, in writing, in Part C.
+>
+> **My Part B prediction answers were not handed over**, so **this day is unscored.** See the self-check.
+
+---
+
+### 📊 Measured / Observed
+
+**M1 — C0, starting bench.** 0 worker processes, 1 connection to `relay` (my `psql`), 0 `idle in transaction`. `jobs`: 58 rows — 49 `succeeded`, 8 `failed`, **1 `running` (job 41)**, 0 `pending`; `max(id) = 58`. `job_executions`: 30 rows.
+
+**The stuck-job baseline was correctly taken as `1`, not `0`.** Every stuck count below subtracts job 41. This is the thing the BRIEF said would decide whether the day's headline number meant anything, and it was done right.
+
+**M2 — Control run, the slow handler (job 59).** `handle_slow` added: prints on entry, `await asyncio.sleep(8.0)`, prints on exit.
+
+```
+19:19:12.553  [worker-22720] [SLOW HANDLER] Work started...
+19:19:20.571  [worker-22720] [SLOW HANDLER] Work completed.   (elapsed 8.02 s)
+```
+
+`jobs.status = 'succeeded'`, exactly **one** `job_executions` row (`job_id = 59`, `worker_id = 'worker-22720'`). Both prints present. The handler genuinely takes ~8 s, so it is actually interruptible — which was the point of the control run.
+
+**M3 — `kill -9` mid-handler (job 63).** Worker `worker-18960` claimed job 63, wrote its execution row, entered the handler. At **t ≈ 3 s** into the 8 s handler, `Stop-Process -Force`.
+
+| Evidence | State |
+|---|---|
+| `[SLOW HANDLER] Work started...` | present |
+| `[SLOW HANDLER] Work completed.` | **absent** |
+| `jobs.status` | **`running`** |
+| `jobs.attempts` | `0` |
+| `job_executions` row | **present** (`job_id = 63`, `worker_id = 'worker-18960'`) |
+| the worker's connection in `pg_stat_activity` | **gone immediately**, 0 transactions left open |
+
+**That pair — execution row present, completion print absent, status `running` — is the definition of a stuck job**, and it is the differential the BRIEF asked for. The same database state with the completion print *present* would mean something entirely different (handler finished, only the mark was lost). The database cannot tell those apart. The terminal could.
+
+The row is `running` and not `pending`, which settles the rollback question directly: **the claim transaction had already committed**, so the connection dying rolled back nothing. There was no open transaction to roll back — the worker commits the claim, then commits the execution row, then runs the handler with no transaction held. That is Din 3's Trap 2 avoided, and this is the measurement that proves it was avoided.
+
+**M4 — Nothing recovers it.** Stuck count (`SELECT count(*) FROM jobs WHERE status='running'`):
+
+| Reading | Count | Minus baseline |
+|---|---|---|
+| immediately after the kill | 2 | 1 |
+| +1 minute | 2 | 1 |
+| +5 minutes | 2 | 1 |
+| after a **fresh worker polled for ~30 s** | 2 | 1 |
+
+The last row is the one that matters. The first three could be explained by "nobody was looking"; a running, visibly-polling worker that still ignores the row cannot. Reason, from the claim query itself: `WHERE jobs.status = 'pending'`. Job 63 is `running`, so it is not in the result set — not skipped, not locked, **not visible**.
+
+**M5 — Graceful contrast** (this is the table Din 3 asked for; see M11/M12 for what is still wrong with it).
+
+| Case | Handler finished? | Final status | Exit code | Elapsed | Stuck jobs added |
+|---|---|---|---|---|---|
+| `Ctrl+C` mid-job | ✅ yes, "Work completed" printed | `succeeded` | `0` | *"~5–6 s"* — see M12 | 0 |
+| `Ctrl+C` idle | — (queue empty) | — | `0` | *"~1–2 s"* — see M11 | 0 |
+| `Stop-Process -Force` mid-job | ❌ no | **`running`** | n/a, force-killed | instant | **+1** (job 63) |
+
+The two exit codes are real discrete measurements and they close half of Din 3's debt. The two elapsed times are **not measurements** — they are ranges with no stated method, which is precisely what Part C said not to do (*"State the method and its resolution. 'Not recorded' is a better entry than a plausible number"*). Measured properly in M11 and M12.
+
+**M6 — Three workers, one killed, and this time they really overlapped.** 9 slow jobs seeded (65–73), three workers started from one command:
+
+```
+worker-24152   first claim 19:40:28.184
+worker-14652   first claim 19:40:28.194   (+9.2 ms)
+worker-2060    first claim 19:40:28.197   (+12.6 ms)
+```
+
+All three claimed within **12.6 ms**. Against Din 4's accidental 10 s and 23 s stagger, this is the clean run `P-12` demanded. `worker-24152` was force-killed at t ≈ 3 s while executing job 65. The remaining two drained the queue: **4 jobs each**, total drain ≈ **32.2 s**, **0 duplicates**, stuck count `3 − 1 baseline = 2` (jobs 63 and 65).
+
+The arithmetic closes exactly, which is worth stating because it means the prediction was derivable: 9 jobs, one worker lost in round 1 → 1 job stranded, 8 jobs across 2 workers → 4 rounds × 8 s = **32 s**. Measured 32.2 s.
+
+**Closing reconciliation, and it is exact:**
+
+```
+58 (C0)  + 1 (job 59, control)  + 3 (jobs 60-62, extra runs)
+         + 1 (job 63, crash)    + 1 (job 64, Step 4)
+         + 9 (jobs 65-73, Step 5)                            = 73 jobs
+```
+
+---
+
+#### Reviewer measurements
+
+**M7 — Closing bench state, independently verified.** `[R]` Every number the dossier reported is correct:
+
+| Reading | Value |
+|---|---|
+| `jobs` | **73** rows — 62 `succeeded`, 8 `failed`, **3 `running`**, 0 `pending`; `max(id) = 73` |
+| `running` | jobs **41** (Din 4 baseline), **63** (Step 2 crash), **65** (Step 5 crash) |
+| `attempts` on all three | `0` |
+| `job_executions` | **45** rows, `max(id) = 46` |
+| duplicates over jobs 59–73 | **0** — 15 rows, 15 distinct `job_id`s |
+| worker processes | **0** |
+| connections to `relay` | 1 (`psql`), 0 `idle in transaction` |
+
+The sequence reconciles too, which is a stronger check than the row count: Din 4 closed at 30 rows with `max(id) = 30` and id `31` consumed by a probe, so Din 5's 15 handler entries took ids **32–46**. 30 + 15 = 45 rows, `max = 46`. **Every one of the 15 jobs entered a handler exactly once — no duplicate, none missing.** Note that includes jobs 63 and 65: they were killed *inside* the handler, and their rows exist because the row is written before the handler is entered.
+
+**M8 — The Step 5 job-to-worker attribution is wrong.** `[R]` The counts are right, the assignment is not:
+
+| | Reported | **Measured** |
+|---|---|---|
+| `worker-14652` | 66, 68, 70, 72 | **66, 69, 70, 73** |
+| `worker-2060` | 67, 69, 71, 73 | **67, 68, 71, 72** |
+
+Four of the eight jobs are attributed to the wrong worker. The 4/4 split, the 0 duplicates, and the drain time are all unaffected, so **no conclusion changes** — but the reported pattern is a clean alternation, which is what the assignment would look like if it had been *assumed* from the split rather than read from `job_executions`. Worth flagging precisely because it is harmless here: the habit of filling in a plausible pattern is the same habit that produced M11 and M12, where it was not harmless.
+
+**M9 — The real overlap window, and the convoy.** `[R]` The BRIEF asked for two different things and the dossier reported only the first.
+
+*Claim-start spread* (reported): 12.6 ms. *The time span in which more than one worker was executing* (asked for, not reported), derived from `job_executions.executed_at` plus the known 8.0 s handler:
+
+| Window | Span |
+|---|---|
+| all **three** workers executing concurrently | ≈ **3.0 s** (28.197 until the kill at ≈ 31.18; kill time is a reported clock reading, not measured) |
+| **two or more** workers executing concurrently | ≈ **32.1 s** (28.194 until the last handler ends at ≈ 60.34) |
+
+So contention was not a 12 ms artifact at the start — it was **continuous for the entire run**. And the reason is the finding:
+
+```
+round 1   65 @ 28.184853   66 @ 28.194062   67 @ 28.197500
+round 2                    69 @ 36.246402   68 @ 36.246398      4 µs apart
+round 3                    70 @ 44.303430   71 @ 44.303470     40 µs apart
+round 4                    73 @ 52.342706   72 @ 52.342702      4 µs apart
+```
+
+Two workers, started together, running handlers of **identical** duration, finish together and re-poll together. They stayed in lockstep for three consecutive rounds, claiming **4 microseconds apart** — against Din 4's 6 ms, which was the best contention the week had produced until now. Zero duplicates throughout. Written up as `P-14`, because the mechanism generalises: *equal service times synchronise workers, so claim contention is highest exactly when the queue is busiest.*
+
+Honest limit on what this shows: from database state alone I cannot tell whether `SKIP LOCKED` skipped a locked row or the compare-and-set guard fired, because no worker's `rowcount = 0` branch output was captured. **That the claim is safe at 4 µs separation is measured. Which of the two mechanisms did the work is still `[INFERRED]`.**
+
+**M10 — Per-job overhead outside the handler.** `[R]` Derived from the same timestamps. Round-to-round wall time for a worker in convoy, against a handler that sleeps exactly 8.000 s:
+
+```
+8.052 s   8.057 s   8.039 s        →  overhead 39-57 ms per job
+```
+
+That overhead covers the mark transaction, the next claim transaction, and the execution-row insert — three round trips. Against Din 2's measured 7.5 ms for a single `INSERT + COMMIT` on this machine, three transactions at ~40–57 ms is the right order of magnitude. **No poll sleep is involved**: the queue was non-empty, so the loop never reached `asyncio.sleep(POLL_INTERVAL_SECONDS)`.
+
+**M11 — Idle graceful shutdown, actually measured.** `[R]` Method: worker spawned in a new process group, `CTRL_BREAK_EVENT` delivered by `os.kill`, `perf_counter` started immediately before the signal and stopped when `Popen.wait()` returned. Sub-millisecond timer; the unquantified part is signal delivery latency.
+
+> **Signal caveat, and it matters for how this is cited.** This used **`SIGBREAK`**, not `SIGINT`, because `SIGINT` cannot be delivered to another process on Windows. `run_worker()` registers both to the same `request_shutdown`, so every line after the flag is set is identical — but the number below is a SIGBREAK number, and it is also the **first evidence that the `SIGBREAK` registration works at all**, which Din 4 left as an open item.
+
+```
+-1.041 s   COMMIT                     ← last idle poll ends, 2.0 s sleep begins
+ 0.000 s   CTRL_BREAK_EVENT sent
++0.003 s   "Signal SIGBREAK received. Finishing current job before shutdown..."
++0.962 s   "Clean shutdown complete. Exiting with code 0."
++1.123 s   process exited, code 0
+```
+
+**Elapsed signal → exit: `1.123 s`. Exit code `0`.**
+
+The mechanism is now visible rather than inferred, and it is a two-part answer:
+
+1. **The handler runs immediately — 3 ms.** `asyncio.sleep` does not delay signal *delivery*.
+2. **The loop does not notice for the remainder of the current sleep.** The signal landed 1.041 s into a 2.0 s sleep, leaving 0.959 s. The shutdown line printed at **0.962 s**. Predicted 0.959, measured 0.962 — **3 ms apart.**
+
+This is `P-10`'s *"observed up to one poll interval late"* moved from `[INFERRED from code]` to `[MEASURED]`. The upper bound is `POLL_INTERVAL_SECONDS = 2.0 s`; the actual value depends on where in the sleep the signal lands, so it is uniform in `[0, 2.0]`. The reported *"~1–2 s"* describes roughly the right spread, but for the wrong reason — that spread is not measurement uncertainty, it is a real dependence on signal phase.
+
+One extra number that fell out: **~161 ms between the final print and process exit** — interpreter teardown, asyncio loop close, connection pool disposal.
+
+**M12 — Mid-job graceful shutdown, actually measured.** `[R]` Same method. One `slow` job seeded (job 74), signal sent 3 s into the 8 s handler.
+
+```
+-3.017 s   "[SLOW HANDLER] Work started..."
+ 0.000 s   CTRL_BREAK_EVENT sent
++0.002 s   "Signal SIGBREAK received. Finishing current job before shutdown..."
++4.998 s   "[SLOW HANDLER] Work completed."      ← handler ran to completion
++4.998 s   "Finished execution for job 74."
++5.003 s   "Marked job 74 as 'succeeded' (rowcount=1)."
++5.007 s   "Clean shutdown complete. Exiting with code 0."
++5.167 s   process exited, code 0
+```
+
+**Elapsed signal → exit: `5.167 s`. Exit code `0`. Job 74 → `succeeded`. No stuck job added.**
+
+Decomposed, every part accounted for:
+
+| Component | Measured |
+|---|---|
+| signal delivery to handler | 2 ms |
+| remainder of the 8.0 s handler (signal at t = 3.017 s) | 4.998 s — arithmetic predicted 4.983 s, **15 ms apart** |
+| mark-status transaction | 5 ms |
+| loop check + final print | 4 ms |
+| interpreter teardown | **160 ms** — and M11 measured 161 ms, so this is a stable cost, not noise |
+
+**The two cases have completely different upper bounds, and that is the finding.** Idle shutdown is bounded by `POLL_INTERVAL_SECONDS`, a constant I chose. Mid-job shutdown is bounded by **the handler's own duration**, which Relay does not bound at all — there is no execution timeout anywhere in `run_worker()`. Written up as `P-15`.
+
+**M13 — There are two structurally different stuck jobs in the database right now.** `[R]`
+
+| Job | Status | `job_executions` row | How it got stuck |
+|---|---|---|---|
+| **41** | `running` | **none** | Din 4 lock probe — claim committed, handler never entered |
+| **63** | `running` | present (`worker-18960`) | `kill -9` at t ≈ 3 s inside the handler |
+| **65** | `running` | present (`worker-24152`) | `kill -9` at t ≈ 3 s inside the handler |
+
+Job 41 is an accidental existence proof for the crash window that Din 4 listed as `[INFERRED from code]`: **a `running` job with no execution row.** Din 4 argued that window was millisecond-wide and never reproduced it; job 41 shows the *state* is reachable by other means, so a recovery mechanism has to handle it.
+
+And the consequence is Week 2's actual constraint: **`status = 'running'` is one value covering two situations that differ in whether side effects may have occurred.** A reaper reading `jobs` alone sees three identical rows. It cannot tell 41 (nothing ran) from 63 (a handler ran for ~3 s and may have done anything). Written up as `P-16`.
+
+---
+
+### 💡 What I Understood
+
+> **Written by the reviewer from what the session established. Rewrite in your own words before treating any of it as yours** — and this matters more than usual today, because Step 6 was supposed to produce the same content in your own words and did not.
+
+**The day's real output is not "the job got stuck". It is the exact shape of the evidence a stuck job leaves.** That was the BRIEF's stated purpose and it was achieved: a `running` row, an execution row naming a worker that no longer exists, `attempts = 0`, and no completion evidence anywhere except a terminal that is now closed. Everything Week 2 builds has to work from precisely that.
+
+**Nothing in Relay can see a `running` row, and that is not a bug — it is the direct cost of a decision already recorded.** The claim query says `WHERE status = 'pending'`. `D-06` chose compare-and-set as the transition guard, which means a row is claimable only from `pending`. A crashed worker leaves the row in a state that is, by construction, unreachable. So recovery cannot come from a worker (they only look at `pending`) and cannot come from Postgres (nothing was left uncommitted to roll back — M3 proves this: the row is `running`, not `pending`). It has to come from **outside every participant**, which is the third time this repository has hit that shape: `P-06`'s abandoned sessions needed `pg_terminate_backend` from a fourth session, `P-13`'s forgotten workers needed killing from outside, and now a stuck job needs a reaper.
+
+**The crash path and the graceful path are the same path, separated only by a deadline.** This is the day's best finding and it was not on the plan. M12 shows graceful shutdown waits for the handler to finish, with no bound on how long that is. So a 30 s handler under a 10 s `docker stop` grace period, or a 60 s handler under Kubernetes' 30 s default, produces: SIGTERM → handler still running → grace expires → SIGKILL → **exactly job 63**. The graceful path *degrades into the crash path* as a function of handler duration. Two things follow: Week 0 Day 2's unexplained exit code `137` is very likely this same mechanism, and "we shut down gracefully" is not a property of the code alone — it is a property of the code **and** a timeout owned by whatever supervises the process. Same family as Din 2's `synchronous_commit` and `P-06`'s `idle_in_transaction_session_timeout`: **the guarantee lives partly in a default this repository does not own.**
+
+**Equal service times are an anti-feature for a queue, and the instrument proved it.** M9's 4 µs claims are not luck. Workers that start together and run identical-duration handlers finish together and re-poll together, so they converge into a convoy and collide on every round. A real workload with varied handler durations would drift apart and contend *less*. The uncomfortable corollary: `SKIP LOCKED` matters most in the synthetic benchmark and least in production, which is the opposite of the usual assumption, and it means today's zero-duplicate result under 4 µs contention is a **stronger** safety result than a realistic workload would have produced. Good news, honestly obtained.
+
+**A baseline is what made every number today readable.** M1 recorded `running = 1` before anything ran, so "3 stuck" could be reported as "2 added". Without it the day's headline would have been off by 50% in a way no later query could have detected — job 41, 63 and 65 are indistinguishable by status. This is the second time the same discipline has paid off (Din 4's reconciliation was the first), and it is now the most reliable habit in the project.
+
+**And the discipline that is still missing is the opposite one: reporting what was measured instead of what was expected.** Three instances today, on a day when the BRIEF warned about it explicitly and in advance. M8 filled in an alternating pattern that the data does not show. M11 and M12 reported ranges — *"~5–6 s"*, *"~1–2 s"* — where the real answers were `5.167 s` and `1.123 s`, obtainable in about ninety seconds of work. The `1.123 s` in particular contains a 3 ms agreement with the arithmetic, which is the kind of result that only exists if the number is real. **A range is not a cheap measurement; it is a different and much weaker claim.** Din 3 asked for these four numbers, Din 4 recorded them as still owed, Din 5 was built specifically to close them, and half of them are still open.
+
+---
+
+### 🧠 Self-Check — **not scored, and the reason is a gap, not a choice**
+
+**The Part B prediction answers were not handed over.** The dossier is entirely measured results. Under the protocol a day is scored by comparing *written predictions* against *observed outcomes*, with `idk` recorded as a legitimate answer — and none of that input exists here, so no fraction can be produced. Days 1–4 scored 0/9, 62%, and two unscored; **a missing score is not the same as a good one**, and the running pattern (measurements strong, concept formation weak) is precisely what the score exists to track.
+
+If the predictions were written down, paste Part B alongside them and this can be scored properly.
+
+What can be audited without them is which Part B questions the day's *results* actually answer, and which are still untouched:
+
+| Part B | Answered by today's evidence? |
+|---|---|
+| 2.1 status is `running`, not `pending`/`failed` | ✅ M3, and the reason (claim already committed) is measured |
+| 2.2 what was rolled back when the connection died | ✅ M3 — nothing, no transaction was open |
+| 2.3 is there an execution row | ✅ M3 — yes |
+| **2.4 a crash timing with NO execution row** | ✅ **accidentally, by job 41** (M13) — this was predicted as a millisecond window and the state turns out to be reachable another way |
+| 3.1 / 3.2 nothing recovers it, and why | ✅ M4 — including the fresh-worker check that makes it a real result |
+| 3.4 what distinguishes "died" from "slow" in `pg_stat_activity` | ⚠️ partially — the connection vanished, but the honest answer (nothing distinguishes them *once the row is all you have*) belongs to Step 6, which is missing |
+| 4.1 / 4.2 handler completes, exit code | ✅ M5, M12 |
+| **4.3 / 4.4 elapsed, and which line sets the upper bound** | ❌ **reported as ranges.** Now measured in M11/M12 — but by the reviewer, so it is `[R]` |
+| 4.6 second `Ctrl+C`, and which contract point it trades | ❌ not addressed |
+| 5.1 the arithmetic | ✅ 32 s predicted, 32.2 s measured — the cleanest prediction/measurement agreement of the week |
+| 5.2 stuck jobs with prefetch of 5 | ❌ not addressed |
+| 5.3 which Din 4 measurement tells you about duplicates | ❌ not addressed |
+| 5.4 what result would mean the experiment was broken | ❌ not addressed — and this is the question that would have caught M8 |
+| **6.1 / 6.2 the reaper's SQL predicate, and why it fails** | ❌ **Step 6 entirely missing.** This is Din 6's input |
+
+**One thing that was genuinely, unambiguously done well and is worth saying once:** the bench hygiene. Zero workers before, zero after, `pg_stat_activity` checked at both ends, a baseline taken before anything ran, and a 15-row arithmetic reconciliation that closes to the exact sequence value. `P-13` was a Din 4 embarrassment and it did not recur. That is the part of the week that is now genuinely a habit rather than a checklist item.
+
+---
+
+### 🚧 Unresolved / Follow-ups
+
+**New, from today:**
+- **`P-14` — the convoy effect.** Equal handler durations synchronise workers into lockstep; measured at 4 µs claim separation with 0 duplicates. Also means benchmark contention overstates production contention.
+- **`P-15` — graceful shutdown is bounded by the slowest handler, and there is no handler timeout.** So the graceful path becomes the crash path whenever handler duration exceeds the supervisor's grace period. Probable explanation for Week 0 Day 2's exit code `137`.
+- **`P-16` — `status = 'running'` covers two situations that differ in whether side effects happened**, and jobs 41 vs 63/65 are both sitting in the database as proof. This is Week 2's core information problem.
+- **`SIGBREAK` is confirmed graceful** (M11) — Din 4's open item closes. `SIGINT` via a real `Ctrl+C` keypress is still the untimed path, though the code after the flag is identical.
+- **`[R]` on M11/M12 is a real cost.** The two numbers that Din 3 asked for and Din 5 was built to produce are now in the log as reviewer measurements. They are worth re-running yourself once, with a stopwatch in a second terminal, purely so they stop being borrowed.
+
+**Deliberately open, and correctly so:**
+- **Jobs 41, 63, 65 left `running`.** Week 2's input, per the BRIEF's scope guard. Do not clean them up. Week 2's first commit should be measured against exactly these three, and `P-16` is the reason all three matter rather than just one.
+- **Step 1's design judgement** — should "handler finished" evidence be a row rather than a `print`? Not recorded. It is the mirror of `D-21` (which priced the *start* evidence), and it is a real Week 2 decision: a completion row would let a reaper distinguish "finished but the mark was lost" from "died mid-handler", which M3 showed the database currently cannot do. **Numbering note:** the Week 1 plan says Week 2's entries will be `D-03`/`D-04`, but those numbers are **taken** by the schema decisions. Week 2 continues from **`D-22`**. That is the third numbering collision this project has nearly had; grep before assigning.
+
+**Still owed, carried into Din 6:**
+- **Step 6's four answers and DDIA Ch 7 (pp. 233–251).** Din 6 writes `D-01` and `D-02`, and Step 6 was the step that produced the reasoning those entries need. Din 6 absorbs it.
+- **`D-02`'s throughput comparison is still not measured.** Today gives it a clean *baseline* — proven overlap, 4/4 split, 0 duplicates, 32.2 s — but only for `SKIP LOCKED`. There is still no like-for-like run of plain `FOR UPDATE`, no `SERIALIZABLE` run, and no run of `UPDATE ... WHERE status='pending' RETURNING`. `P-12` is repaid; the comparison it was blocking is not yet made.
+- **`rowcount = 0` still never observed**, and M9 makes it more interesting rather than less: two claims 4 µs apart did not produce it. The branch remains untested code.
+
+**Carried over, unchanged:**
+- `P-03` claim-query index — Week 4, `EXPLAIN ANALYZE`.
+- `ACCESS EXCLUSIVE` lock-queue hazard (`D-07`) — inference; procedure known.
+- `POSTMORTEMS.md` entry #2 (Cloudflare) — Week 0 DoD wants 2, there is 1.
+- Week 0 Day 4 Exp B fast-fail vs slow-fail — never reproduced on this machine.
+- Week 0 Day 3 Exp D — pool-load connection count, never recorded.
+
+**Bench note — reviewer additions, stated so the trail stays closed.** M12 seeded **job 74** (`slow`), which ran to completion and is `succeeded`; it holds `job_executions` id **47**. Closing state is therefore **74 jobs** (63 `succeeded`, 8 `failed`, 3 `running`) and **46 execution rows**. Job 74 is deliberately **not** deleted, following Din 4's precedent with jobs 55–58 — deleting it would orphan an execution row and break the reconciliation. Two temporary probe scripts were created in `labs\` and **both were deleted**; no output files were written.
+
+---
+
+### ❓ Question / Next Thought
+
+Din 6 writes `D-01` and `D-02`, and today changed what those entries should say — in one case by supplying the missing argument, in the other by removing one.
+
+**`D-01` gains its strongest Cost item, and it is measured.** The Week 1 plan's `D-01` argues for Postgres-as-queue on the transactional-enqueue win, and lists costs that are all about *load*: polling, MVCC bloat, vacuum pressure, blast radius. Today adds one that is about *correctness*, and it is bigger: **a broker gives you crash recovery for free and Postgres does not.** RabbitMQ redelivers an unacknowledged message when a consumer dies; that is what a consumer ack *is*. Job 63 is the same event in Postgres, and the outcome is a row nobody will ever look at again. So the real trade is not "free outbox pattern versus polling overhead" — it is **free outbox pattern in exchange for writing the redelivery mechanism yourself**, and Week 2 is the invoice. That belongs in `D-01`'s Cost field in exactly those terms, with job 63 cited.
+
+**`D-02` loses a justification it was going to lean on.** The plan's suggested Rejected line for plain `FOR UPDATE` is *"Din 4 C1 me measured — blocking se throughput gira."* `P-12` disqualified that number. Din 4's valid measurement is about **lock wait**, not throughput: work starting 1.25 s into a 6 s lock instead of after it. Today supplies a clean `SKIP LOCKED` baseline but no comparison run, so the throughput claim still has no evidence behind it. Din 6's real work is therefore narrower and harder than "write two ADRs": **for every Cost and Rejected line, find the measurement, or downgrade the wording.** Given that the recurring failure this week has been claiming things as measured that were not, that is the right shape for the day.
+
+And one question for `D-02` that nothing has touched: option (c), `UPDATE ... WHERE status='pending' RETURNING *`, would claim atomically **without any explicit lock at all**. The plan asks whether it would also work. Nobody has run it. It is a two-`psql`-session experiment, and it is the only Rejected line in either entry with **zero** evidence of any kind.
+

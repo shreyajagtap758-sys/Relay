@@ -558,3 +558,68 @@ Result: The database stays lightweight, while large data is handled by appropria
 **Revisit when:** Week 2 adds retries (Cost 2 forces an attempt/claim identifier), or Week 4 defines job retention (forces the FK/cascade question), or the duplicate query gets slow enough to measure (then index `job_id`, with `EXPLAIN ANALYZE`, alongside `P-03`).
 
 ---
+
+## D-01: Postgres as the Queue Substrate (Relay Storage Engine)
+-> Problem:  Background jobs ko reliably store aur orchestrate karne ke liye kaunsa persistence substrate choose karein?
+
+## Options:
+- (a) Postgres (already primary DB)
+- (b) Redis (In-memory Key-Value / Streams)
+- (c) RabbitMQ (Dedicated AMQP Message Broker)
+
+### Chose:  (a) Postgres.
+1. Relay core contract #1 : "Accepted job is NEVER lost". With Postgres ACID compliance and WAL disk fsync, durable storage is guaranteed.
+2. Elimination of Dual-Write Problem : Business logic and Job enqueue can be committed in one atomic transaction. (Free Outbox Pattern):
+````
+BEGIN;
+INSERT INTO orders (id, amount) VALUES (101, 500);
+INSERT INTO jobs (type, payload) VALUES ('send_receipt', '{"order_id": 101}');
+COMMIT;
+````
+-> both operations either commit together or rollback together. In Redis/RabbitMQ, DB write and Broker publish are two different network operations; in middle network timeout or crash = inconsistency (e.g. order ban gaya par email job publish nahi hua).
+
+### Cost: 
+1. Polling Tax & Latency: due to NO Push-based sockets, workers need to do polling . if poll interval is 2s, so after job comes, job pickup may take delay of 2s.
+2. MVCC Table Bloat & Autovacuum Pressure: In Postgres, UPDATE is "delete old tuple + create new tuple" operation. in jobs table, heavy status update causes dead tuples generation (`pending` -> `running` -> `succeeded`), dur to which disk bloat increases and constant load on autovacuum engine.
+3. Shared Blast Radius (4-Roles Model): Ek hi Postgres instance par OLTP business transactional load aur high-frequency queue writes dono chalte hain. Agar DB CPU/connection choke hua, toh API aur background queue dono ek sath down ho jayenge.
+4. Scale Ceiling: Queue depth 100k+ hone par claim index scans (`WHERE status='pending'`) table bloat ki wajah se slow ho sakte hain.
+
+### Rejected: 
+- (b) Redis because: Default volatile in-memory storage. if Host crash or OOM kill, un-flushed memory jobs could evaporate (Contract #1 violation). For solving Dual-write race condition, extra CDC or separate outbox table creation is needed.
+- (c) RabbitMQ because: Week 1 me dedicated operational/infrastructure overhead badhata hai. Plus, separate distributed system hone ke karan distributed transactions (2PC) ya application-level Outbox pattern Postgres me tab bhi implement karna padta.
+
+---
+
+## D-02: SELECT ... FOR UPDATE SKIP LOCKED for Atomic Job Claiming
+-> Problem:  Multiple concurrent workers ke beech duplicate execution (lost update) aur worker starvation ko bina throughput destroy kiye kaise solve karein?
+
+### Options:
+- (a) SELECT ... FOR UPDATE (Row-level exclusive lock without skip)
+- (b) SELECT ... FOR UPDATE SKIP LOCKED (Row-level exclusive lock with lock skipping)
+- (c) UPDATE ... WHERE status='pending' RETURNING * (Status flag atomic update)
+- (d) Advisory Locks (`pg_try_advisory_xact_lock`)
+- (e) SERIALIZABLE Isolation Level (Optimistic concurrency control)
+
+### Chose:    (b) SELECT ... FOR UPDATE SKIP LOCKED.
+
+#### Concurrency control has teen fundamental models :
+- Wait Model (FOR UPDATE): worker waits for lock release.
+- Abort Model (SERIALIZABLE): on conflict, transaction is aborted and gives 40001 error.
+- Skip Model (SKIP LOCKED): bypass the locked row and takes other pending jobs.
+
+-> for Job queues, "Skip Model" is optimal. worker gets new pending jobs instead seating idle or retry rollback. day 4 C2 experiment : 2 workers executed 10 jobs in 10ms without any blocking or duplication (2x throughput vs serialized 20s in C1).
+
+### Cost: 
+1. Strict FIFO Ordering Loss: if job #1 is locked by worker A, so worker B skips job #1 and takes job #2. if job #2 is small, it will be finished before job #1. Queue doesnt stay strictly FIFO .
+2. MVCC Write Amplification: Har claim par row update hone se continuous dead tuples bante hain.
+3. LIMIT Subtlety: Complex subqueries ke sath LIMIT use karne par query planner kabhi-kabhi expected count se kam rows lock karta hai agar intermediate locked rows skip ho jayein.
+
+### Rejected:
+- (a) SELECT ... FOR UPDATE because: day 4 C1 measured — worker 2 freezed on worker 1 to acquire lock. In `pg_stat_activity`, `wait_event_type = 'Lock'` and `wait_event = 'transactionid'` was seen. Concurrency zero ho gayi aur 10 jobs ka total time 20s (sequential) laga.
+- (c) UPDATE ... RETURNING because: Pure atomic update me complex FIFO sorting (`ORDER BY created_at`) aur batching control clean nahi rehta, aur subquery lock order par predictable control nahi milta.
+- (d) Advisory Locks because: Session/Transaction level advisory locks table data rows se loosely coupled hote hain. Inhe maintain karna aur crash recovery handle karna bug-prone hota hai.
+- (e) SERIALIZABLE Isolation because: Week 0 Day 5 Exp 2 me measured — high concurrency par Postgres SQLSTATE 40001 `serialization_failure` throw karke transaction abort kar deta hai, jisse CPU compute waste hoti hai aur application layer par heavy retry logic likhna padta hai.
+
+---
+
+
