@@ -3,6 +3,8 @@
 !.env.example
 
 docs/revision.md
+docs/daily/
+docs/DDIA_SUMMARIES/
 
 __pycache__/
 *.py[cod]
