@@ -55,11 +55,23 @@ class Job(Base):
         server_default=func.now(),
     )
 
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
     )
+
+    lease_expires_at : Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True
+    )
+
+
 
     __table_args__ = (
         CheckConstraint(
@@ -67,12 +79,6 @@ class Job(Base):
             name="jobs_status_check",
         ),
     )
-
-    def __repr__(self) -> str:
-        return (
-            f"<Job(id={self.id}, type={self.type!r}, "
-            f"status={self.status!r}, attempts={self.attempts})>"
-        )
 
 
 
