@@ -14,7 +14,7 @@ from relay.models import Job
 
 
 POLL_INTERVAL_SECONDS = 2.0
-LEASE_DURATION_SECONDS = 30
+CLAIM_TIMEOUT_SECONDS = 5.0
 REAPER_ID = f"reaper-{os.getpid()}"
 SHUTDOWN_REQUESTED = False
 
@@ -32,7 +32,7 @@ async def reap_stuck_jobs() -> int:
         async with session.begin():
             predicate = or_(
                 Job.claimed_at.is_(None),
-                Job.claimed_at < func.now() - text(f"interval '{LEASE_DURATION_SECONDS} seconds'"),
+                Job.claimed_at < func.now() - text(f"interval '{CLAIM_TIMEOUT_SECONDS} seconds'"),
             )
             select_stmt = (
                 select(Job.id, Job.status, Job.claimed_at)
@@ -75,7 +75,7 @@ async def reap_stuck_jobs() -> int:
 
 async def run_reaper() -> None:
     print(
-        f"[{REAPER_ID}] Starting reaper process (PID: {os.getpid()}, poll={POLL_INTERVAL_SECONDS}s, lease={LEASE_DURATION_SECONDS}s)..."
+        f"[{REAPER_ID}] Starting reaper process (PID: {os.getpid()}, poll={POLL_INTERVAL_SECONDS}s, lease={CLAIM_TIMEOUT_SECONDS}s)..."
     )
 
     signal.signal(signal.SIGINT, request_shutdown)

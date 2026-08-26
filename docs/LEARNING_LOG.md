@@ -1575,3 +1575,138 @@ Recovery kisne kiya?	      Kisi ne nahi — job stuck reh gayi        	Worker it
 ````
 
 ---
+
+relay cant show or say how many workers are alive, reaper has two situations where it cant tell any difference :
+1. worker crashed
+2. worker is alive but slow/ can create duplicate execution.
+
+reaper's decision is always a guess.
+
+duplication is not a guard failure, this is a time-window result, this needs idempotency not guard.
+- eg : worker A claims a job when its status is pending.
+worker B claimed when job's status is pending(reaper expired and status back to pending).
+- no GUARD was harmed.
+
+
+if worker A claimed a job, and its slow so lease expires.
+reaper does : running -> pending.
+NOW worker b claims the same job and does pending -> running.
+AT THE SAME MOMENT, worker A finally finishes and does status = running -> succeeded(guard matched because worker b picked and status= running while running -> success is valid).
+now worker B is executing while worker A marked succeeded.
+
+status only shows current state, doesn't really gurantee the concurrency.
+Isliye running → pending → running cycle ke baad old Worker A ko new Worker B se distinguish karne ke liye Fencing Token chahiye.
+
+
+why not just kill worker because in case of short lease expiry time we take authority of that job from the expired worker and assign to another, but that worker doesn't die, which can create duplication risk.
+
+- why not kill? if its killed, we dont know how much that worker has completed the work, this creates new problem. second thing is reaper only owns job number, status and lease expiry, it doesn't know worker pid, what machine/container its in, process is alive or not etc.. so this is not the solution or can be done.
+
+thats why we use lease renewal/heartbeat, fencing tokens(for duplications), idempotent handlers(limit duplication damage) etc.
+
+
+
+LOG : 
+before building HEARTBEAT : i tested what happened and how duplication worked :
+
+Job ID = 22
+Type   = slow
+Lease  = 5 seconds
+Slow handler = ~15 seconds
+
+
+11:08:54.058  Worker B claims Job 22 → running
+11:08:54.xxx  Worker B starts slow handler
+
+11:08:55.878  Reaper reclaims Job 22 → pending ❌
+11:08:56.638  Worker A claims SAME Job 22 → running
+11:08:56.xxx  Worker A starts slow handler
+
+               Worker A + Worker B BOTH executing Job 22
+
+11:09:09.130  Worker B finishes first, tries succeeded → rowcount=1
+11:09:11.724  Worker A finishes, tries succeeded → rowcount=0
+
+result rowcount = 0 why? 
+- we have compare-and-set guard :
+
+UPDATE jobs
+SET status = 'succeeded'
+WHERE
+    id = 22
+    AND status = 'running'
+
+so worker sees compare id = 22 and status = running then only set status succeeded, worker B set running, so worker A didn't harm any guard.
+
+so rowcount = 0; meaning worker A tries succees but it already got success by worker B first so conflict on mark error -> rowcount = 1 means job successfully done.
+
+job_id |  worker_id   |          executed_at          
+--------+--------------+-------------------------------
+     22 | worker-11040 | 2026-08-26 05:38:54.064126+00
+     22 | worker-23088 | 2026-08-26 05:38:56.651132+00
+
+
+
+NOW IMPLEMENT HEARTBEAT AND EXECUTE THE SAME :
+
+Worker alive
+    ↓
+heartbeat every ~2 sec
+    ↓
+lease continuously extended
+    ↓
+reaper shouldn't reclaim it
+
+- job = 23, lease = 5 sec, heartbeat = 2 sec
+
+NORMAL SITUATION :
+
+worker A:
+
+11:42:03  Claimed Job 23
+          status = running
+          lease = 11:42:08
+
+11:42:05  HEARTBEAT
+          lease = 11:42:10(extend)
+
+11:42:07  HEARTBEAT
+          lease = 11:42:12
+
+11:42:09  HEARTBEAT
+          lease = 11:42:14
+
+- heartbeat → lease extend → lease expiry future me
+
+
+id |  status   |          claimed_at           |       lease_expires_at        |              now              
+----+-----------+-------------------------------+-------------------------------+-------------------------------
+ 24 | succeeded | 2026-08-26 06:33:34.611379+00 | 2026-08-26 06:33:45.767051+00 | 2026-08-26 06:36:52.215766+00
+(1 row)
+
+
+
+DUPLICATION SITUATION :
+
+WORKER A :
+
+healthy sending heartbeats, but due to some cause :
+
+Worker process crash ho gaya
+Machine/container crash hua
+Network/DB temporarily unavailable
+Event loop block ho gaya
+Heartbeat task itself fail/hang ho gaya
+CPU/resource starvation
+
+heartbeat missed, now if lease expires at that moment, reaper does status = running -> pending, while worker A is still executing, another worker can take it.
+
+
+so Fencing token
+   ↓
+   old worker baad me wapas aaye to
+   new worker ke against kuch modify na kar sake
+
+
+
+

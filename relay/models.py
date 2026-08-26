@@ -66,12 +66,6 @@ class Job(Base):
         server_default=func.now(),
     )
 
-    lease_expires_at : Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True
-    )
-
-
 
     __table_args__ = (
         CheckConstraint(

@@ -2,17 +2,17 @@ import asyncio
 import os
 import signal
 import sys
+from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
 from sqlalchemy import select, update, insert, func, text
 
 from relay.db import async_session
 from relay.models import Job, JobExecution
 
-
 POLL_INTERVAL_SECONDS = 2.0
 WORKER_ID = f"worker-{os.getpid()}"
 SHUTDOWN_REQUESTED = False
-LEASE_DURATION_SECONDS = 30  # integer constant
+CLAIM_TIMEOUT_SECONDS = 5.0
 
 
 def request_shutdown(signum: int, frame: Any) -> None:
@@ -56,6 +56,37 @@ async def record_execution(job_id: int, worker_id: str) -> None:
             )
 
 
+async def send_heartbeat(job_id: int, stop_event: asyncio.Event, interval_seconds: float = 2.0) -> None:
+    """
+    Jab tak handler chal raha hai, har 2 sec me lease deadline extend karega.
+    CAS Guard: WHERE id = :id AND status = 'running'
+    """
+    while not stop_event.is_set():
+        try:
+            await asyncio.sleep(interval_seconds)
+            if stop_event.is_set():
+                break
+
+            async with async_session() as session:
+                async with session.begin():
+                    hb_stmt = (
+                        update(Job)
+                        .where(Job.id == job_id, Job.status == "running")
+                        .values(
+                            claimed_at=func.now()
+                        )
+                    )
+                    result = await session.execute(hb_stmt)
+                    if result.rowcount > 0:
+                        now_str = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                        print(f"[{WORKER_ID}] [{now_str}] [HEARTBEAT] Extended lease for job {job_id} by {CLAIM_TIMEOUT_SECONDS}s.")
+                    else:
+                        print(f"[{WORKER_ID}] [HEARTBEAT] Guard rejected: Job {job_id} is no longer 'running'.")
+                        break
+        except Exception as e:
+            print(f"[{WORKER_ID}] [HEARTBEAT ERROR] {e}")
+
+
 async def run_worker() -> None:
     print(f"[{WORKER_ID}] Starting worker process (PID: {os.getpid()})...")
 
@@ -86,7 +117,7 @@ async def run_worker() -> None:
                         .where(Job.id == job.id, Job.status == "pending")
                         .values(
                             status="running",
-                            lease_expires_at=func.now() + text(f"interval '{LEASE_DURATION_SECONDS} seconds'")
+                            claimed_at=func.now()
                         )
                     )
                     update_result = await session.execute(update_stmt)
@@ -110,16 +141,29 @@ async def run_worker() -> None:
         if not handler:
             print(f"[{WORKER_ID}] Unknown job type: '{job_type}'. Marking failed.")
             new_status = "failed"
+
+            # heartbeat implementation here
         else:
-            try:
-                print(f"[{WORKER_ID}] Executing job {job_id} (type={job_type})...")
-                await record_execution(job_id, WORKER_ID)
-                await handler(payload)
-                print(f"[{WORKER_ID}] Finished execution for job {job_id}.")
-                new_status = "succeeded"
-            except Exception as exc:
-                print(f"[{WORKER_ID}] Job {job_id} raised an exception: {exc}. Marking failed.")
-                new_status = "failed"
+                try:
+                    print(f"[{WORKER_ID}] Executing job {job_id} (type={job_type})...")
+                    await record_execution(job_id, WORKER_ID)
+
+                # Heartbeat background task shuru karein
+                    stop_heartbeat = asyncio.Event()
+                    heartbeat_task = asyncio.create_task(send_heartbeat(job_id, stop_heartbeat, interval_seconds=2.0))
+
+                    try:
+                        await handler(payload)
+                    finally:
+                        # Handler khatam hone par heartbeat task band karein
+                        stop_heartbeat.set()
+                        await heartbeat_task
+
+                    print(f"[{WORKER_ID}] Finished execution for job {job_id}.")
+                    new_status = "succeeded"
+                except Exception as exc:
+                    print(f"[{WORKER_ID}] Job {job_id} raised an exception: {exc}. Marking failed.")
+                    new_status = "failed"
 
         async with async_session() as session:
             async with session.begin():
