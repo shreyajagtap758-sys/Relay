@@ -849,3 +849,21 @@ validate it**: 10 seconds or 10 hours would have produced the same three lines.
   `5:29:59.994671` with a `7.262 ms` read gap `[MEASURED-R]`, so the arithmetic is workable; the missing
   label is what makes a lease bug and a timezone bug read identically in a diff.
 
+---
+
+## P-21 — Lease expiry worker ko rokti nahi hai: Reaper aage nikal sakta hai, rok nahi sakta
+
+### Problem
+Database me lease expire hona aur reaper dwara job ko wapas `pending` mark kar dena ek database-side event hai. Yeh event chal rahe worker process ko physically pause, interrupt, ya cancel nahi karta. Arbitrary user handler code (jaise `asyncio.sleep`, slow I/O, ya CPU-bound calculation) database state se anjaan hokar execute hota rehta hai. 
+
+Iska natija yeh hota hai ki ek taraf pehla worker apna execution continue karta hai, aur doosri taraf reaper dwara reclaim kiye gaye usi same job ko doosra worker claim karke simultaneously chalane lagta hai. Ek hi job do alag workers par simultaneously execute hoti hai aur dono executions individually legitimate hoti hain.
+
+### Why this is interesting
+1. **Guard tootne se nahi, time-window se duplicate banta hai:** Dono workers ne database ke Compare-and-Set (CAS) guards (`WHERE status = 'pending'`) ko honestly follow kiya tha. Kisi process ne koi lock ya constraint bypass nahi kiya, phir bhi duplicate execution physically manifest hua.
+2. **Reaper ki liveness vs correctness tradeoff:** Reaper ka kaam system me liveness lana hai (stuck jobs ko reclaim karna), lekin lease expire hone par reaper ko yeh pata nahi hota ki worker crash ho chuka hai ya sirf slow hai (DDIA Ch 8 *Dead node vs Slow node*). Agar worker sirf slow hai, to reaper ka reclaim action system me correctness violation (duplicate execution) create kar deta hai.
+3. **Status-only guard ki limit:** Jab `running → pending → running` transition hoti hai, to pehla worker jab aakhir me apna status update (`UPDATE jobs SET status = 'succeeded' WHERE id = :id AND status = 'running'`) chalata hai, to wo guard match ho jata hai kyunki doosre worker ne status wapas `running` kar diya tha. Pehla worker us kaam ko succeeded mark kar deta hai jo doosra worker abhi kar raha hota hai.
+
+### Why it matters for Relay
+1. **Contract #2 ki boundary:** Relay ka Contract #1 ("job lose nahi hoga") maintain karne ke chakkar me Contract #2 ("side-effect exactly once hoga") toot jata hai. Reaper duplicate ka window narrow karta hai, band nahi kar sakta.
+2. **Heartbeat ki structural limitation:** Heartbeat is overlap window ko chhota (narrow) karta hai, lekin agar handler thread block ho jaye to heartbeat write bhi nahi bhej pata.
+3. **Week 3 (Idempotency Key) ka foundation:** Yeh problem yeh prove karti hai ki duplicate execution ko database-level locking ya reaper tuning se permanently solve nahi kiya ja sakta. Iska permanent structural solution application-level idempotency keys aur fencing tokens hain, jo aage aayenge.
