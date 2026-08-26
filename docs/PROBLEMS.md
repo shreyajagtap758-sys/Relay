@@ -544,3 +544,308 @@ Two consequences that are already visible:
 - **Does "handler finished" deserve a row?** Din 5 Step 1 asked this and it was not answered. Today the completion evidence is a `print` that dies with the terminal, which is why M3's differential — same database state, "finished" print present or absent, two entirely different truths — is currently only observable by a human watching a console. A completion row would let a reaper distinguish "finished but the mark was lost" from "died mid-handler". Cost: another write per job, and `D-21` already priced the symmetric decision for the *start* evidence.
 - **Which table owns the lease?** A `claimed_at` / `lease_expires_at` / `locked_by` on `jobs` keeps the reaper's query on one table and makes the claim a wider `UPDATE`. Putting it on `job_executions` reuses the append-only history but promotes an instrument to a load-bearing structure, against `D-21`'s stated intent.
 - **What is a sane lease duration when the handler has no timeout?** `P-15` shows Relay does not bound handler runtime, so any lease shorter than the slowest handler manufactures duplicate execution on purpose. The lease and the handler timeout are therefore **one decision, not two**, and neither exists yet.
+
+---
+
+## P-17 — `EvalPlanQual` rechecks the predicate you wrote, not the invariant you meant, so the same mechanism that saved a claim on Din 4 destroys one on Din 6
+
+**Status: MEASURED** on Din 6, in two live `psql` sessions, plus an `EXPLAIN` that shows the mechanism `[R]`.
+
+**The problem:** `UPDATE ... WHERE id = (SELECT id FROM jobs WHERE status='pending' ORDER BY created_at, id LIMIT 1) RETURNING id, status` reads like a safe atomic claim. One statement, no read-then-write gap, no explicit lock to forget. Two workers running it concurrently claimed **the same job**, both with `rowcount = 1`, with no error and no trace anywhere in `jobs`.
+
+**What was measured.** Session 1 ran the statement inside `BEGIN` and did not commit. Session 2 ran the identical statement.
+
+| Step | Observed |
+|---|---|
+| session 2 runs while session 1 holds the row | **blocks** on the row lock — not an error, not an immediate empty result |
+| session 1 commits | session 2 unblocks immediately |
+| session 2 returns | `id = 76`, `status = 'running'`, **`rowcount = 1`** |
+| session 1 had claimed | `id = 76` |
+
+**Both sessions were told they own job 76.** And the part that makes it genuinely dangerous rather than merely wrong: **the row's final state is `status='running'`, which is exactly what one correct claim looks like.** There is no state in `jobs` that distinguishes "claimed once" from "claimed twice". `D-21`'s argument for an append-only instrument arrives here from a completely new direction — the evidence has to live outside the row, because the row cannot hold it.
+
+**Why it happens, and this is the part that cannot be discovered by reading the SQL.** `EXPLAIN` on the statement `[MEASURED-R]`:
+
+```
+Update on jobs
+  InitPlan 1 (returns $0)
+    ->  Limit
+          ->  Sort  (Sort Key: jobs_1.created_at, jobs_1.id)
+                ->  Seq Scan on jobs jobs_1   Filter: (status = 'pending'::text)
+  ->  Seq Scan on jobs   Filter: (id = $0)
+```
+
+The subquery does not reference the outer row, so it is **uncorrelated**. Postgres evaluates it **once, before the scan begins**, as an `InitPlan` yielding a constant `$0`. The outer statement's qualification is therefore literally `Filter: (id = $0)` — **`status` appears nowhere in it.** The statement reads as *"claim the current oldest pending row"*; the plan says *"pick one id, then use that constant."*
+
+Then the second mechanism. Under `READ COMMITTED`, a writer that blocks on a locked row does not wake holding a stale tuple: it re-fetches the newest committed version and **re-evaluates the statement's qualification** against it. That is `EvalPlanQual`, and Din 4 met it with a happy ending — the qual there was `status='pending'`, the row had become `running`, the recheck failed, and the row was correctly dropped.
+
+Here the recheck asks `id = $0`, which is **still true** after session 1 set `status='running'`. So the recheck passes, the row is updated a second time, and `RETURNING` reports success.
+
+**Why this is interesting:** it is `P-04`'s shape in a new material. `EvalPlanQual` is not a concurrency safety feature; it is a **recheck of whatever predicate was supplied**. Variants 1 and 2 of the Din 6 experiment are the *same* mechanism producing *opposite* outcomes, and the only difference is whether the column that changes is mentioned in the qual:
+
+| Variant | Outer `WHERE` | Session 2 result | Verdict |
+|---|---|---|---|
+| 1 | `id = (subquery)` | id 76, `rowcount = 1` | ❌ duplicate claim |
+| 2 | `id = (subquery) AND status='pending'` | none, **`rowcount = 0`** | ✅ safe, but it waited for nothing |
+| 3 | `id = (subquery FOR UPDATE SKIP LOCKED)` | id **77**, no blocking | ✅ safe, and it got work |
+
+And the generalisation that is worth more than the specific bug: **Din 4 over-generalised from a happy accident.** Seeing EPQ correctly reject a stale claim taught the wrong lesson — that the mechanism protects concurrent writers. It protects the predicate. Whether the predicate covers the invariant is entirely the author's problem, and the failure is silent when it does not.
+
+**Two smaller findings that came with it, both first-time observations in this project:**
+
+1. **`rowcount = 0` has now actually been seen.** Din 1 called the compare-and-set guard load-bearing, Din 4 and Din 5 both recorded that its branch had never fired, and Din 5's two workers claimed **4 µs apart** without provoking it (`P-14`). Variant 2 produces it on demand. A branch described as load-bearing for five days has finally been *observed* working rather than argued about.
+2. **`UPDATE 0` is a result, not an error.** `psql` prints it, exit status is `0`, `RETURNING` simply yields no rows. In application code it is visible only if `rowcount` is checked — which is exactly why `D-06` requires the check.
+
+**Why it matters for Relay:** it settles `D-02`'s hardest Rejected line and it does so more precisely than the plan expected. **Option (c) is not broken; the naive form of it is.** `UPDATE ... WHERE id = (subquery) AND status='pending' RETURNING` is a sound single-statement claim, arguably simpler than what Relay ships. What it gives up is variant 3's property: when two workers collide, Relay's form has both doing useful work, whereas (c)-with-guard leaves the loser blocked and then empty-handed.
+
+It also prices Relay's two halves separately, which nothing before Din 6 could do:
+
+| Half | Provides | Without it |
+|---|---|---|
+| `FOR UPDATE SKIP LOCKED` in the claim `SELECT` | **liveness** | variant 2 — correct, but the worker blocks then gets nothing |
+| `AND status='pending'` on the `UPDATE` | **safety** | variant 1 — a silent duplicate claim |
+
+**Still `[INFERRED]`, and Din 6 did not settle it:** which of the two halves kept Din 5's 4 µs claims safe. The clean 4/4 split with no repeated ids is what *skipping* produces, and had the guard been the active mechanism the loser of each race would have printed a `rowcount=0` conflict line and re-polled. But worker stdout was not captured for that run, so this remains inference. **What would settle it is cheap and specific:** capture worker stdout during a convoy run and grep for the conflict line. Zero occurrences alongside a clean split confirms `SKIP LOCKED`; any occurrence means both mechanisms are live and the guard is not merely a backstop.
+
+**Named in the literature:** DDIA Ch 7 calls variant 1 a **lost update** — two writers, one row, the second writer's decision based on a value that changed underneath it — and names **compare-and-set** as one of the standard remedies, alongside explicit locking and atomic write operations. Relay was already using the remedy. Din 6 is the first time the disease was produced on purpose.
+
+---
+
+## P-18 — A verification step whose expected output is produced equally by the mechanism and by the mechanism's absence
+
+**Status: MEASURED** on Din 6, and the check in question was written by the reviewer, which is the part worth recording.
+
+**The problem:** Din 6's Part C, Case B, instructed: insert an order, `ROLLBACK`, then read `jobs_id_seq`. Part B question 1.1 asked *"Case B rolls back an order INSERT **and a job INSERT** together. Afterwards, is the jobs sequence value the same as before?"*, and the KEY listed *"a sequence gap after Case B"* under **outputs that will look wrong but are correct**, citing Din 2's M16 finding that `nextval` is non-transactional.
+
+**The SQL in Case B never inserts a job.** It inserts into `orders_probe` only. So no `nextval` on `jobs_id_seq` is ever called, and the sequence is unchanged for a reason that has nothing to do with transactional semantics.
+
+The day reported the observation faithfully — *"`jobs_id_seq` remained 75"* — which is the correct output. It is also the output that a database where sequences **were** transactional would produce, and the output a database where they are **not** would produce. **The check cannot distinguish the two, so it establishes nothing**, and the KEY's stated expectation (a gap) was not reachable from the SQL as written.
+
+**The differential version, run afterwards** `[MEASURED-R]`:
+
+```
+last_value before          78
+BEGIN; INSERT INTO jobs (type) VALUES ('probe_seq_rollback') RETURNING id;  →  id 79
+ROLLBACK;
+last_value after           79        ← advanced
+count(*) FROM jobs         78        ← unchanged
+max(id)                    78        ← unchanged
+```
+
+Sequence value consumed, no row committed, gap permanent. Din 2's M16 is reproduced, and `P-05`'s first half now has a second independent measurement. Cost of the correct check: one extra statement.
+
+**Why this is interesting:** the project already had a rule for exactly this failure, written after Din 2's `413` bug — *"for each check ask: what wrong implementation would also pass this?"* Din 6's own BRIEF restates that rule at the top of Part C. The rule was then broken **in the same document**, by the person who wrote the rule, in the one case out of six where the check had no differential built into it. Everything else in Din 6's Part C was designed to distinguish: Case A alone proves nothing, so Cases B and C exist; one returned `id` proves nothing, so variant 1 compares *two*; `UPDATE 0` is called out in advance as a result rather than an error.
+
+So the finding is not "one check was weak". It is that **the discipline is not transferable by stating it.** A decorative check is not identifiable by reading it, because a decorative check *passes*. The only reliable test is mechanical and has to be applied per check, not per document: write down the output the check produces if the mechanism is present, then the output it produces if the mechanism is absent, and if the two lines are identical, the check is measuring nothing.
+
+There is a second, quieter observation. The mismatch was between **Part B's question and Part C's SQL** — the question asked about a rollback that the procedure never performed. Both were written in the same sitting, which is what made them feel consistent. A question and the experiment that answers it are two artifacts, and agreement between them is something to verify rather than assume.
+
+**Why it matters for Relay:** three carry-forwards, and the first two are about how the days are built rather than about Relay itself.
+
+- **Part C entries need the two-line table, not the prose rule.** *"What output if the mechanism is present / absent?"* If the two match, the check gets rewritten before the day ships. This is the third instance in the project of a check that passed while measuring nothing (Din 2's `413`, Din 5's reported ranges, now this one), and the first where the flaw was in the design rather than in the reporting.
+- **Reviewer-authored material gets audited on the same terms as the day's own output.** `P-12` disqualified a reviewer-suggested throughput line; this entry disqualifies a reviewer-designed check. Neither was caught by review — both were caught by running something.
+- **Reporting the observed output rather than the expected one is what made this findable.** The KEY said to expect a gap. The day reported "remained 75". Had the number been bent toward the KEY's expectation, the BRIEF's error would have been absorbed as a correct result and `P-05`'s mechanism would still be resting on a single Din 2 measurement. That habit is the opposite of the one Din 5's M8/M11/M12 recorded, and it is worth naming as the day's best process outcome.
+
+---
+
+## P-19 — The lease column adds a second clock and a third meaning to `NULL`, and the column's *name* decides which of them the reaper has to reason about
+
+**Status: MEASURED** on Week 2 Din 1. Three separate measurements, and the third one was not planned.
+
+**The problem:** `jobs` gained one nullable column, `claimed_at timestamptz`, written by the claim's
+compare-and-set `UPDATE` from `func.now()`. One column, one migration, no logic change. What arrived with
+it was not one thing but three, and only the first was expected.
+
+### 1. A second clock, and the decision that kept it at one
+
+Before today, claimability was a **string comparison**: `status = 'pending'`. After today, part of it is a
+**timestamp comparison**, and a timestamp comparison has two sides. Each side can come from a different
+clock, and if they do, nothing errors — the arithmetic still works, the sort order still works, and the
+error is a fixed offset, which is the hardest bug class to see.
+
+Two shapes were available:
+
+| Who computes the value | Clocks involved |
+|---|---|
+| Python: `datetime.now(timezone.utc)` in the worker | Worker's clock writes, database's clock compares — **two** |
+| SQL: `func.now()` in the `UPDATE`'s `SET` | Database writes, database compares — **one** |
+
+The second was chosen, and that is the reason the clock count is still one `[MEASURED]`. This is worth
+recording as a decision rather than a detail, because the two implementations are one line apart and
+produce identical output on a single machine. The difference only appears when the worker and the database
+are on different hosts — which is to say, it appears in production and not in this repo.
+
+**And the offset itself was only half measured.** The day's evidence was `claimed_at = 09:46:55.549+00`
+against `now() = 09:47:05+00`, both from the same `select`. That pair proves the two values share a clock;
+it cannot measure the offset to any *other* clock, because both readings came from the same one. The
+DB-versus-worker-stdout offset had to be recovered afterwards from process start time
+(`15:16:54 IST`) against that connection's `backend_start` (`09:46:55.463+00`) → `5:30:01.46`, of which
+roughly `1.5 s` is interpreter startup and connect `[MEASURED-R]`. Reading one clock twice does not
+measure an offset.
+
+### 2. `NULL` is a third state, and it is silent
+
+86 rows existed before the column did. Option B was chosen — leave them `NULL`, branch in the predicate —
+and the cost was accepted in writing: `(claimed_at IS NULL OR claimed_at < now())` lives in the predicate
+permanently, and it makes **every** `NULL`-lease row reclaimable, including any future writer that forgets
+to stamp the lease.
+
+Measured, on the three fixture rows `[MEASURED]`, reproduced `[MEASURED-R]`:
+
+```
+select count(*) from jobs where status='running' and claimed_at < now();                          -> 0
+select count(*) from jobs where status='running' and (claimed_at is null or claimed_at < now());  -> 3
+```
+
+`NULL < now()` is `NULL`, not `false`, and `WHERE` admits only `true`. So a predicate that reads as
+completely correct matches **none** of the three rows it was built for, and reports success. Stranded row
+and nothing-to-do are the same output.
+
+**The part that generalises past `NULL`:** the first count is `0`, and `0` had two available causes — the
+three-valued-logic trap, or "nothing was expired". Only the second query separated them. A single count
+never carries its own cause, which is `P-12`'s rule arriving in a new place.
+
+**And the same two lines hid a second defect.** `claimed_at < now()` on an *event* column means "claimed
+at any instant in the past" — a zero-second lease. It returned `0` today only because all three rows are
+`NULL`. Had job 88 still been `running`, that query would have matched it in the same second it was
+claimed. The differential exposed the `NULL` trap and concealed the missing duration term, in one line.
+
+### 3. The name is the decision, not the type
+
+`claimed_at` and `lease_expires_at` take the same type, the same nullability, the same migration, and the
+same one-line change to the claim. They demand **different predicates**, and the difference is where the
+lease *duration* lives:
+
+```
+deadline column:  WHERE lease_expires_at < now()                     -- duration is in the writer
+event column:     WHERE claimed_at < now() - interval '<duration>'   -- duration is in every reader
+```
+
+`claimed_at` was chosen. It is defensible on its own terms: it records a fact that happened (this row was
+claimed at this instant), whereas a deadline records a policy that changes whenever the duration changes,
+and a stored deadline cannot be reinterpreted after the fact. But it has a scheduling consequence that was
+not visible when the column was named: **the lease duration is now an input to the reaper's predicate**,
+and the plan defers that number to `D-22` on Din 6 specifically because its `Cost` line cannot be written
+before Din 3 produces a duplicate count.
+
+So a number that was scheduled to be *measured first, chosen second* now has to be chosen on Din 2, before
+the evidence exists. When `D-22` is written, the honest line is *"chosen on Din 2, ahead of measurement"*,
+not *"measured"*.
+
+**Why it matters for Relay:** four carry-forwards.
+
+- **The reaper's decision now rests on a comparison, and comparisons have two sides.** Every future writer
+  of `claimed_at` has to use the database's clock. A Python-side write would not fail, it would skew.
+- **The `IS NULL` branch is load-bearing and its reason lives only in the log.** The database cannot
+  distinguish "Option B was chosen" from "the backfill was forgotten" — both look like `NULL` on three
+  rows. `P-16`'s shape, one layer up: the state is one value covering two situations.
+- **On Din 2, 41/63/65 will be reclaimed because they are `NULL`, not because they expired.** No duration
+  applies to them — there is nothing to subtract from. The reaper's output will look identical for both
+  reasons, so the per-row verdict has to say which one fired.
+- **Naming a column is a query-design decision.** The question to ask before choosing is not "what does
+  this column store" but "what will the query that reads it look like, and what does it force the reader
+  to know". Today that question was answered after the migration ran.n
+
+---
+
+## P-20 — The reaper reports a post-state it never read, and a pass with nothing to reclaim prints nothing at all, so a working guard and a missing guard produce the same stdout
+
+**Status: MEASURED** on Week 2 Din 2 `[MEASURED-R]` — reviewer ran the reaper against a database with zero
+`running` rows and read the compiled statement, not the source comments.
+
+**The problem:** `src/reaper.py` does everything the transition needed. It is a separate process, the
+`UPDATE` carries a compare-and-set guard on the old value, the predicate lives in the `WHERE` rather than
+in a Python `if`, and `rowcount` is read on every row. The *transition* is correct. What is not correct is
+the **evidence** the loop emits about that transition — and on Din 2 the evidence was the deliverable.
+
+### 1. `post_status` is asserted, not read
+
+```python
+matched = update_result.rowcount
+post_status = "pending" if matched == 1 else candidate.status
+print(f"... id={id} pre_status={...} matched={matched} post_status={post_status}")
+```
+
+`post_status` is a restatement of `matched`. It carries no independent information: the row is never
+re-read, so the line reports what the code *believes* the `UPDATE` did. Any mechanism that made the write
+land differently — a wrong `values()`, a trigger, a later statement in the same transaction — produces
+**exactly this output**. `P-18` at the reporting layer.
+
+The parameterised fix is one clause, not a second round trip: `UPDATE ... RETURNING status`. Then
+`post_status` is a value the database sent back, and the line becomes a measurement.
+
+### 2. A pass with no candidates emits no per-row lines
+
+The loop `SELECT`s candidates first (`status = 'running' AND (...)`), then iterates. A row that fails the
+`SELECT` is never printed. Measured over a 7-second run against 0 `running` rows `[MEASURED-R]`:
+
+```
+[reaper-30276] Starting reaper process (PID: 30276, poll=2.0s, lease=30s)...
+   ... 24 lines of SQLAlchemy echo, 3 passes, zero [reaper-...] per-row lines
+```
+
+Two consequences, and the second is the expensive one:
+
+- **Din 2's Step 6 differential is unsatisfiable by this implementation.** The check was *"run it twice;
+  the second run reports `rowcount 0` on those rows"*. The second run cannot report `rowcount 0` on them,
+  because after reclaim they are `pending` and the `SELECT` excludes them before the guard is ever
+  reached. The expected output of the check is an **empty** output — which is what a dead reaper, a
+  truncated capture, and a correctly-guarded reaper all produce.
+- **The only thing distinguishing an idle reaper from a hung one today is `echo=True`** in
+  `src/database.py` `[MEASURED-R]`. That is a debug flag, not a design decision, and it is the sole reason
+  the run above had 25 lines instead of 1. Turn it off and liveness evidence disappears with it.
+
+### 3. The guard is real, but nothing exercises it — and the `SELECT` is what actually filtered
+
+Deletion test on `AND status = 'running'` inside the `UPDATE`: remove it, and within a single pass the
+`SELECT` has already restricted candidates to `running`, so the observable behaviour on Din 2 would have
+been **identical**. The guard's only job is to reject a row that some *other* writer moved in the window
+between the `SELECT` and that row's `UPDATE`. That is a genuine protection and it is not decorative — but
+Din 2 ran with no worker and one reaper, so no such window existed, and the guard was never asked a
+question it could answer wrongly. Recorded as **present and untested**, not as verified.
+
+### 4. `now()` is frozen for the whole pass, so the guard's expiry term cannot shift
+
+`reap_stuck_jobs()` wraps the `SELECT` and every per-row `UPDATE` in one `session.begin()`. Measured
+`[MEASURED-R]`:
+
+```
+first  now()=2026-08-25 10:55:08.738597+00   clock_timestamp()=...08.750751+00
+second now()=2026-08-25 10:55:08.738597+00   clock_timestamp()=...10.260537+00
+now() identical: True    clock_timestamp advanced: 0:00:01.509786
+```
+
+So the `now()` the `SELECT` used and the `now()` the recheck uses are the **same instant**. On the expiry
+branch the re-evaluated predicate cannot disagree with the one that selected the row, and rows that expire
+*during* the pass are not picked up until the next pass. The bias is toward **under**-reclaiming, which is
+the safe direction — and that is luck, not design. The same mechanism biases dangerously the moment a
+transaction is used to decide something has *not yet* expired.
+
+### 5. The two branches answer different questions and the output cannot say which one fired
+
+`claimed_at < now() - interval '30 seconds'` asks *has this claim outlived the lease*. `claimed_at IS NULL`
+asks *is there any claim information at all*. The reaper treats both as "reclaim this" and prints one
+line either way. On Din 2 **all three reclaimed rows matched the second branch** — derivable from the
+day's own pre-reclaim dump, where every `running` row had `claimed_at NULL` `[INFERRED from Din 2 Step 2
+verbatim]`. The chosen lease duration of `30 s` therefore had **no effect on the run that appeared to
+validate it**: 10 seconds or 10 hours would have produced the same three lines.
+
+### What this means for Relay
+
+- **The transition and the evidence about the transition are two separate deliverables, and only the first
+  one was built.** A reclaim loop whose output is inferred is a loop whose behaviour cannot be audited
+  after the fact — and Din 3 onward compares numbers *across* runs.
+- **A `SELECT`-then-`UPDATE` shape moves the filtering upstream of the guard, and takes the guard's
+  observability with it.** Anything the `SELECT` excludes is invisible to the per-row report, which is
+  also why job 75's *not-matched* verdict cannot be read from the reaper's stdout at all — it can only be
+  read from a separate `select`. A per-row verdict on non-candidates is structurally impossible in this
+  shape.
+- **`narrows`, not `closes`:** per-row output with `RETURNING` narrows the gap between what the reaper did
+  and what the reaper claims. It does not close it — a row can still change after the pass commits, and
+  nothing in the loop revisits it.
+- **Carried to Din 3:** the duplicate count depends on reading the reaper's reclaim line and a worker's
+  handler lines against one clock. The reaper's timestamps come from `datetime.now()` — naive, local, and
+  printed without a timezone label — while every `jobs` value is `Etc/UTC`. The offset is now measured at
+  `5:29:59.994671` with a `7.262 ms` read gap `[MEASURED-R]`, so the arithmetic is workable; the missing
+  label is what makes a lease bug and a timezone bug read identically in a diff.
+
