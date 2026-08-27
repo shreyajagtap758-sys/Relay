@@ -1708,5 +1708,307 @@ so Fencing token
    new worker ke against kuch modify na kar sake
 
 
+also heartbeat updates must be before the lease expiry, or it will get expired until heartbeat arrives.
 
+---
+
+job queue lifecycle roughly :
+
+pending
+   │
+   │ worker claims
+   ▼
+running
+   │
+   ├── success ──► succeeded
+   │
+   └── failure ──► retry wait
+                       │
+                       │ retry_at <= now()
+                       ▼
+                    pending
+                       │
+                       ▼
+                     running
+
+if after every failure, immediate status update pending, then :
+10:00:00.000  Attempt 1 → fail
+10:00:00.001  Attempt 2 → fail
+10:00:00.002  Attempt 3 → fail
+
+this is failure loop.
+
+if external API/database/payment service is down, queue will load on that already-down system.
+
+so we do failure -> wait -> retry mechanism. but fixed wait is not enough.
+
+EXPONENTIAL BACKOFF :
+- formula :
+
+delay(n)=min(base×multiplier
+(n−1)
+,cap)
+
+Recommended:
+
+base       = 3 seconds
+multiplier = 2
+cap        = 12 seconds
+max_attempts = 3
+
+Ab ek-ek component samjho.
+
+HERE :
+- n = attempt number.
+- so when attempt 1 = delay(1) = 3 x 2(1-1) = 3x1 => delay = 3 sec.
+
+- attempt 2 = delay(2) = 3 x 2(2-1) = 3 x 2(1) => 6 sec.
+
+- attempt 3 = delay(3) = 3 x 2(3-1) = 3 x 4 => 12 sec...
+
+so everytime attempt increases, delay increases till its max_attempt, if max_attempt = 3, and when delay(4) comes, attempts(4) > maxattempts(3) => now dont delay, do dead_letter.
+
+
+why base = 3 ?
+- we have poll_interval = 2(worker checks for 2 every 2 sec).
+- when job failed at 10:00, if retry delay <= poll interval, potentially timing behavior in retry has no meaningful spacing, so base > poll_interval.
+
+
+- WHATS CAP :
+if max retry is greater than 3 so => 
+
+Attempt 1 → 3s
+Attempt 2 → 6s
+Attempt 3 → 12s
+Attempt 4 → 24s
+Attempt 5 → 48s
+Attempt 6 → 96s
+Attempt 7 → 192s (too much wait)
+...
+
+with cap :
+
+Attempt 1 → 3s
+Attempt 2 → 6s
+
+Attempt 3 → 12s (cap = 12)
+
+Attempt 4 → 12s (delay(4) = 24 sec, min(24, 12) = 12.
+
+Attempt 5 → 12s
+Attempt 6 → 12s (constant after a time)
+...
+
+
+JITTER :
+
+exponential backoff is not enough alone, suppose we have 10,000 jobs calling external API :
+- now external service down : 10,000 jobs fail synchronously, all retry after 3 sec, 6 sec...
+- 10,000 jobs hit external API at same time, so external service collapses, this is retry storm.
+
+so jitter formula :
+
+actual_delay=delay/2 ​+ random(0,delay/2​).
+
+for delay = 6s,
+
+then 3 + random(0,3)
+
+- so each job gets random delay :
+Job A → 3.2 sec
+Job B → 4.7 sec
+Job C → 5.1 sec
+
+- LOAD spreads.
+
+instead of :
+A B C D E
+↓ ↓ ↓ ↓ ↓
+ALL RETRY AT 6 SEC
+
+
+
+this jitter gives random retry range.
+
+half jitter/equal jitter :
+formula : actual_delay=delay/2 ​+ random(0,delay/2​).
+
+for delay = 6s,
+
+then 3 + random(0,3)
+
+- so we get 3s to 6s random range.
+- but this gets monotinicity, not random :
+3.2s
+4.1s
+5.4s
+5.9s
+
+also because full jitter could get = range(0,6), random could generate 0.5, meaning retry only took 0.5 sec which is too short as its random, to avoid this + for monotonicity, we use half jitter.
+
+this gives half spreading.
+
+full jitter :
+- actual_delay=random(0,delay)
+
+delay = 6s, then range(0,6) :
+possible values for 5 jobs: 
+
+A → 0.8s
+B → 4.2s
+C → 1.3s
+D → 5.7s
+E → 3.6s
+
+very strong spreading, but delay might be too short.
+
+
+TESTS :
+
+1. single boom job retry chain :
+
+- Ek failed job automatically retry hoti hai, har retry par backoff badhta hai, attempts track hote hain, aur maximum attempts ke baad job permanently failed ho jaati hai.
+
+retry mechanism + exponential backoff + max_attempts guard ka test hai
+
+
+worker A claimed job 
+eg : job = 25, status = pending -> running, attempts = 0 (now 1)
+
+attempt 1 executes : 
+Executing job 25 (type=boom, attempt=1/3)...
+
+FIRST FAILURE :
+Job 25 failed attempt 1/3:
+Simulated handler failure: BOOM!.
+Scheduling retry in 1.59s
+(new_status='pending').
+
+
+handler failed : running -> failed.
+worker decided 1 < 3, so retry.
+
+RETRY WRITE :
+Marked job 25 as 'pending' (rowcount=1).
+
+next_attempt_at = now + 1.59s
+
+SECOND CLAIM :
+Claimed job 25 (attempt=2, rowcount=1)
+
+FAILURE :
+Job 25 failed attempt 2/3...
+Scheduling retry in 3.58s
+
+after third failure :
+attempts = 3
+max_attempts = 3
+
+
+now no more retry, running->failed.
+
+jitter difference :
+Attempt 1
+    ↓ ~1.99s
+Attempt 2
+    ↓ ~3.93s
+Attempt 3
+
+so this est : does retry work?
+
+
+2. Jitter spread test :
+
+When multiple jobs fail together, does jitter prevent them from continuing to retry together?
+
+we have four jobs and they start together -> type = boom, so they will fail.
+
+26 → 18:14:57.035
+27 → 18:14:57.097
+28 → 18:14:57.166
+29 → 18:14:57.261
+
+spread ≈ 0.226s
+
+they are synchronized.
+
+then in round 2, they started again together :
+
+26 → +4.104s
+27 → +4.248s
+28 → +4.361s
+29 → +4.473s
+
+spread = 0.369s
+
+now round 3 :
+
+27 → +8.372898
+29 → +8.443082
+26 → +10.408285
+28 → +10.449493
+
+spread = 2.076595s => 2.08s
+
+so now they are not sync group anymore, the spread increased. so instead one giant spike, load is distributed.
+
+this test : does jitter spread retries
+
+3. Real Bound Check :
+
+can the retry system run forever?
+
+query :
+
+SELECT id, status, attempts
+FROM jobs
+WHERE id IN (26,27,28,29);
+
+result :
+26 | failed | 3
+27 | failed | 3
+28 | failed | 3
+29 | failed | 3
+
+so max_attempts = 3 was enforced.
+
+Without a maximum-attempt guard, a permanently broken job can behave like:
+
+fail
+ ↓
+retry
+ ↓
+fail
+ ↓
+retry
+ ↓
+fail
+ ↓
+retry
+ ↓
+ ∞
+
+
+attempts < max_attempts
+        ↓
+       retry
+
+attempts >= max_attempts
+        ↓
+      STOP
+
+
+Test 1 — Retry Chain
+
+A single boom job was executed three times. The first two failures transitioned the job from running back to pending using the guarded retry UPDATE with rowcount=1, while increasing the attempt count and scheduling a future retry. The third failure reached max_attempts=3, so the job transitioned to terminal failed. The observed inter-execution gaps increased consistently with the configured exponential backoff, with jitter and the 2-second polling interval affecting the exact wall-clock gaps.
+
+Test 2 — Jitter
+
+Four jobs were initially executed within approximately 226 ms of each other, showing that they started nearly synchronized. Subsequent retry executions became increasingly spread out, with the third round spanning approximately 2.08 seconds. This demonstrates that randomized jitter reduces retry synchronization and therefore mitigates thundering-herd behavior. The observed spread is evidence of desynchronization, not a guaranteed minimum spread.
+
+Test 3 — Maximum Attempts
+
+All four jobs ended with attempts=3 and status=failed, demonstrating that the retry loop is bounded by max_attempts and does not continue indefinitely.
+
+---
 
