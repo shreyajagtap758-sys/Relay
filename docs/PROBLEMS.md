@@ -1286,3 +1286,90 @@ accurate outcome of an unfalsifiable check, and it went unnoticed because silenc
 
 ---
 
+## P-27 — `MAX_ATTEMPTS` bounds retry *scheduling*, not dispatches, so any row that re-enters the queue at the bound buys one more full handler execution
+
+**Status: MEASURED** on Week 2 Din 5 `[MEASURED-R]` — reviewer probe, seeded row, the real reaper and the
+real worker, and the worker printed `attempt=4/3` itself.
+
+**The problem:** Din 4 shipped a bound with three deliberate decisions behind it, all defensible in
+isolation:
+
+| Decision | Choice | Where it lives |
+|---|---|---|
+| `attempts` increment point | **on claim**, inside the claim's row lock, `values(attempts=Job.attempts + 1)` | Din 4, `D1-A` |
+| not-before storage | **new column** `next_attempt_at`, and **no writer clears it** except the mark | Din 4, `D2-A` |
+| who writes terminal | **the retry writer**, guarded `WHERE id = :id AND status = 'running'` | Din 5, Option A |
+
+And the bound itself is checked in the failure branch, i.e. **after the handler has already run**:
+
+```python
+except Exception as exc:
+    if current_attempts < MAX_ATTEMPTS:   # schedule a retry
+        ...
+    else:                                  # terminal
+        new_status = "dead_letter"
+```
+
+The claim gate consults `status` and `next_attempt_at`. **It does not consult `attempts` at all.**
+
+### The measurement
+
+Seeded one row — `type='boom'`, `status='running'`, `attempts = 3` (already at the bound),
+`claimed_at = now() - 45 s` so the lease was expired — then ran `src/reaper.py` and `src/worker.py` as real
+processes `[MEASURED-R]`:
+
+```
+[reaper-39764] [DB_TIME: 2026-08-28T10:48:46.370822+00:00] id=108 pre_status=running matched=1 post_status=pending
+-> id=108 status=pending attempts=3 claimed_at=NULL next_attempt_at=NULL  claimable=TRUE
+
+[worker-50664] Claimed job 108 (attempt=4, rowcount=1). Status is now 'running'.
+[worker-50664] Executing job 108 (type=boom, attempt=4/3)...
+[worker-50664] Job 108 reached max_attempts (3): Simulated handler failure: BOOM!. Marking terminal 'dead_letter'.
+[worker-50664] Marked job 108 as 'dead_letter' (rowcount=1).
+
+-> id=108 status=dead_letter attempts=4   job_executions(108) = 1
+```
+
+Four readings:
+
+1. **`attempts` reached `4` with `MAX_ATTEMPTS = 3`.** The row-level statement *"`attempts` never exceeds
+   `MAX_ATTEMPTS`"* is false, and job `108` is the counterexample sitting in the table.
+2. **The extra dispatch is a full handler execution, not just a claim.** `record_execution()` committed and
+   `handle_boom` ran. For `boom` that is free; for a handler with a side effect it is **one more side
+   effect after the bound was crossed**, and Relay has nothing that prevents it before Week 3's
+   idempotency key.
+3. **The worker's own stdout says so** — `attempt=4/3`. The code prints the violation and proceeds.
+4. **The `dead_letter` write was *not* rejected here** (`rowcount = 1`), because no reaper was racing at
+   that instant. So `P-25`'s rejection on this transition is **still untested**; what was measured is the
+   path *after* a row returns to the queue at the bound, whatever put it there.
+
+### Two ways a row reaches this state, and both are already live
+
+- **The reaper's reclaim** — a worker dies mid-handler on the bound-crossing attempt. The row stays
+  `running`, the reaper reclaims it to `pending`, `attempts` untouched at the bound, `next_attempt_at`
+  untouched (nobody clears it), so it is claimable at once. This is Option A's written cost, and Din 5 is
+  where it stopped being `[INFERRED]`.
+- **`P-25`'s rejected mark** — the reaper gets there first, the guarded terminal `UPDATE` returns
+  `rowcount = 0`, and `next_attempt_at` is never written because it lived in the same rejected statement.
+  Same end state, no delay.
+
+### What this means for Relay
+
+- **The bound's honest name is the one the BRIEF used:** *"stops retrying once `attempts >= MAX_ATTEMPTS` at
+  the next live dispatch."* Not *"attempts never exceeds max."* The two read alike and only the second is a
+  claim about the table.
+- **`MAX_ATTEMPTS` is a budget for dispatches of every origin**, which Din 4 already established for lease
+  flapping — and Din 5 adds that the budget can be **overdrawn by exactly one dispatch**, which is one
+  handler body.
+- **This is an interaction, not a bug in any one decision.** Each of the three choices was priced on its
+  own day and the joint behaviour appears in none of the three `Cost` lines. That is the reason a `Cost`
+  field has to be re-read when a *later* decision lands on the same columns.
+- **Where the check sits decides whether the cost is real.** A bound evaluated after the handler is
+  accounting; a bound evaluated at the claim is enforcement. Moving it to the claim gate
+  (`AND attempts < :max`) makes the bound-crossed row unclaimable and immediately raises a new question —
+  *then who terminalises it?* — which is Din 5's rejected Option B (a sweep) with a fifth writer on
+  `status`. **Not a Week 2 change.**
+- **Open, and it decides `D-23`'s wording:** accept the overdraft and write it, or move the term into the
+  claim gate and own the sweep. Silence produces a `Cost` line that the table itself refutes.
+
+---

@@ -1904,3 +1904,1056 @@ doosri sach thi (M2, M3), aur ek baar parameter genuinely maujood nahi tha (M5, 
 karna hi kal ka kaam hai.
 
 ---
+
+## Din 5 — `dead_letter` + graceful shutdown (`2026-08-28`)
+
+> **Date chain, aur teesra din lagataar.** Din 3 `08-26`, Din 4 `08-27`, Din 5 `08-28` — commit
+> `fe8aa1e`/`399febb` aur migration create dates (`2026-08-28 14:27:56`, `14:28:05`) isko confirm karte
+> hain `[MEASURED-R]`. Purane do gaps (Week 1 Din 7, `2026-08-24`) abhi bhi khule hain aur carried hain.
+
+> ⚠️ **Ye section reviewer ne likha hai.** Jahan bhi *"maine samjha"* padha jaaye, wo **session ne
+> establish kiya** hai. **Apne shabdon me edit karna hai.** Jo maine khud nahi chalaya wo `[MEASURED-R]`
+> se marked hai.
+
+**Original goal (from the plan):** `status` ko paanchva value do, aur uska naam batao ki retry kahan rukti
+hai — `dead_letter` — ek zero-downtime shape me (`DROP` + `ADD ... NOT VALID` + `VALIDATE`), lock queue ko
+**andar se** dekh ke; terminal writer kaun hai, guard aur `rowcount` ke saath; ek `dead_letter` row ke
+against `downgrade`; koi bhi writer terminal row ko hilata hai ya nahi — **check karke, padhke nahi**; aur
+shutdown path se ek hi sawaal poochho: **exit karta hua worker apni lease ka kya karta hai.**
+
+**Goal met? — `partial`, aur partial ka hissa exactly ek step hai.**
+
+| Hua | Nahi hua / adhoora |
+|---|---|
+| **Zero-downtime shape Option B me ship hui, aur dono halves alag-alag verify hue** — `15a05eeb0f79` ke baad `convalidated = false`, `682e01d87be9` ke baad `true` `[MEASURED-R]` | **Step 3c — lock queue ka measurement din me nahi hua.** Reviewer ne aaj chalaya, aur **substituted form** me (M6). Ye Week 1 Din 3 ke baad iss item ki **doosri** attempt thi |
+| **Terminal transition kaam karti hai, dono fixtures pe, dono expected numbers ke saath** — 105 ek dispatch me, 104 do me, `rowcount = 1` dono baar `[MEASURED-R]` | **Step 7 ka asli sawaal test hua hi nahi.** Handler `8.0 s`, lease `30.0 s` — handler lease se **chhota** tha, to lease expire ho hi nahi sakti thi. Graceful shutdown measure hua (wo pehle se measured tha); **shutdown-versus-lease interaction nahi** (correction #1) |
+| **Constraint bite karti hai** — `psycopg.errors.CheckViolation` on an illegal `status` `[MEASURED]` | **Heartbeat ka chautha observation bhi khaali hai** — `8 s` handler versus `10 s` interval, to **zero heartbeat fire hua**, aur ye job 107 ke `claimed_at` se measurable hai (M4) |
+| **`downgrade` ka conditional-reversibility finding asli hai**, aur error text reviewer ne reproduce kiya `[MEASURED-R]` (M5) | **`downgrade -1` head se ek no-op hai jo success report karta hai** — aur wo report me nahi tha. Version hil gaya, schema nahi (M5) |
+| **Zero-resurrection check chala** — worker aur reaper dono zinda, `dead_letter` rows par 0 claims, 0 reclaims, execution count frozen | **`P-23` mechanism me band hua, exercise me nahi** — repo me knob hai, par database me **koi row `seconds` carry nahi karti**; 106/107 dono ka payload `{}` hai, matlab default branch (correction #3) |
+| **`BASE_BACKOFF_SECONDS = 5.0`** — jitter floor `2.50 s > 2.0 s` quantum, aur cap ka verdict likha gaya (`n = 4` reserved) | **`P-24` construction se resolve hua, measurement se nahi** — aaj ek hi inter-attempt gap bana (job 104), aur multi-job jitter distribution dobara measure nahi hui (correction #6) |
+| **Part B ke saat jawab ek file me likhe gaye** — `DIN_05_ANSWERS.md` maujood hai, `idk` marker ke saath | **Uss file ki mtime `15:03 IST` hai**, jo migrations (`14:27`) aur dono `dead_letter` transitions (`14:50–14:51 IST`) ke **baad** hai. Scoring skip hui, par provenance ek measurement hai aur wo likha jaata hai (niche 🧠) |
+
+**Anything else learned?** Haan, teen cheezein jo plan ne poochhi nahi thi, aur pehli sabse mehngi hai:
+
+1. **Bound row-level pe bound nahi hai. Job 108 `attempts = 4` pe pahuncha, aur uska handler dobara
+   chala.** BRIEF ne ye sawaal Step 4 me naam se poochha tha (*"What does the next claim do with it?"*)
+   aur din me uska jawab nahi aaya. Reviewer ne measure kiya: worker ki apni line `attempt=4/3` print
+   karti hai, `job_executions` ko ek row milti hai, **phir** `dead_letter` likha jaata hai. → **`P-27`**
+2. **`failed` ka ab exactly ek live writer bacha hai** — unknown `type` wali branch. Retry writer aaj se
+   `failed` kabhi nahi likhta. Yaani table ke 15 `failed` rows me se **saare historical hain**, aur agla
+   naya `failed` sirf ek missing registry entry se aayega.
+3. **Chain me doosri no-op downgrade revision aa gayi** — `682e01d87be9` ka `downgrade(): pass`. Din 1 ki
+   `79cb2ee38481` **accident** thi; ye **unavoidable** hai (Postgres me constraint ko un-validate karne ka
+   koi statement nahi hai). Do alag cheezein, ek jaisi shape, aur dono `P-18` ki tarah padhti hain.
+
+---
+
+### 📊 Measured / Observed
+
+**Opening / closing check (`P-13`, `P-06`) — reviewer ne day close ke baad padha:**
+
+| Kya | Value | Label |
+|---|---|---|
+| `python.exe` processes | **`0`** — **doosra consecutive clean process close** (Din 4 pehla tha) | `[MEASURED-R]` |
+| `idle in transaction` sessions | `0` | `[MEASURED-R]` |
+| `datname='relay'` connections | `2`, aur unme se ek **`2026-08-25 09:55:12.346835+00`** se — ab **`~3 din`**, `application_name = psql`, `state = idle`, `xact_start NULL` | `[MEASURED-R]` |
+| Teesra check (`backend_start`) BRIEF ne maanga tha | **Chala nahi, ya chala aur report nahi hua.** PID `37` abhi bhi wahin baitha hai. Ye Din 4 ka open item tha aur khula hai | `[MEASURED-R]` |
+| `alembic_version` | `682e01d87be9` (head) | `[MEASURED-R]` |
+
+**Aaj ye likhna hai (plan ka Din 5 obligation):**
+
+| Kya | Value / text | Label |
+|---|---|---|
+| Constraint ka **purana naam aur purani definition** | `jobs_status_check`, `CHECK ((status = ANY (ARRAY['pending','running','succeeded','failed'])))` — naam `pg_constraint` se padha gaya, `models.py` se nahi, aur `pg_get_constraintdef` `IN (...)` ko `= ANY (ARRAY[...])` me normalise karta hai | `[MEASURED]` |
+| Ek migration ya do — faisla | **Option B — do migrations.** `15a05eeb0f79` = `DROP` + `ADD ... NOT VALID`; `682e01d87be9` = `VALIDATE CONSTRAINT`. Cost of the other: Alembic `upgrade()` ko ek transaction me wrap karta hai, to Option A me `ACCESS EXCLUSIVE` commit tak hold rehta aur validation scan usi lock ke neeche chalta — `NOT VALID` **likha** hota aur uska fayda **na milta**. `104` rows pe farq unmeasurable, aur wahi khatarnak hissa hai | — |
+| `NOT VALID` ke baad `VALIDATE` — dono ka output | `convalidated = false` → `true`, do alag readings me `[MEASURED-R]`. **Split ka poora point yahi ek boolean hai** | `[MEASURED-R]` |
+| `downgrade` ka actual output ek `dead_letter` row ke saath | M5 — `psycopg.errors.CheckViolation` verbatim, aur error **offending row ka id nahi deta** | `[MEASURED-R]` |
+| Terminal writer ka faisla | **Option A — retry writer hi likhta hai**, guard `WHERE id = :id AND status = 'running'`, `rowcount` padha jaata hai. Cost: terminal faisla **worker ke haath** me hai, aur jo worker mid-handler marta hai wo statement chalata hi nahi — wo row `running` rehti hai, reaper reclaim karta hai, aur agla claim bound ke aage nikal jaata hai. **Aaj ye cost measure ho gayi, inferred nahi rahi** (M7, `P-27`) | — |
+| `max_attempts` → `dead_letter` guard + affected-row-count | `rowcount = 1`, dono fixtures pe | `[MEASURED-R]` |
+| Always-failing job ka `attempts` `dead_letter` pe | **`3`** normal path pe (104, 105). **`4`** us path pe jahan row bound cross karke queue me wapas aayi (108) | `[MEASURED-R]` |
+| Shutdown pe lease ka faisla | **Option A — kuch nahi karna, handler ko khatam hone dena.** Cost: agar handler lease se lamba hua, reaper shutdown ke **dauran** reclaim karega, doosra worker shuru karega, aur exit karta hua worker kisi doosre ka kaam mark karega. **Aaj ye cost paid nahi hui kyunki handler lease se chhota tha** — yaani decision liya gaya aur uska cost untested hai | — |
+| Teen durations ek line pe | **Handler `8.0 s` · Lease `30.0 s` · Grace period unbounded (supervisor-dependent).** Ordering safe hai — aur **safe ordering hi wo ek ordering hai jo Step 7 ka interaction produce nahi kar sakti** | `[MEASURED-R]` |
+| SIGTERM/SIGBREAK ke baad naye `running` rows | **0** — signal ke baad koi naya claim nahi. `jobs` me uske baad koi extra row nahi bani | `[MEASURED-R]` (DB se) · stdout `[NO EVIDENCE]`, capture bachi nahi |
+| `ACCESS EXCLUSIVE` measurement ka result | **M6 — pehli baar queue observe hui**, par **substituted form** me: `LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE`, migration nahi. Substitution likha gaya hai, chhupaya nahi | `[MEASURED-R]` |
+| Log poora hai — `Claimed job` count, aakhri line | **`[NO EVIDENCE]`** — worker/reaper captures paanchve din bhi bachi nahi, aur repo me koi capture file nahi mili | `[MEASURED-R]` (absence) |
+
+---
+
+**M1 — closing counts, reviewer ne independently verify kiye `[MEASURED-R]`**
+
+```
+   status    | count            total | maxid        last_value        job_executions
+-------------+-------           ------+-------      ------------      --------------
+ dead_letter |     2              106 |   107            107                93
+ failed      |    15
+ succeeded   |    89            attempts | count
+                                --------+-------
+ (pending 0, running 0 —              0 |    95
+  group by me row hi nahi)            1 |     3
+                                      3 |     8
+```
+
+`jobs_status_check` → `convalidated = t`,
+`CHECK ((status = ANY (ARRAY['pending','running','succeeded','failed','dead_letter'])))`. Job **75**
+`failed`, `attempts 0`, hila nahi. Jobs **44, 63, 65, 95** chaaron `attempts = 0` — kuch retroactively
+nahi likha gaya. **Report ke saare closing numbers exactly reproduce hue.**
+
+**M2 — dono fixtures ka poora lifecycle, ek hi clock me `[MEASURED-R]`**
+
+```
+ job_id |  worker_id   |          executed_at          |    gap
+--------+--------------+-------------------------------+-----------------
+    105 | worker-38628 | 2026-08-28 09:20:57.705839+00 |   (only dispatch)
+    104 | worker-38628 | 2026-08-28 09:20:57.658198+00 |
+    104 | worker-38628 | 2026-08-28 09:21:03.788273+00 | 00:00:06.130075
+
+ id  | status      | attempts | claimed_at
+ 104 | dead_letter |        3 | 2026-08-28 09:21:03.77442+00
+ 105 | dead_letter |        3 | 2026-08-28 09:20:57.689381+00
+```
+
+**Predictions jo BRIEF Step 4 ne pehle likhne ko kaha tha, dono sahi nikle:** `105` ko `+1` execution,
+`104` ko `+2`. Ek hi `worker_id` dono par — koi second variable nahi.
+
+**Aur ek chhoti par asli baat: `claimed_at` `dead_letter` row par non-NULL bacha hai.** Terminal mark usko
+clear nahi karta, exactly jaise retry mark nahi karta tha (`P-19` par ek aur value). Aaj safe hai kyunki
+reaper ka doosra term `status = 'running'` hai — **safety by conjunction**, phir se.
+
+**M3 — job 104 ka gap 5.0-base ke saath: pehli baar delay quantum se saaf upar hai, par ek gap ek
+distribution nahi hai `[MEASURED-R]`**
+
+```
+BASE=5.0 MULT=2.0 CAP=15.0 MAX=3  POLL≈2.03 s
+  attempt n=1: raw= 5.0  delay= 5.0  actual ∈ [2.50,  5.00]   floor 2.50 > 2.0  -> 0 % masked
+  attempt n=2: raw=10.0  delay=10.0  actual ∈ [5.00, 10.00]   floor 5.00 > 2.0  -> 0 % masked
+  attempt n=3: raw=20.0  delay=15.0                           CAP BINDS, aur MAX=3 pe compute hi nahi hota
+```
+
+Job 104 ka gap `6.130075 s`. Poll grid se pichhe solve karo (`handle_boom` instantly raise karta hai, to
+mark dispatch ke turant baad hai): `t + 4.10` wala poll **miss** hua, `t + 6.13` wala **hit** — yaani
+configured delay `(4.10, 6.13]` me hai. Report ka stdout number `5.58 s` uske andar baithta hai
+`[MEASURED]`, aur wahi uska **poora** evidence hai, kyunki stdout capture delete ho gayi.
+
+**To `P-24` ka jo hissa aaj band hua wo arithmetic ka hai, measurement ka nahi:** floor `2.50 s` quantum se
+upar hai, to masked range `0 %` — ye **derive** kiya ja sakta hai aur wo sahi hai. Jo aaj **nahi** hua: kai
+jobs ka retry distribution dobara measure karna, jisme Din 4 ka convoy re-formation dikha tha. Aaj ek job,
+ek gap. **Ek gap growth nahi dikhata aur distribution to bilkul nahi.**
+
+**M4 — Step 7 ka handler lease se chhota tha, aur heartbeat ek baar bhi fire nahi hua `[MEASURED-R]`**
+
+Ye aaj ka sabse important measurement hai, kyunki ye batata hai ki Step 7 ne kaunsa sawaal **poochha hi
+nahi**:
+
+```
+ id  | type | payload |  status   | attempts |          claimed_at           |          executed_at
+-----+------+---------+-----------+----------+-------------------------------+-------------------------------
+ 106 | slow | {}      | succeeded |        1 | 2026-08-28 09:32:33.960895+00 | 2026-08-28 09:32:34.039627+00
+ 107 | slow | {}      | succeeded |        1 | 2026-08-28 09:33:15.609401+00 | 2026-08-28 09:33:15.634055+00
+```
+
+Teen cheezein ek saath:
+
+1. **`payload` dono par `{}` hai.** `handle_slow` `payload.get("seconds", 8.0)` padhta hai, to duration
+   **default** `8.0 s` thi. Naya knob chala, par uska **non-default branch aaj exercise hua hi nahi** — aur
+   `jobs` me koi row `seconds` key carry nahi karti.
+2. **Handler `8.0 s`, lease `30.0 s`.** Lease expire hone ka koi rasta nahi tha. To reaper kabhi candidate
+   nahi dekhta, reclaim kabhi nahi hota, doosra worker kabhi shuru nahi hota, aur exit karta hua worker
+   kabhi kisi doosre ka kaam mark nahi karta. **Step 7 ka poora sawaal iss setup me pooch hi nahi sakta
+   tha**, aur BRIEF ne ye literally likha tha: *"`slow` cannot make the lease expire. You need handler `>`
+   lease."*
+3. **`claimed_at` ≈ `executed_at` (`24.6 ms` / `24.7 ms` apart), aur heartbeat interval `10.0 s` hai.** Agar
+   ek bhi heartbeat land hota to `claimed_at` dispatch se `~10 s` aage hota — Din 3 me job 96 par wo
+   `40.295 s` aage tha. Yahan `25 ms` hai. **Zero heartbeats fired**, kyunki `8 s < 10 s`. To BRIEF ka
+   chautha observation (*"does the heartbeat keep running during shutdown?"*) bhi **bina data** hai.
+
+Jo actually measure hua: **graceful shutdown ka wahi behaviour jo Week 1 Din 5 pe already measured tha** —
+handler poora hua, naya claim nahi hua, exit clean. Wo sach hai aur wo aaj ka goal nahi tha.
+
+**M5 — `downgrade` ke do bilkul alag outcomes, aur pehla wala report me nahi tha `[MEASURED-R]`**
+
+**(a) `downgrade -1` head se — success, aur zero change:**
+
+```
+Running downgrade 682e01d87be9 -> 15a05eeb0f79
+-> alembic_version = 15a05eeb0f79
+-> jobs_status_check convalidated = t        (still true; definition still five-valued)
+```
+
+`682e01d87be9` ka `downgrade()` `pass` hai, aur wo **honest** hai — Postgres me `VALIDATE` ko undo karne ka
+koi statement nahi hai (`SET NOT VALID` exist nahi karta). Par nateeja ye hai: **ek chain step jo hamesha
+success bolega aur kabhi kuch nahi badlega**, aur uske baad `alembic_version` aur schema **diverge** ho
+jaate hain — alembic maanta hai VALIDATE nahi chala, database me wo chala hua hai. **Koi output ye
+divergence nahi dikhata.** Din 1 ki `79cb2ee38481` ka doosra roop, par wo accident thi aur ye unavoidable
+hai.
+
+**(b) doosra `downgrade -1` — expected failure, aur yahi finding hai:**
+
+```
+Running downgrade 15a05eeb0f79 -> 9e4822cbf157, add dead_letter to jobs status not valid
+psycopg.errors.CheckViolation: check constraint "jobs_status_check" of relation "jobs"
+is violated by some row
+```
+
+Uske baad: `alembic_version = 15a05eeb0f79`, constraint abhi bhi **paanch values, `convalidated = t`** —
+yaani DDL poora roll back hua. Classification: **reversible in shape, conditional on data.** Offending rows
+`104` aur `105` hain — **aur error unhe naam se nahi deta**, wo
+`select id from jobs where status = 'dead_letter'` se aate hain. Reviewer ne `upgrade head` chalake head par
+wapas kar diya.
+
+**Aur isliye report ki line *"safely rolled back to head"* aadhi sach hai:** DDL rollback hua, par
+`alembic_version` apne aap head par wapas **nahi** aata — pehla (no-op) `downgrade -1` already commit ho
+chuka tha. Head par wapas ek **`upgrade`** laata hai, rollback nahi.
+
+**M6 — `ACCESS EXCLUSIVE` ki queue, pehli baar observe hui, aur substitution declare kiya jaata hai
+`[MEASURED-R]`**
+
+Week 1 Din 3 pe ye attempt fail hui thi (lock turant grant ho gaya, kyunki queue karne wala koi nahi tha).
+Aaj teen sessions, aur observer **andar** se padhta hai:
+
+```
+HOLDER   pid=3038 holding ACCESS SHARE inside an open transaction
+WAITER   pid=3039 requesting ACCESS EXCLUSIVE on jobs
+OBSERVER pg_stat_activity:
+  pid=3038   state=idle in transaction  wait=Client/ClientRead
+  pid=3039   state=active               wait=Lock/relation   q='lock table jobs in access exclusive mode'
+OBSERVER pg_locks on jobs:
+  pid=3038   mode=AccessShareLock        granted=True
+  pid=3039   mode=AccessExclusiveLock    granted=False
+WAITER   pid=3039 LockNotAvailableError: canceling statement due to lock timeout
+```
+
+**Ye wo teen cheezein deta hai jo do timestamps kabhi nahi de sakte:** `wait_event_type = Lock`,
+`granted = false` ek naam wale lock mode ke saath, aur ek plain `SELECT` jo poori DDL ko rok raha hai.
+`lock_timeout = 9s` ne mistake ko hang ki jagah error banaya.
+
+**Substitution, saaf likha hua:** ye `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` tha, **migration nahi**.
+Lock **mode** identical hai, to conflict aur queueing ka mechanism identical hai; jo ye **nahi** batata wo
+hai ki asli `ADD CONSTRAINT` uss lock ko **kitni der** hold karta hai. Wo Option A versus Option B ka
+number hai aur wo abhi bhi `[INFERRED]` hai. `LEARNING_LOG.md` ka *"`ACCESS EXCLUSIVE` lock-queue hazard"*
+item **aadha** band hota hai: *queue banti hai* ab `[MEASURED-R]` hai, *hold duration* nahi.
+
+**M7 — bound row-level pe bound nahi hai, aur extra dispatch ek asli handler execution hai `[MEASURED-R]`
+→ `P-27`**
+
+BRIEF Step 4 ka sawaal tha: *"the terminal transition can be rejected too, and then the row goes back into
+the queue with `attempts` already at the bound. What does the next claim do with it?"* Din me jawab nahi
+aaya. Reviewer ne seed kiya — ek row, `boom`, `running`, `attempts = 3`, `claimed_at = now() - 45 s` — phir
+**asli** reaper aur **asli** worker chalaye:
+
+```
+[reaper-39764] [DB_TIME: 2026-08-28T10:48:46.370822+00:00] id=108 pre_status=running matched=1 post_status=pending
+[reaper-39764] Pass completed: candidates=0 reclaimed=0        (x2, agle passes)
+-> id=108 status=pending attempts=3 claimed_at=NULL next_attempt_at=NULL  claimable=TRUE
+
+[worker-50664] Claimed job 108 (attempt=4, rowcount=1). Status is now 'running'.
+[worker-50664] Executing job 108 (type=boom, attempt=4/3)...
+[worker-50664] Job 108 reached max_attempts (3): ... Marking terminal 'dead_letter'.
+[worker-50664] Marked job 108 as 'dead_letter' (rowcount=1).
+-> id=108 status=dead_letter attempts=4   job_executions(108) = 1
+```
+
+Chaar baatein, aur teesri wo hai jo maine galat predict ki thi:
+
+1. **`attempts` `4` par pahuncha.** `MAX_ATTEMPTS = 3` dispatches ko bound **nahi** karta; wo *retry
+   scheduling* ko bound karta hai. Row-level invariant *"`attempts` never exceeds 3"* **jhooth hai**, aur
+   bound ki honest phrasing wahi hai jo BRIEF me thi: *"stops retrying once `attempts >= MAX_ATTEMPTS` at
+   the next live dispatch."*
+2. **Worker ka apna output `attempt=4/3` print karta hai** — code khud bol raha hai ki bound cross ho gaya
+   aur usko rokne wala kuch nahi hai.
+3. **Extra dispatch ek pura handler run hai.** `record_execution()` commit hui, `handle_boom` chala. `boom`
+   ke liye ye harmless hai; ek side-effect wale handler ke liye ye **bound cross hone ke baad ek aur side
+   effect** hai. Bound `handler ke baad`, mark par evaluate hota hai — **claim gate `attempts` consult hi
+   nahi karta.**
+4. **`dead_letter` write yahan reject nahi hui** (`rowcount = 1`), kyunki uss instant koi reaper race nahi
+   kar raha tha. To `P-25` ka rejection **is path pe abhi bhi untested** hai; jo test hua wo uske **baad**
+   ka rasta hai.
+
+**Aur ye teen decisions ka interaction hai, kisi ek ka bug nahi:** increment-on-claim (Din 4 D1-A) +
+not-before ek alag column me jise reaper clear nahi karta (Din 4 D2-A) + terminal writer worker ke haath me
+(aaj, Option A). Teen options alag-alag defensible hain aur unka joint behaviour kisi ek ki `Cost` line me
+nahi tha. → **`P-27`**
+
+**M8 — `failed` ka ab ek hi live writer hai, aur `dead_letter` observer ko kya batata hai
+`[MEASURED-R from source]`**
+
+`worker.py` me `status = "failed"` ab **sirf** unknown-`type` branch me likha jaata hai. Retry writer
+`pending` ya `dead_letter` likhta hai; kuch aur nahi. Consequence, aur ye Step 5 ka doosra half hai:
+
+- **`dead_letter` ab self-describing hai.** Ek observer sirf `psql` se, `MAX_ATTEMPTS` ki value jaane bina,
+  bata sakta hai ki ye row bounded out hui — pehle usko `status = 'failed'` **aur** `attempts` dono padhne
+  padte the aur `max_attempts` Python me baitha tha (`P-16`).
+- **Jo ab bhi nahi batata:** *kyu* fail hui. Exception ka koi record kahin nahi hai — na `jobs` me, na
+  `job_executions` me. `dead_letter` ek verdict hai, diagnosis nahi.
+- **Aur `failed` history ke liye overloaded rehta hai, aur wo retroactively theek nahi hota.** 15 `failed`
+  rows me job **98** (`attempts = 3`, kal ka bounded-out) aur job **75** (`attempts = 0`, Week 1 ka
+  unknown-`type`) dono hain, aur **koi bhi rename nahi hui**. Yaani `dead_letter` naya sach batata hai aur
+  purana jhooth wahin rehta hai — Din 6 ko `failed 15` ko *"jobs that failed once"* padhna **nahi** hai.
+- **`super_slow` ka dormant hazard zinda hai:** jobs `93`–`96` ka `type` registry me nahi hai
+  `[MEASURED-R]`. Chaaron terminal (`succeeded`) hain, to inert. Aaj ke baad wo ek naya `failed` **aur**
+  bound se bahar ka rasta hai — unknown-`type` branch `attempts` **dekhta hi nahi**.
+
+---
+
+**Closing reconciliation** — opening counts **Din 4 ke log se** (post-review-probe line):
+
+| Line | Value | Label |
+|---|---|---|
+| opening (Din 4 close) | `87 succeeded / 15 failed / 2 pending / 0 running` = `104` · `job_executions 88` · `max(id) 105` · seq `105` | `[MEASURED-R]` |
+| `±` job **104** (Din 4 probe, `boom`, `attempts 1`) | `pending → dead_letter`, `attempts 3` · `job_executions` **`+2`** | `[MEASURED-R]` |
+| `±` job **105** (Din 4 probe, `boom`, `attempts 2`) | `pending → dead_letter`, `attempts 3` · `job_executions` **`+1`** | `[MEASURED-R]` |
+| `+` job **106** (`slow`, payload `{}`) | `succeeded`, `attempts 1` · `job_executions` **`+1`** | `[MEASURED-R]` |
+| `+` job **107** (`slow`, payload `{}`, Step 7 ka shutdown run) | `succeeded`, `attempts 1` · `job_executions` **`+1`** | `[MEASURED-R]` |
+| `=` expected close, **paanch buckets** | `89 succeeded / 15 failed / 2 dead_letter / 0 pending / 0 running` = `106` · `job_executions 93` · `max(id) 107` · seq `107` | — |
+| `psql` actual (reviewer, probe se pehle) | **exactly wahi** | `[MEASURED-R]` |
+| Match? | **Haan.** `89 + 15 + 2 = 106`. `88 + 2 + 1 + 1 + 1 = 93` | `[MEASURED-R]` |
+| Sequence | `max(id) 107` = seq `107` — aaj koi naya gap nahi bana; `P-05` ka purana gap (id `79`) waise hi hai | `[MEASURED-R]` |
+
+**E5 trigger nahi hua** — chain judi, aur aaj wo genuinely detect kar rahi thi: `dead_letter` bucket pehli
+baar count hua aur `0` nahi tha, to *"migration apply hui par transition nahi"* wala failure mode ruled out
+hai.
+
+**`job_executions` par `count(*) > 1` ke ab paanch causes hain, ids ke saath:**
+
+| Cause | Job ids | Kya proved hua |
+|---|---|---|
+| same-worker re-dispatch | `44` | ek `worker_id`, `6m54s` apart, Week 1 |
+| reclaim re-execution | `63`, `65` | do workers, ek **hafta** apart, Din 2 |
+| overlapping duplicate | `95` | do workers, **`14.783 s`** proved overlap, Din 3 |
+| bounded retry | `98`–`103`, aur aaj `104` | ek worker, dispatches, `attempts = 3` |
+| **bound-crossed re-dispatch (aaj)** | `108` | reclaim ke baad ek **extra** dispatch, `attempts = 4`, `P-27` |
+
+`duplicate` shabd sirf `95` par lagta hai.
+
+**Review probe ne ek row add ki (`P-05`, rows delete nahi hoti):**
+
+| id | State | Kya hai |
+|---|---|---|
+| `108` | `dead_letter`, `boom`, **`attempts = 4`**, `job_executions` `1` | M7 ka `P-27` probe. **Ye table ki ek hi row hai jiska `attempts` bound se bada hai** — Din 6 ke arithmetic me isko naam se rakhna hai |
+
+Probe ke baad actual: `107` rows, **`3 dead_letter`** / `15 failed` / `89 succeeded`, `max(id) 108`, seq
+`108`, `job_executions 94`, `attempts` distribution `0|95 · 1|3 · 3|8 · 4|1` `[MEASURED-R]`.
+
+**Cleanup:**
+
+| Kya | Status | Label |
+|---|---|---|
+| worker / reaper processes at close | **`0`** — doosra consecutive clean close | `[MEASURED-R]` |
+| `idle in transaction` | `0` | `[MEASURED-R]` |
+| worker/reaper stdout captures | **paanchva din delete-first.** `Scheduling retry in 5.58s` aur `dead_letter` mark lines report me quote hui — wo bacha, baaki nahi. `Claimed job` grep count aur file ki aakhri line: **`[NO EVIDENCE]`** | `[MEASURED-R]` |
+| Step 3c ki jaan-boojh wali `idle in transaction` session | **Din me bani hi nahi** (step chala nahi). Reviewer ki holder session `pid 3038` thi aur wo `ROLLBACK` se band hui, `pg_terminate_backend` se nahi | `[MEASURED-R]` |
+| **Teesra check — `backend_start`** | ❌ **PID `37`, `application_name = psql`, connected since `2026-08-25 09:55:12+00` — ab `~3 din`.** `xact_start NULL`, to koi lock, koi snapshot; `P-06` ka mechanism **absent**, `P-13` ka hygiene hazard maujood. **Terminate nahi kiya — wo tumhari session hai.** Aur aaj wo ek `ACCESS EXCLUSIVE` DDL wale din bhi baithi rahi | `[MEASURED-R]` |
+| reviewer probe scripts | `labs/_probe_din5_lock.py`, `labs/_probe_din5_p25.py`, aur chaar capture files (`_reaper_din5.log/.err`, `_worker_din5.log/.err`) — **saare delete kar diye**, relevant lines M6/M7 me pehle copy kiye | `[MEASURED-R]` |
+| probe rows | `108` — rakhi gayi, upar naam se | `[MEASURED-R]` |
+| working tree | **clean**, `399febb` pushed. Reviewer ne `src/` me ek line nahi badli | `[MEASURED-R]` |
+
+**`DECISIONS.md` me aaj kuch nahi.** `D-06` ka amendment aur `D-22`/`D-23` Din 6 pe. Aaj ke liye do lines jo
+Din 6 ko chahiye hongi:
+
+- **`D-06` Cost 4 ki prediction adhoori thi, aur uski missing condition ab ek naam wali cheez hai:**
+  *"`NOT VALID` ka fayda transaction **boundaries** ka property hai, keyword ka nahi"* — Option B isi liye
+  chuna gaya, aur M6 ne pehli baar dikhaya ki uss lock ke peeche ek plain `SELECT` khada ho sakta hai.
+- **`D-06` Cost 1 ab paanch jagah lagta hai, aur paanchvi jagah aaj bani** — claim, reaper, retry,
+  terminal, heartbeat. Shutdown path apna koi `status` write **nahi** karta (Option A), aur wo ek decision
+  hai, absence nahi.
+
+---
+
+### 💡 What I Understood
+
+> **Ye session ne establish kiya, mera wording nahi. Isko apne shabdon me likhna hai.**
+
+**1. Ek bound jo *retry scheduling* ko bound karta hai wo *dispatches* ko bound nahi karta, aur farq ek
+extra handler execution ka hai.** `MAX_ATTEMPTS = 3` ka check handler chalne ke **baad** hota hai, mark par;
+claim gate `attempts` padhta hi nahi. To koi bhi rasta jo bound-crossed row ko wapas `pending` karta hai —
+reaper ka reclaim, ya `P-25` ka rejected mark — ek pura extra dispatch khareed leta hai: `attempts = 4`, ek
+nayi `job_executions` row, aur handler ka poora body. Job 108 par worker ne khud `attempt=4/3` print kiya.
+**Bound ki jagah galat nahi hai — uska naam galat hai**, aur *"attempts never exceeds max"* likhna ek
+invariant claim karna hai jo table me abhi ek row se refute ho chuka hai.
+
+**2. Ek safe setup me experiment chalane ka matlab hai experiment na chalana.** Handler `8 s`, lease `30 s`
+— ye ordering **sahi** hai, wahi ordering hai jo production me chahiye, aur wahi ek ordering hai jisme
+Step 7 ka sawaal **exist hi nahi karta**. Lease expire nahi hui, reaper ko candidate nahi mila, doosra
+worker nahi aaya, aur exiting worker ka mark bina competition ke chala. Jo measure hua wo graceful shutdown
+tha — jo Week 1 Din 5 pe already measured tha. **Ek experiment ka setup uska sabse important hissa hai**,
+aur ye `P-22` ka wahi sabaq hai ek naye layer par: pichle do baar **observer** galat tha, aaj **subject**
+galat tha.
+
+**3. Ek migration jo success bolti hai aur kuch nahi badalti, ab do baar aa chuki hai — aur doosri baar wo
+galti nahi thi.** `682e01d87be9` ka `downgrade(): pass` honest hai: Postgres me constraint ko un-validate
+karne ka koi statement nahi hai. Par uska nateeja Din 1 ki accidental khaali revision jaisa hi hai, aur usse
+ek naya sach nikalta hai: **`alembic_version` aur schema silently diverge ho sakte hain**, aur koi output ye
+nahi dikhata. Iska matlab bhi hai ki *"downgrade chalaya, error aayi"* wali kahani me pehla `downgrade -1`
+invisible tha — aur head par wapas ek `upgrade` laaya, rollback nahi.
+
+**4. `dead_letter` naya sach batata hai; purana jhooth wahin rehta hai.** Aaj se ek observer sirf `psql` se
+bounded-out row pehchaan sakta hai, bina `MAX_ATTEMPTS` jaane. Aur 15 `failed` rows me se ek bhi rename nahi
+hui — job 98 (`attempts 3`, bounded out) aur job 75 (`attempts 0`, unknown `type`) ek hi value share karte
+hain. **Ek naya status value history ko migrate nahi karta**, aur `failed` ka ab exactly ek live writer hai:
+missing registry entry. Yaani agli baar `failed` dikhega to uska matlab *"handler exist nahi karta"* hoga,
+*"handler fail hua"* nahi — aur ye baat abhi likhni padegi, warna Din 6 uss count ko galat padhega.
+
+**5. Lock queue ke liye observer ko andar ghusna pada, aur substitution declare karna uska hissa hai.** Do
+timestamps `ALTER TABLE` ke aas-paas rakhne se `104` rows par kuch nahi dikhta. `pg_locks` me
+`granted = false` ek naam wale lock mode ke saath, aur `wait_event_type = Lock` — ye teen cheezein queue ko
+**hone** ka proof hain. Par ye reading `LOCK TABLE` se aayi, migration se nahi, aur isliye *hold duration*
+ka sawaal khula hai. **Ek measurement ka scope uske procedure se aata hai** — aur uska substitution likhna
+usko `[MEASURED]` rakhta hai, `[NO EVIDENCE]` banne se bachata hai.
+
+---
+
+### 🧠 Self-Check (scoring **skipped by request** — par provenance ek measurement hai, aur wo likhi jaati hai)
+
+**Part B ka scoring aaj jaan-boojh ke skip hua** (user ka instruction, saare concepts manually review ho
+chuke hain). To niche koi score nahi hai. Do factual baatein phir bhi record hoti hain, kyunki dono
+measurable hain aur dono `E8` ke baare me hain:
+
+**1. File maujood hai — Din 4 ke `0/6` ke baad ye khud ek fix hai.** `docs/daily/week_02/DIN_05_ANSWERS.md`,
+`1828 B`, saaton headings, saaton ke neeche likha hua content `[MEASURED-R]`.
+
+**2. Uski mtime `2026-08-28 15:03:36 IST` hai, aur wo din ke measurements ke *baad* hai** `[MEASURED-R]`:
+
+| Din ka event | Timestamp | ANSWERS mtime se |
+|---|---|---|
+| Migrations create (`15a05eeb0f79`, `682e01d87be9`) | `14:27:56`, `14:28:05` IST | **`~35 min` pehle** |
+| Jobs 105 aur 104 `dead_letter` | `14:50:57`, `14:51:03` IST | **`~12 min` pehle** |
+| Job 107 ka shutdown run | `15:03:15` IST | **usi minute** |
+
+Ek hi write, din ke end ke qareeb. To `E8` ke hisaab se Q1–Q4 ka data **prediction** nahi hai; wo
+reconstruction hai. **Ye score nahi hai, ye ek label hai** — aur wo isliye likha ja raha hai ki file agli
+baar bhi isi shape me aayegi aur tab score dena hoga.
+
+**3. Aur ek shape ki baat, jo scoring se alag hai:** saaton jawab literally `idk — ` se shuru hote hain aur
+uske baad poora sahi mechanism likha hai. `idk` ka poora kaam ye batana hai ki *jawab nahi aata* — usko sahi
+jawab ke aage lagane se marker ka matlab khatam ho jaata hai. Protocol me `idk` **not-answered** score karta
+hai, to `idk — <correct answer>` ek self-inflicted zero hai. **Agli baar do me se ek chuno**, dono nahi.
+
+**Corrections — jo report me kaha gaya aur jo measurement ne refute kiya:**
+
+| # | I said | Actual `[MEASURED-R]` | The transferable lesson |
+|---|---|---|---|
+| 1 | *"Step 7 (Mid-Job Graceful Shutdown): Job 107 (slow, 8.0s) received SIGBREAK at T=3s ... marked 'succeeded' ... exited cleanly"* — Step 7 complete ki tarah | Sab sach hai **aur ye Step 7 ka sawaal nahi tha.** Handler `8.0 s`, lease `30.0 s`: lease expire ho hi nahi sakti thi, to reclaim, doosra worker, aur exiting worker ka contested mark — teeno **produce hi nahi hue**. BRIEF ne ye pehle se naam se likha tha: *"you need handler `>` lease"*. Aur `payload` `{}` tha, to naya `seconds` knob use hi nahi hua | Graceful shutdown Week 1 Din 5 pe measure ho chuka tha. Aaj ka naya sawaal **lease** tha, aur ek safe duration ordering wahi ek ordering hai jisme wo sawaal exist nahi karta. **Ek run jo pass karta hai, kaunsa sawaal poochh raha tha — ye alag se poochhna padta hai** (Din 2 correction #3 ka wahi shape, ab subject par) |
+| 2 | *"Three Durations: Handler = 8.0 s · Lease = 30.0 s · Grace Period = Unbounded"* — deliverable ki tarah | Teen numbers sahi hain aur ordering bhi sahi hai. Par DoD ye numbers isliye maangta hai ki unka **interaction** dikhe, aur `8 < 30` ka matlab hai koi interaction nahi. Plus `10.0 s` heartbeat interval par ek `8 s` handler = **zero heartbeats**, `claimed_at` dispatch se `24.7 ms` par ruka | Ek line par teen durations likhna unka rishta document karta hai; unko **test** karne ke liye order todna padta hai. Din 3 ka job 96 (`40.295 s` aage badha `claimed_at`) wo dikhata hai jo aaj dikhna chahiye tha aur nahi dikha |
+| 3 | *"Dynamic handler durations ... permanently closing `P-23`"* | Mechanism commit me hai ✅ — **wo asli progress hai aur teen din ka khula item band karta hai.** Par **exercise nahi hua**: 106/107 dono ka `payload = {}`, to default `8.0` chala, aur `jobs` me koi row `seconds` carry nahi karti. Aur `super_slow` ab bhi registry me nahi hai, to jobs `93`–`96` ka `type` handler-less hai | *"Closed"* do cheezein ho sakti hain: mechanism maujood, ya mechanism **exercised**. `P-23` pehle sense me band hai. Din 3 ka centrepiece ab reproducible **hai** — `payload {"seconds": 45}` se — par wo reproduce **kiya nahi gaya**, aur `P-24`/`P-18` ka poora sabaq yahi hai ki un dono me farq karna padta hai |
+| 4 | *"alembic downgrade ... threw IntegrityError (CheckViolation) and safely rolled back to head"* | CheckViolation reproduce hua ✅, DDL roll back hua ✅. Par **head par wapas apne aap nahi aaya**: pehla `downgrade -1` (`682e01d87be9` ka `pass`) **success ke saath commit** ho gaya tha, to failure ke baad version `15a05eeb0f79` par tha aur head ek `upgrade` se aaya | Ek no-op downgrade jo success return karta hai wo `alembic_version` aur schema ko **diverge** kar deta hai, aur koi output ye nahi dikhata. Din 1 ki khaali revision accidental thi; ye unavoidable hai — aur dono ek jaisi padhti hain, jo `P-18` ka poora point hai |
+| 5 | *"Active Python processes: 0 (clean process audit)"* | Python ke liye **sach**, aur reproduce hua ✅ — **doosra consecutive clean close.** Par BRIEF ka **teesra** check (`backend_start`) abhi bhi red hai: `psql` backend PID `37`, connected since `2026-08-25 09:55:12+00`, ab **`~3 din`** | Aur aaj wo pehle se zyada matter karta tha, kyunki aaj `ACCESS EXCLUSIVE` DDL chali. Wo session `xact_start NULL` par thi to koi lock nahi tha — **luck, discipline nahi.** M6 abhi dikha chuka hai ki ek plain `SELECT` bhi poori DDL ko rok deta hai |
+| 6 | *"BASE_BACKOFF_SECONDS = 5.0s (Equal Jitter minimum floor 2.50s > 2.0s polling quantum, resolving `P-24` with 0% masked range)"* | Arithmetic **sahi** hai aur ye Din 4 ka owed step poora karta hai ✅. Par *"resolving"* do cheezein mila deta hai: masked range `0 %` **derive** kiya gaya, aur aaj koi multi-job jitter distribution measure **nahi** hui. Ek hi gap bana (job 104, `6.130075 s`), jo delay ko `(4.10, 6.13]` tak bound karta hai | `P-24` ka observation-quantum half ab construction se closed hai. Uska doosra half — *convoy re-formation* — Din 4 pe **measured** tha aur aaj re-measure nahi hua. Ek arithmetic argument ek measurement ki jagah nahi leta; wo sirf batata hai ki ab measurement possible **hai** |
+| 7 | **Reviewer ki apni galat prediction, aur wo yahan rehti hai** | `P-27` probe chalane se pehle maine socha tha ki rejected/reclaimed bound-crossed row ek extra **dispatch** kharch karti hai. Measurement ne dikhaya ki wo ek extra **handler execution** hai — `record_execution()` commit hui aur `handle_boom` chala, kyunki bound handler ke **baad** evaluate hota hai aur claim gate `attempts` padhta hi nahi | *"Ek extra dispatch"* aur *"ek extra execution"* mere hi liye ek jaise padh rahe the, aur unme ek side effect ka farq hai. Jahan bound check baitha hai — pehle ya baad — wahi decide karta hai ki cost accounting ki hai ya asli |
+
+*(Ye table kabhi delete nahi hoti, na chhoti hoti hai.)*
+
+---
+
+### 🚧 Unresolved / Follow-ups
+
+**New, from today:**
+
+| # | Item | Kya specifically chahiye |
+|---|---|---|
+| 1 | **Bound row-level pe bound nahi hai — `attempts` `4` par pahuncha** (M7, `P-27`) | Faisla likhna hai, banana Din 6 pe **nahi**: (a) claim gate me `attempts < MAX_ATTEMPTS` term jodo — phir bound-crossed row claim hi nahi hoti, aur kaun usko terminal karega ye ek naya sawaal hai (sweep, Option B); ya (b) accept karo aur `D-23` me likho ki bound *"retries"* ko bound karta hai, *dispatches* ko nahi, ek extra execution ki keemat par. **Aaj (b) honest hai; (a) Week 3 ka hai** |
+| 2 | **`P-25` ka rejection `dead_letter` write par abhi bhi untested** | M7 ne rejection ke **baad** ka rasta measure kiya, rejection nahi. Chahiye: reaper mid-handler reclaim kare aur exiting worker ka `dead_letter` mark `rowcount = 0` de. Iske liye handler `>` lease chahiye — yaani **item 3 ka wahi setup** |
+| 3 | **Step 7 dobara chalana hai, ek `payload {"seconds": 45}` ke saath** | Aaj knob ship ho gaya aur use nahi hua. `slow` job `45 s` par, lease `30 s`, `SIGBREAK` `T = 3 s` par → phir teen cheezein dikhengi jo aaj nahi dikhi: reaper ka reclaim, doosra claim, aur exiting worker ka contested mark. **`D-22` ki `Cost` line me abhi ye hole hai aur usko hole likhna hai** |
+| 4 | **Heartbeat shutdown ke dauran chalta hai ya nahi — abhi bhi `[INFERRED]`** | `8 s < 10 s` ki wajah se ek bhi heartbeat fire nahi hua. Item 3 ka `45 s` run isko automatically answer karega (4 heartbeats expected, Din 3 ki tarah), aur tab pata chalega ki heartbeat lease ko shutdown ke dauran zinda rakhta hai — jo Option A ki cost ko **narrow** karta hai, band nahi |
+| 5 | **`682e01d87be9` ka no-op downgrade version/schema divergence banata hai** | Theek karna nahi hai (Postgres me un-validate exist nahi karta). Chahiye: `LEARNING_LOG.md` me ek line, aur aadat — `downgrade` ke baad `alembic_version` **aur** `pg_constraint` dono padho, exit code par mat ruko |
+| 6 | **`ACCESS EXCLUSIVE` ka *hold duration* abhi bhi `[INFERRED]`** | M6 ne *queue banti hai* measure kiya, `LOCK TABLE` se. Jo bacha hai wo Option A versus Option B ka number hai: ek migration jisme `ADD ... NOT VALID` + `VALIDATE` ek transaction me ho, aur `pg_locks` ko uske **dauran** padha jaaye. `104` rows par wo microseconds hoga — to ye number ek badi table ka intezaar karta hai, aur wahi likhna honest hai |
+| 7 | **`psql` backend PID `37` `~3 din` se connected hai** | `\q`, ya `pg_terminate_backend(37)` tumhare faisle se. Aaj wo ek DDL wale din baithi rahi. **Reviewer ne terminate nahi kiya** — wo tumhari session hai aur uska hatana ek named item hona chahiye |
+| 8 | **`super_slow` ke chaar rows ka `type` registry me nahi hai** | Jobs `93`–`96`, chaaron terminal, to inert. Faisla: registry me `super_slow` daalo (ab trivial hai — `handle_slow` payload padhta hai), ya likho ki wo chaar rows permanent orphan types hain. Unknown-`type` branch `attempts` **dekhta hi nahi**, to wo ek doosra bound bypass hai |
+| 9 | **`docs/ddia_summaries/` gitignored hai, aur Din 5 ki BRIEF usko commit karne ko keh rahi thi** | `git check-ignore -v docs/ddia_summaries/DDIA_CH8_LINKS.md` → `.gitignore:45` `[MEASURED-R]`. Yaani Ch 8 links ka koi version history nahi hai aur `git status` uske baare me kuch nahi bolta — wahi shape jo Week 1 Din 6 ne `CURRENT_WEEK.md` ke liye note kiya tha. **Teen doc paths ab invisible hain** (`docs/roadmap/`, `docs/daily/`, `docs/ddia_summaries/`), aur Din 6 ki commit list se `DDIA_CH8_LINKS.md` hataa diya gaya hai. Faisla khula: file ko track karna hai ya uski gair-history accept karni hai |
+
+**Deliberately open (owner ke saath):**
+
+- **`D-22` (lease duration + handler timeout)** — Din 6. Ab uske paas Din 2/3/4 ke numbers hain aur **Din 5
+  ka hole**: mid-job shutdown ka lease behaviour untested hai. Wo hole `Cost` me likha jaata hai,
+  `[NO EVIDENCE]` tag ke saath.
+- **`D-23` (retry policy)** — Din 6. Naye inputs: `BASE = 5.0` ka reason (jitter floor, `0 %` masked,
+  derived), `CAP = 15.0` reserved for a future `MAX_ATTEMPTS` with crossing point `n = 4` (`P-26` ka
+  verdict, aur wo *"inert par documented"* hai, *"tuned"* nahi), aur `P-27`.
+- **Fencing token** — Week 3+. Aaj chautha din hai jab ye maanga gaya aur **likha gaya, banaya nahi**. Sahi
+  hai: ek naya column plus **chaar** guards.
+- **Contract #2 unprotected** — Week 3 ke dedup tak. Accepted trade.
+- **`echo=True`** — Week 4.
+
+**Slipped (aur specifically kya chahiye):**
+
+| Item | Kaunsi baar | Kya chahiye |
+|---|---|---|
+| **Step 3c — lock queue din me** | pehli (aur item-level pe **doosri**, Week 1 Din 3 ke baad) | **Reviewer ne aaj chalaya** (M6), substituted form me. Jo bacha hai wo item 6 hai upar |
+| **Capture cleanup, paanchva din** | **paanchvi** | Teen cheezein delete se **pehle**: handler start/end lines, mark line apne `rowcount` ke saath, aur `Claimed job` ka grep count. Aaj mark line bachi (report me quote hui), baaki do nahi |
+| **Teesra check (`backend_start`)** | pehli, aur wo Din 4 ka naya item tha | Item 7 upar |
+| **Paanch written Week 2 answers** | **nauvi** | Wahi paanch. Din 6 ke week-close pe ya likhi jaati hain, ya **explicitly** owner ke saath *"iss hafte nahi likhi"* record hoti hain — nauvi consecutive slip ke baad chup rehna teesra option nahi hai |
+| **Din 3 ke paanch job ids ka role** (`89, 90, 92, 93, 94`) | teesri | Ek line per id. `94` sabse zaroori |
+| `DDIA_CH8_LINKS.md` — lines **17–18** aaj **khud likhi gayi** ✅ (doosra consecutive din) | — | Line 18 ka parenthetical ek mechanism claim karta hai jo **aaj ke run me produce nahi hua** (handler `<` lease), to uske neeche ek reviewer note gaya hai. Lines **10–13** (reviewer-written, Din 3) ab bhi apne shabdon me confirm karni hain |
+
+**Carried forward, unchanged:**
+
+- `P-21` — heartbeat re-claimed lease reject nahi kar sakta, **untested**, chautha din.
+- `P-23` — mechanism band, **exercise khula** (correction #3, item 3).
+- `2026-08-24` ka koi record nahi. **Cause not identified.** Din 6 ke week-close pe naam lena hai.
+- Week 1 Din 7 ki log entry nahi hai. Numbers verified, kya chala wo nahi.
+- `79cb2ee38481` — khaali migration revision chain me permanent hai. **Aur aaj usko ek company mil gayi**
+  (`682e01d87be9`, unavoidable version).
+- Sequence gap at id `79` (`P-05`).
+- Positional indexing into an ORM `RETURNING` (Din 3 M7) — latent, `RETURNING` list badalne se pehle fix.
+
+---
+
+### ❓ Question / Next Thought
+
+**Kal ka din likhne ka din hai, aur aaj ka `attempts = 4` ek entry ko pehle se galat kar chuka hai.**
+`D-23` ki `Cost` line me *"`MAX_ATTEMPTS = 3` bounds retries"* likhna aasan hai. Table me ek row baithi hai
+jiska `attempts` `4` hai, jise worker ne khud `attempt=4/3` bolke dispatch kiya, aur jo sirf `boom` hone ki
+wajah se harmless thi. To kal ka pehla sawaal ye hai: **`D-23` me kya likhna hai — ek bound, ya ek bound
+plus uska naam wala exception?** Aur ye style ka choice nahi hai: `Cost` field ka apna rule hai ki khaali
+`Cost` matlab decision samjha nahi, aur ek `Cost` jo apne hi table ke ek row se refute hoti hai usse bhi
+kamzor hai.
+
+**Aur ek doosra sawaal jo aaj ke arithmetic se seedha aata hai.** Kal hafte ki chain jodni hai, aur usme
+paanch buckets hain jahan hafte ke opening pe teen the. Chain jud jaayegi — maine aaj wo verify kar liya.
+Par `failed 15` uss chain me ek **single number** ki tarah baithegi, aur usme teen bilkul alag cheezein
+hain: Week 1 ke unknown-`type` rows, Din 4 ke bounded-out rows (`attempts = 3`, jinhe aaj se `dead_letter`
+kaha jaata), aur ek bhi aisi row nahi jo aaj ke code se ban sakti ho. **To sawaal ye hai: jab ek status
+value ka matlab beech hafte badalta hai, to hafte ka closing count kis definition se ginta hai?** Aaj ka
+jawab: `dead_letter` ka `2` (ab `3`) ek naye contract ke against hai, aur `failed` ka `15` teen purane
+contracts ke against — aur chain dono ko ek hi arithmetic me jodti hai bina ye farq dikhaye. Din 6 ko ye
+farq **likhna** hai, warna Week 3 `failed 15` ko *"jobs that failed"* padhega.
+
+---
+
+## Din 6 — Close: reconcile, likho, handoff (`2026-08-29`)
+
+> ⚠️ **Ye entry reviewer ne likhi hai.** Measurements jo reviewer ne khud chalayi wo `[MEASURED]` hain (yahi
+> ek din hai jab reviewer ki `[MEASURED]` aur `[MEASURED-R]` ka farq ulta hai — aaj ka bench reviewer ne
+> apni machine pe apni queries se padha). **`💡` aur `🧠` sections apne shabdon me likhne hain.**
+
+**Original goal (from the plan):** paanch din ka evidence entries me badalna — week chain reconcile karna
+(paanch per-day delta), `D-22` aur `D-23` likhna, `D-06` aur `D-21` ko **append** karke amend karna,
+`MAP.md` / `LEARNING_LOG.md` / `CURRENT_WEEK.md` update karna, `WEEK_02_HANDOFF.md` teen headings ke saath
+likhna, nau baar slip hue item ka verdict dena, aur commit. **Koi `src/` change nahi, koi migration nahi,
+koi experiment nahi.**
+
+**Goal met? — `yes`.** Saat files me se saaton likhi gayi aur **disk se** padh ke verify hui (Stage Day ka
+`0 B` failure mode isi liye check hota hai). Chain **pehli koshish me exactly judi**, paanch status buckets
+aur `job_executions` dono par. `D-22`/`D-23` likhe gaye, har `Cost` line pe **ek** provenance tag, aur
+`D-22` ka shutdown wala hole `[INFERRED]` tag ke saath likha gaya — `[MEASURED]` likhna iss file ki sabse
+mehngi line hoti. `D-06`/`D-21` **append** se amend hue, ek bhi purani line edit nahi hui.
+
+**Anything else learned?** Teen cheezein jo BRIEF ne poochhi hi nahi thi, aur teeno document ki galti nahi —
+**source aur database se padhi hui asli baatein hain:**
+
+1. **`failed = 15` ke *teen* shapes hain, do nahi.** BRIEF ne do groups ka anumaan lagaya tha (unknown
+   `type`, aur bounded-out at `attempts = 3`). Actual `[MEASURED]`: unknown `type` = `8`, `23`, `58`
+   (`does_not_exist`) aur `75` (`send_receipt`) — chaar; **Week 1 ke handler failures jab retry logic exist
+   hi nahi karti thi** = `5`, `20` (`sleep`) aur `6`, `21`, `57` (`boom`) — paanch; bounded-out = `98`–`103`
+   (sab `boom`) — chhe. Teesra shape kisi ne name nahi kiya tha aur wo sabse bada single group hai.
+2. **"`status` writers ek se paanch ho gaye" imprecise hai.** Source se `[MEASURED]`: `status` **teen** code
+   sites likhte hain — claim, reaper reclaim, aur **ek** mark statement jo chaar different values emit karta
+   hai (`succeeded` / `pending` / `dead_letter` / `failed`). Heartbeat chautha guarded writer hai par uska
+   `SET` sirf `claimed_at` hai — wo `status` **par** guarded hai, `status` **likhta nahi**. Shutdown kuch
+   nahi likhta (Option A). To `D-06` Cost 1 ka audit surface **teen statements** hai, paanch nahi — aur
+   count dono directions me matter karta hai: zyada batao to kaam invent hota hai, kam batao to ek writer
+   chhoot jaata hai.
+3. **Teen din purani `psql` backend PID `37` chali gayi — par discipline se nahi.** Aaj `datname='relay'` par
+   sirf aaj ka review session (`pid 102`) hai `[MEASURED]`, aur `relay-db-1` container **~35 minute** se up
+   hai — yaani **container restart** ne usko band kiya. Koi `pg_terminate_backend` nahi chala, aur teesra
+   cleanup check (`backend_start`, oldest first) aaj bhi ek baar user ne nahi chalaya. **Item band hua,
+   habit nahi bani** — check Week 3 me carry hota hai.
+
+---
+
+### 📊 Measured / Observed
+
+**Opening check (`P-13`, `P-06`) — aur ye Step 1 se PEHLE chala, taki "query dobara chalayi jab tak arithmetic
+mila" ka darwaza band rahe:**
+
+| Kya | Value | Label |
+|---|---|---|
+| `python.exe` processes | **`0`** — **teesra consecutive clean process close** (Din 4, Din 5, aaj) | `[MEASURED]` |
+| `idle in transaction` sessions | `0` | `[MEASURED]` |
+| `datname='relay'` connections | **`1`**, aur wo aaj ka review session hai (`pid 102`, `application_name = psql`, `backend_start 2026-08-29 11:20:50+00`) | `[MEASURED]` |
+| **Teesra check — `backend_start`, oldest first** | ✅ **Chala, aur PID `37` ab nahi hai.** Par wajah discipline nahi: `relay-db-1` container `~35 min` se up hai, yaani restart ne backend band kiya. **Band hua, habit nahi bani** | `[MEASURED]` |
+| `alembic_version` | `682e01d87be9` (head) | `[MEASURED]` |
+
+**Step 0 ka poora bench output — reviewer ne aaj apni queries se independently padha `[MEASURED]`:**
+
+```
+   status    | count            total | maxid       last_value      job_executions
+-------------+-------           ------+-------     ------------    --------------
+ dead_letter |     3              107 |   108           108              94
+ failed      |    15
+ succeeded   |    89            attempts | count      dead_letter rows
+ (pending 0, running 0 —        ---------+-------     ----------------
+  group by me row hi nahi)             0 |    95      104 | attempts 3
+                                       1 |     3      105 | attempts 3
+                                       3 |     8      108 | attempts 4
+                                       4 |     1
+
+ jobs_status_check | convalidated = t
+   CHECK ((status = ANY (ARRAY['pending','running','succeeded','failed','dead_letter'])))
+ alembic_version = 682e01d87be9
+```
+
+**Din 5 ke close + reviewer probe wale expected numbers se zero divergence.** `E2` trigger nahi hua. Teen
+cheezein jo BRIEF ne naam se maangi thi, teeno likhi hui hain: **job `108` `attempts = 4` par hai aur wo
+`P-27` ka probe hai** (`dead_letter 3` ke andar chhupaya nahi gaya), **`running = 0` aur `pending = 0` —
+measured zero bhi likha jaata hai, aaj ki date ke saath**, aur **`max(id) 108 = jobs_id_seq 108`** — iss
+hafte koi naya gap nahi bana, `P-05` ka ek hi gap abhi bhi id `79` par hai aur sequence **reset nahi ki
+gayi**.
+
+**Aaj ka grep output — number assign karne ke din chala, plan likhne ke din nahi (E6) `[MEASURED]`:**
+
+```
+Select-String -Path docs\DECISIONS.md -Pattern '^## `?D-'
+  5: ## D-NN: <decision in one line>            <- format template, entry nahi
+ 14: ## `D-01` and `D-02` — written on Din 6...  <- evidence-trail heading
+ 91: ## D-01   266: ## D-02   451: ## D-03   496: ## D-04   545: ## D-05
+629: ## D-06   813: ## D-07   876: ## D-08   930: ## D-21
+  -> aaj ke baad: 1080: ## D-22   1260: ## D-23
+
+Select-String -Path docs\PROBLEMS.md -Pattern '^## P-'
+  P-01 .. P-27, koi gap nahi, koi duplicate nahi
+```
+
+| Kya | Value |
+|---|---|
+| Grep plan ke expected ranges se match karta hai? | **Haan.** `D-` me next free `D-22`, `P-` me next free `P-28` — dono plan ke expectation se match `[MEASURED]` |
+| Aaj assign hue `D-` numbers | **`D-22`, `D-23`.** Next free ab **`D-24`** |
+| Aaj assign hue `P-` numbers | **Koi nahi.** Aaj likhne ka din tha, koi naya failure mode produce nahi hua — to `P-28` abhi bhi free hai. *Ek bhi naya `P-` na hona apne aap me suspicious hoga agar aaj koi experiment chala hota; aaj nahi chala* |
+| Collision mili? | **Nahi.** `D-09`..`D-20` roadmap Part 2 ke reserved hain aur touch nahi hue. Do purani collisions (`D-09`, `P-07`) isi grep ki wajah se dobara nahi hui |
+| Dangling citation mili? | **Nahi.** Aaj cite hue saare numbers — `D-01`, `D-04`, `D-06`, `D-07`, `D-21`, `D-22`, `D-23`, `P-01`, `P-04`, `P-05`, `P-07`, `P-11`, `P-12`, `P-13`, `P-14`, `P-15`, `P-16`, `P-19`, `P-20`, `P-21`, `P-22`, `P-23`, `P-24`, `P-25`, `P-26`, `P-27` — sabke heading maujood hain `[MEASURED]` |
+
+**Doc-sync — kya actually likha gaya (files kholke check, `git status` se nahi):**
+
+| File | Kya gaya | Ho gaya? |
+|---|---|---|
+| `docs/DECISIONS.md` — `D-22` | Lease `30 s` + heartbeat `10.0 s` + **no handler timeout**, ek entry (`P-15` ki wajah se — Relay handler bound nahi karta, to lease ka koi upper bound nahi jiske neeche wo safe ho). 12 `Cost` lines, 7 `Rejected` lines, `Revisit when` me wo run jo hole band karta hai | ✅ heading line `1080` par, disk se padhi |
+| `docs/DECISIONS.md` — `D-23` | Retry policy: increment **on claim**, `next_attempt_at` column, `delay(n) = min(5.0 · 2^(n-1), 15.0)` verbatim, equal jitter verbatim, jitter ke do reason do alag tag ke saath, `CAP` **inert** likha gaya, aur overdraft **accept** kiya gaya. 12 `Cost` lines, 8 `Rejected` lines | ✅ heading line `1260` par, disk se padhi |
+| `docs/DECISIONS.md` — `D-06` amendment | Paanch hisse: kaunsa option chala aur `NOT VALID` ka fayda mila ya nahi · lock queue ke do halves (queue `[MEASURED-R]`, hold duration `[INFERRED]`, `LOCK TABLE` substitution **declared**) · `downgrade` ke dono outcomes · Cost 1 ka asli writer count · aur cycle ki wajah se CAS ka generation-blindness | ✅ **append hua**, ek bhi purani line edit nahi hui |
+| `docs/DECISIONS.md` — `D-21` amendment | `count(*) > 1` **kab** expire hui (Din 2/3, retry se do din pehle) · ab uska matlab ek **sawaal** hai · paanch causes ids ke saath · identifier ka verdict (**overdue**, owner Week 3, `D-22` Cost 11 me same jawab) · aur `failed = 15` ka teen-shape breakdown | ✅ **append hua** |
+| Har naye entry ka **non-empty `Cost`**, aur har `Cost`/`Rejected` line pe ek provenance tag | Dono entries me koi `Cost` line khaali nahi. Tags: `[MEASURED]` / `[MEASURED-R]` / `[INFERRED]` / `[NO EVIDENCE]`, **exactly ek per line** — kyunki untagged line `[MEASURED]` ki tarah padhi jaati hai | ✅ padh ke verify kiya |
+| `docs/PROBLEMS.md` — Din 1–5 ki bachi hui entries | **Kuch bacha hi nahi tha** — `P-19`..`P-27` apne apne din pe likhi gayi thi; grep se confirm `[MEASURED]`. Aaj koi nayi entry nahi | ✅ nothing owed |
+| `docs/MAP.md` — per naye entry ek index row, **reasoning nahi** | Index A: ek **naya subsection** *"Lease, reaper, and duplicate execution"* (12 rows) + retry/backoff rows *"Retries and duplicate side effects"* me + `NOT VALID`/lock-queue/`downgrade` rows *"Constraints, schema, and migrations"* me + do shutdown rows. Index B: `D-22`/`D-23` ki nayi rows, aur `D-06`/`D-21` ki **purani rows update** hui (nayi nahi jodi). Index C: `jobs.claimed_at`, `jobs.next_attempt_at`, `Reaper`, `Heartbeat`, `dead_letter`, `Migrations / Alembic` — aur `jobs.status`/`jobs.attempts`/`job_executions`/`Claim query`/`Worker loop`/`Shutdown`/`Poll interval` update. Trust ledger aur Open ledger me bhi Week 2 ke blocks — warna dono silently stale reh jaate | ✅ ek line per cell, koi paragraph copy nahi |
+| `docs/LEARNING_LOG.md` — open-items table, Week 2 row, next-free numbers | Week 2 row ✅ Complete; companion table me `D-24`/`P-28`; **har touch hua item ko verdict** — closing day + measurement, **ya** owner naam se. Ek stale row pakdi gayi: *"POSTMORTEMS.md — 1 entry, Cloudflare still open"* jabki file me **3 entries** hain aur Cloudflare Incident 02 hai `[MEASURED]`. Nayi sub-table: Din 6 ke apne teen debts | ✅ |
+| `docs/roadmap/CURRENT_WEEK.md` — week status table + pointer Week 3 pe | Pointer `Week 3` par, Din 6 ke warnings **superseded** block me shift, Week 2 row ✅ Complete apne closing summary ke saath, Week 3 row 🔄 Active, aur *"Five things Week 3 Din 1 must take as given"* + Week 3 ke liye bench | ✅ **gitignored file — kholke padhi, `git status` se nahi** |
+| `docs/daily/WEEK_02_HANDOFF.md` — teen headings, dono definitions, content | Teen headings, `WEEK_01_HANDOFF.md` ke same shape me, pehli do word-for-word. Dono definitions **file me likhi hui** hain, memory me nahi. `What Week 3 Must Not Assume` me chaar items: contract #2 unprotected, `attempts = 4` overdraft, untested shutdown-lease interaction, heartbeat ki event-loop dependency | ✅ **gitignored file — kholke padhi** |
+| Commit — staged paths naam se, `.` kabhi nahi | Paanch committable paths: `docs/DECISIONS.md`, `docs/PROBLEMS.md`, `docs/MAP.md`, `docs/LEARNING_LOG.md`, `docs/logs/WEEK_02.md` | niche `Commit` block dekho |
+
+**Do files aaj ki hain aur `git status` me kabhi nahi aayengi** — `docs/roadmap/CURRENT_WEEK.md` aur
+`docs/daily/WEEK_02_HANDOFF.md`. `git check-ignore -v` output niche cleanup block me hai. Din 5 ki BRIEF ne
+`DDIA_CH8_LINKS.md` ko committable list me daala tha aur wo **galat** tha — `docs/ddia_summaries/` bhi
+`.gitignore` line `45` se excluded hai `[MEASURED]`. Wo file aaj touch hi nahi hui (lines 10–13 abhi bhi
+unconfirmed).
+
+`docs/roadmap/` aur `docs/daily/` gitignored hain — wo do files `git status` me dikhengi hi nahi, isliye
+kholke check hoti hain.
+
+**Cleanup:**
+
+| Kya | Status | Label |
+|---|---|---|
+| Naye probe rows | **Koi nahi.** Aaj ek bhi `INSERT` nahi hui, ek bhi row ka `status` nahi badla. Saari queries read-only thi (`select`, `pg_constraint`, `pg_stat_activity`) | `[MEASURED]` |
+| Temporary capture file | **Koi nahi bani.** Bench output seedha iss log me gaya, kisi file me nahi — to delete karne ko kuch nahi tha, aur "output pehle copy karo" wala rule aaj vacuous hai | `[MEASURED]` |
+| Hafte bhar ki probe rows | **Delete nahi hui, aur wahi sahi hai:** `88` (Din 1), `97` (Din 3), `104`, `105` (Din 4), `108` (Din 5). Paanchon aaj ki chain me naam se count hote hain; ek bhi delete karna delta arithmetic todta hai aur `P-05` ka evidence mitata hai | `[MEASURED]` |
+| `src/` change | **Zero.** `git status` me sirf `docs/` — HEAD `399febb` se `src/` me ek line farq nahi | `[MEASURED]` |
+| worker / reaper processes | **`0`** — teesra consecutive clean close | `[MEASURED]` |
+| `idle in transaction` | `0` | `[MEASURED]` |
+| **Teesra check — `backend_start`** | PID `37` (`2026-08-25 09:55:12+00` se, `~4 din`) **ab nahi hai.** Sirf aaj ka review session `pid 102` hai. Wajah: `relay-db-1` `~35 min` se up hai → **container restart**, deliberate terminate nahi | `[MEASURED]` |
+| `git check-ignore -v` — assume nahi, measure | `.gitignore:46:docs/roadmap/` · `.gitignore:44:docs/daily/` · `.gitignore:45:docs/ddia_summaries/` — teen lines, har ek apna rule naam se | `[MEASURED]` |
+
+**Commit:** paanch paths **naam se**, `.` nahi. `docs/DECISIONS.md` · `docs/PROBLEMS.md` · `docs/MAP.md` ·
+`docs/LEARNING_LOG.md` · `docs/logs/WEEK_02.md`. `docs/PROBLEMS.md` aur `docs/LEARNING_LOG.md` Din 5 se
+already modified the — wo iss commit me saath jaate hain, aur ye log me likha hai taki baad me *"Din 6 ne
+`PROBLEMS.md` kyun touch ki"* ka jawab maujood ho. **`CURRENT_WEEK.md` aur `WEEK_02_HANDOFF.md` stage nahi ho
+sakti** — gitignored, aur unki absence `git status` me structurally invisible hai, isliye wo kholke padhi
+gayi.
+
+---
+
+### 💡 What I Understood
+
+> **Ye session ne establish kiya, mera wording nahi. Isko apne shabdon me likhna hai** — aur aaj ye baat
+> normal se zyada bhaari hai, kyunki iss hafte ke **paanchon** din ka `💡` reviewer ne likha hai. Wo debt
+> `LEARNING_LOG.md` me apne owner ke saath likhi hui hai.
+
+**1. Ek `Cost` field wo cheez hai jo entry ko decision se *record* banati hai, aur wo evidence ke bina likhi
+hi nahi ja sakti.** `D-22` paanch din intezaar kiya, aur wo intezaar sahi tha: Din 2 pe uski `Cost` line
+*"lease `30 s` chuna"* hoti — ek number aur koi consequence nahi. Aaj wahi field kehti hai *"lease uss handler
+se chhoti thi jise Relay allow karta hai, aur usne hafte ka duplicate banaya — job 95, overlap `14.783 s`"*.
+Ek hi decision, do bilkul alag entries. **Jo cheez badli wo decision nahi thi, uski keemat ka evidence tha.**
+
+**2. Ek prediction ki keemat uske sahi hone me nahi, uske *conditions* likhe hone me hai.** `D-06` Cost 4 ne
+Week 1 Din 1 pe `NOT VALID` + `VALIDATE` ka pattern **theek** likh diya tha — do statements, dono naam se.
+Aur wo phir bhi adhoora tha, kyunki usne ye nahi likha ki wo do statements **do transactions** me hone
+chahiye. Alembic `upgrade()` ko ek transaction me wrap karta hai, to ek-migration version me `NOT VALID`
+**likha** hota aur uska fayda **na milta** — lock commit tak hold rehta aur validation scan usi ke neeche
+chalta. **Recipe sahi thi, aur wo condition jo usko kaam karati hai unstated thi.** `P-04` ka shape: partial
+protection, poora confidence.
+
+**3. Ek summary count ka matlab uss din badal jaata hai jis din koi status value ka contract badalta hai, aur
+count khud kuch nahi bolta.** `failed = 15` aaj bhi `15` hai aur uske peeche **teen** alag contracts hain.
+`dead_letter` naya sach batata hai; purana `failed` history par baitha rehta hai aur usko rename karna log ko
+jhootha banata. To week-close ka kaam count likhna nahi hai — **count ko disambiguate karna hai**, warna
+Week 3 `15` ko *"jo jobs ek baar fail hui"* padhega, aur wo galti **plausible** direction me hogi. Wahi baat
+`count(*) > 1` par ek layer neeche hai: paanch causes, aur *duplicate* shabd **ek** id par lagta hai.
+
+**4. Chain judna evidence hai, par uss cheez ka nahi jiske liye wo likhi gayi thi.** Paanch delta pehli
+koshish me exactly jud gaye. Wo **ye** prove karta hai: recorded deltas ke bahar koi row bani ya mitti nahi.
+Wo **ye nahi** prove karta: din saaf the. Iss hafte **teen** din chain perfectly judi jabki ek bhoola hua
+process abhi bhi poll kar raha tha — teeno baar wajah ek hi thi, stray ke paas move karne ko kuch nahi tha
+(`pending` count `0`). **Wo detection nahi, wo khaali queue hai.** Ek clean arithmetic ko hygiene ka certificate
+maan lena iss hafte ki sabse quiet galti thi.
+
+**5. Aakhri din pe likhi hui prose har check pass kar jaati hai jo usko padhti nahi.** Isi liye aaj ka
+verification *"likha kya"* nahi tha, *"file kholke line padho"* tha — Stage Day pe chaar files `0 B` thi jab
+editor content dikha raha tha, aur `docs/daily/` + `docs/roadmap/` gitignored hain, to `git status` madad hi
+nahi kar sakta. **Do aaj ki files kabhi `git status` me nahi aayengi**, aur unki absence structurally silent
+hai.
+
+---
+
+### 🧠 Self-Check (honest — `0 / 7` self-answered on Part B, aur ye Din 4 ka `0/6` dohraata hai)
+
+**Part B ke saat sawaalon ka koi likha hua answers file iss review ko supply nahi hua.**
+`docs/daily/week_02/DIN_06_ANSWERS.md` disk pe **maujood nahi hai** `[MEASURED]`. To score `0 / 7` hai, aur
+ye score *galat jawab* ka nahi — *absent jawab* ka hai, aur wo do alag cheezein hain.
+
+**Iss hafte ka Part B record, poora:** Din 1 `0/6` · Din 2 `0/6` · Din 3 **`5/6`** · Din 4 `0/6` (kuch submit
+nahi hua) · Din 5 `7/7` likha gaya par **scoring skip** hui (user ka instruction) aur uska mtime saare
+measurements ke **baad** ka tha (`E8` — reconstruction, prediction nahi) · Din 6 `0/7`.
+
+**Aur aaj iski keemat exactly naapne layak hai, kyunki aaj ke saat sawaal *aaj ke kaam ke* sawaal the.**
+Sawaal 3 (*`D-06` Cost 4 poori sahi thi ya ek condition missing thi?*) ka jawab iss entry ka `💡` #2 hai —
+`transaction boundaries`. Sawaal 5 (*`status` writers kahan lagte hain, aur kis writer pe guard bhoolna sabse
+aasan tha?*) ka jawab source se nikla aur wo **BRIEF ke apne phrasing ko correct karta hai**. Sawaal 4
+(*`D-21` ki prediction ka kaunsa hissa sahi tha aur kaunsa bada ho gaya?*) ka jawab *"mechanism sahi,
+**schedule** galat — do din pehle expire hui"* hai. **Teen sawaal, teen aisi cheezein jo aaj derive hui aur
+jinka prediction likha hota to yaad reh jaata.** Yahi `0/7` ki asli keemat hai, score nahi.
+
+**Corrections:**
+
+| # | I said | Actual | The transferable lesson |
+|---|---|---|---|
+| 1 | *"`status` writers ek se **paanch** ho gaye — claim, reaper, retry, terminal, heartbeat"* (BRIEF, `CURRENT_WEEK.md`, aur Din 5 ki entry, teeno me) | Source se `[MEASURED]`: **teen** code sites `status` likhte hain — claim, reaper, aur **ek** mark statement jo chaar values emit karta hai. Heartbeat chautha guarded writer hai par uska `SET` `claimed_at` hai; wo `status` **par** guarded hai, likhta nahi. Shutdown kuch nahi likhta | **"Kitne writers hain" ek `grep` se aata hai, transitions ki ginti se nahi.** Chaar transitions ek statement se aa sakti hain. Audit surface *statements* ka hota hai, kyunki guard statement pe likha jaata hai — aur ye count dono directions me galat ho sakta hai: zyada batao to kaam invent hota hai, kam batao to writer chhoot jaata hai |
+| 2 | *"`failed` rows ke do groups hain — unknown `type` (`attempts = 0`), aur bounded-out (`attempts = 3`)"* (BRIEF Step 2) | **Teen groups** `[MEASURED]`. `attempts = 0` khud do shapes hai: unknown `type` (`8`, `23`, `58`, `75`) **aur** Week 1 ke handler failures jab retry logic exist nahi karti thi (`5`, `20` = `sleep`; `6`, `21`, `57` = `boom`) — paanch rows, aur ye sabse bada group hai | **`attempts = 0` do bilkul alag cheezein matlab rakhta hai: "counter kabhi incremented nahi hua kyunki handler enter hi nahi hua", aur "counter uss code se pehle ka hai jo usko increment karta"**. Ek column ki default value history me ek dusra meaning rakhti hai, aur usko group karne se pehle `type` bhi padhna padta hai |
+| 3 | Din 5 ki entry: *"`psql` backend `37` ko terminate nahi kiya — wo user ki session hai, aur uska removal ek named item hai"* — yaani wo abhi bhi wahan hai | Aaj wo **nahi** hai `[MEASURED]`, par kisi ne band nahi ki: `relay-db-1` container `~35 min` se up hai, to restart ne usko close kiya | **Ek open item ka "band" ho jaana aur uske peeche wali habit ka ban jaana do alag events hain.** Item close karke habit ko closed maan lena wahi galti hai jo *"chain judi, to din saaf tha"* hai. Check Week 3 me carry hota hai, item ke bina |
+
+---
+
+### 🚧 Unresolved / Follow-ups
+
+**New, from today:**
+
+1. **Iss hafte ka har `💡` aur `🧠` section reviewer ka likha hua hai** — paanchon din, aur aaj ka bhi. Ye
+   hafte ki sabse badi retention debt hai, kyunki `WEEK_02_HANDOFF.md` ka *What Stuck* list **abhi ek claim
+   hai jiske peeche koi test nahi**. Owner: **user**. Sabse sasta honest version: Week 3 ke har din ek din ka
+   `💡` apne shabdon me dobara likho, reviewer ka text **pehle kholе bina**.
+2. **`DIN_06_ANSWERS.md` disk pe exist nahi karta** `[MEASURED]` — Part B `0/7`, aur teen sawaal exactly wo
+   the jinke jawab aaj derive hue (`💡` #2, correction #1, `D-21` ka schedule).
+
+**Deliberately open (owner ke saath):**
+
+- **Attempt / claim identifier on `job_executions`** → **Week 3, dedup key ke saath** (`D-21` amendment +
+  `D-22` Cost 11 — dono jagah **same** jawab, taki diverge na ho).
+- **Completion endpoint (`completed_at`)** → **Week 3**, `D-22` Cost 10 me priced.
+- **Fencing token / generation counter** → **Week 3** (`D-06` amendment, `D-22` Cost 7).
+- **Handler timeout** → **Week 3/4**, aur wo blocked hai ek asli sawaal pe: *timed-out handler ka `status`
+  kya hai?* (`P-15`, `D-22` rejected option c).
+- **`attempts < :max` claim gate me** → **Week 3, agar kabhi** — aaj overdraft accept kiya gaya (`P-27`,
+  `D-23`).
+- **Shutdown-versus-lease ka asli run** (`slow` + `payload {"seconds": 45}`, `SIGBREAK` at `T = 3 s`) →
+  **Week 3 Din 1 ya ek named catch-up slot**. Aaj **jaan-boojh ke nahi chalaya**: wo band ho rahi chain me
+  execution rows add karta aur measurement din ko writing din me mix karta.
+- **`last_error`** → **Week 4** (`dead_letter` verdict hai, diagnosis nahi).
+- **`ADD CONSTRAINT` ka hold duration** → bade table ka intezaar, honestly (`D-06` amendment).
+
+**Slipped (aur specifically kya chahiye):**
+
+- **Paanch written Week 2 answers (*the five written Week 2 answers*) — `slipped`, `deferred` nahi. Dasva
+  carry, aur hafta khatam.** Kabhi kisi
+  slot me schedule nahi hui, kabhi kisi cheez pe blocked nahi thi, aur `CURRENT_WEEK.md` ka apna rule (*"Week
+  2 Din 1 shuru na ho jab tak ye apne shabdon me exist na kare"*) das baar override hua bina koi decision
+  liye. **Chaar me se chaar sawaal ab measured hain, to unhe likhna ab derivation se zyada recall ban gaya
+  hai — aur wahi slip ki asli keemat hai.** Chahiye: `Week 3 Din 1, Step 0 se pehle, user ke haath se`. Agar
+  gyaarva slip hota hai to honest move item **delete** karna hai, carry nahi.
+- **`DDIA_CH8_LINKS.md` lines 10–13** — paanchva din unconfirmed. File aaj touch nahi hui.
+- **Teesra cleanup check user ne ek baar bhi nahi chalaya.** BRIEF me do baar aaya, dono din report nahi hua.
+  Chahiye: ek line, har din close pe, output log me.
+
+**Carried forward, unchanged:**
+
+- **Week 1 Din 7 ka log entry** aur **`2026-08-24` ka record** — dono ab **decision** maangte hain, gyaarva
+  carry nahi: entry likho jo bacha hai usse, **ya** `WEEK_01.md` me likh do ki Din 7 ka entry kabhi nahi
+  banega aur usko debt ki tarah dhona band karo.
+- **Din 3 ke paanch unroled job ids (`89, 90, 92, 93, 94`)** — aaj **unrecoverable** declare kar diye. `94`
+  (`super_slow`, ek dispatch, koi duplicate nahi) wo tha jo maayne rakhta tha, aur uska outcome permanently
+  unknown hai. Koi owner nahi, kyunki karne ko kuch bacha nahi. Jo bacha wo lesson hai: **jis din id banao,
+  usi din delta me naam likho** — attribution wo ek cheez hai jo arithmetic recover nahi kar sakti.
+- **`super_slow` kisi commit me nahi hai** (`P-23`) — `D-22` Cost 12 me likha hua hai ki hafte ka centrepiece
+  ek uncommitted working-tree state pe chala aur **waise dobara nahi chalega**; uska replacement
+  payload-driven `slow` run hai.
+- **Positional indexing into an ORM `RETURNING`** — aaj bhi correct, aaj bhi latent (W2 D3 M7).
+- **`P-03` claim-query index** (Week 4, measure karke), **`P-06` `idle_in_transaction_session_timeout`**
+  (Week 4, pool sizing ke saath), **`P-08` stream-level body limit** (Week 4), **FK + index on
+  `job_executions.job_id`** (Week 4, retention ke baad).
+
+---
+
+### ❓ Question / Next Thought
+
+**Week 3 ka pehla sawaal iss hafte ke do measurements ke beech ki jagah me baitha hai, aur wo *"idempotency
+key kaise banayein"* nahi hai.**
+
+Job 95 ne prove kiya ki do handler **overlap** kar sakte hain (`14.783 s`), aur job 108 ne prove kiya ki bound
+ke **baad** bhi ek poora dispatch mil sakta hai. Dono cases me dedup ka check kahin **chalna** hai — aur agar
+wo check *"is `key` already present?"* hai, to wo khud ek check-then-act hai, jo Week 0 Din 5 ka poora subject
+tha. To sawaal:
+
+> **Dedup ka fayda uss instant aata hai jab dono workers ek saath chal rahe hain — to wo check kis cheez pe
+> atomic hoga?** Ek `UNIQUE` constraint (database faisla karta hai, aur loser ko error milta hai), ya ek
+> `INSERT ... ON CONFLICT DO NOTHING` ka `rowcount` (wahi compare-and-set ka shape jo `D-06` ne chuna), ya
+> handler ke andar ek guard (jo `MAP.md` T6 ki aakhri row hai — *state outside the database*, jahan koi
+> isolation level madad nahi karta)?
+
+Aur uske saath ek doosra, kam obvious sawaal jo aaj ke `D-21` amendment se seedha nikalta hai: **key kis
+cheez ki identity hai — job ki, ya *dispatch* ki?** Agar job ki hai to legitimate retry (`D-23`, `attempts 1→3`)
+bhi duplicate lagega aur bounded retry hi toot jaayega. Agar dispatch ki hai to job 95 ke dono dispatch alag
+keys honge aur dedup kuch nahi rokega. **Wo distinction hi wo identifier hai jo `D-21` ne Week 3 pe defer
+kiya**, aur isi liye dono ek saath decide hote hain — alag-alag nahi.
+
+---
+
+## Week close — reconcile chain aur handoff
+
+Din 6 ka closing **hi** hafte ka closing hai. Chain ka shape ek hi hai: **week opening + har din ka delta =
+aaj ke actual counts.** Chain kabhi `max(id)` se nahi jodi jaati — id contiguity `jobs` ka invariant nahi
+hai, aur `P-05` hi uska evidence hai.
+
+**Full reconcile chain:**
+
+| Line | Kahan se | Value |
+|---|---|---|
+| Week opening counts | BENCH block, jise Din 1 ke bench ne **exactly** reproduce kiya (to provenance settled hai) | `74 succeeded / 9 failed / 3 running (41, 63, 65) / 0 pending` = **`86`** · `job_executions` **`57`** · `max(id) 87` · seq `87` |
+| `+` Din 1 delta | Din 1 entry | **jobs `+1`** — id **`88`** (`slow`) → `succeeded`. **`job_executions +1`**. Koi bucket shift nahi; 41/63/65 abhi bhi `running` |
+| `±` Din 2 delta | Din 2 entry | **jobs `+0`.** Reaper ne **41, 63, 65** ko `running → pending` kiya: `−3 running`, `+3 pending`, **total wahi** — reclaim buckets ke beech move karta hai, banata ya mitata kuch nahi. Job **75** untouched. **`job_executions +0`** (worker off) |
+| `+` Din 3 delta | Din 3 entry | **jobs `+9`** — ids **`89`–`96`** (aathon `succeeded`) **+ reviewer probe `97`**; **plus** drain ne 41/63/65 ko `pending → succeeded` kiya (bucket shift, nayi row nahi). **`job_executions +12`** — drain ke 3 dispatch (41 ka **pehla**, 63/65 ka **doosra**) + `89`–`96` ke 8 + **job 95 ka doosra dispatch** 1 |
+| `+` Din 4 delta | Din 4 entry | **jobs `+8`** — `98` aur `99`–`102` aur `103` (chhe `boom`, sab `failed` at `attempts 3`) **+ do reviewer probe** `104`, `105` (`pending`). **`job_executions +18`** — `97`→1, `98`→3, `99`–`102`→12, `103`→2, probes→0 |
+| `±` Din 5 delta | Din 5 entry | **jobs `+3`** — `106`, `107` (`slow` → `succeeded`) **+ reviewer probe `108`** (`boom` → `dead_letter`, `attempts 4`); **plus** `104`/`105` `pending → dead_letter` (bucket shift). **`job_executions +6`** — `104`→2, `105`→1, `106`→1, `107`→1, `108`→1 |
+| `=` expected closing | arithmetic | jobs `86 + 1 + 0 + 9 + 8 + 3` = **`107`** · executions `57 + 1 + 0 + 12 + 18 + 6` = **`94`** |
+| aaj ke `psql` counts — **paanchon** status buckets + total | aaj ka Step 0 output | `89 succeeded / 15 failed / 3 dead_letter / 0 pending / 0 running` = **`107`** `[MEASURED]` |
+| `job_executions` — opening + per-din delta = aaj ka count | log + aaj ka output | **`94`** `[MEASURED]` |
+| **Chain juda?** | — | **Haan, dono taraf, pehli koshish me.** `89 + 15 + 3 = 107` · `57 + 1 + 0 + 12 + 18 + 6 = 94` |
+
+**Aur per-day delta anumaan se nahi liya gaya — `created_at` aur `executed_at` se padha gaya, jo ki `D-08` aur
+`D-21` ke timestamp columns ka poora payoff hai (`MAP.md` T7) `[MEASURED 2026-08-29]`:**
+
+```
+jobs, ids 88+ by created_at::date          job_executions by executed_at::date
+  2026-08-23  ->  1     (88)                 2026-08-17  -> 30  \
+  2026-08-26  ->  9     (89-97)              2026-08-18  -> 16   > 57 = week opening
+  2026-08-27  ->  8     (98-105)             2026-08-20  -> 11  /
+  2026-08-28  ->  3     (106-108)            2026-08-23  ->  1   Din 1
+  ------------------------------             2026-08-26  -> 12   Din 3
+  86 + 1 + 0 + 9 + 8 + 3 = 107               2026-08-27  -> 18   Din 4
+                                             2026-08-28  ->  6   Din 5
+                                             ------------------------------
+                                             57 + 1 + 0 + 12 + 18 + 6 = 94
+```
+
+**Aur yahin ek finding nikli, aur wo `E5` nahi hai — usse ek rung neeche hai.** Din-close ke reports se banayi
+gayi chain ka **total sahi tha aur do per-day deltas galat the, dono opposite direction me, to unka error
+cancel ho gaya:**
+
+| Line | Report se | `created_at` / `executed_at` se `[MEASURED]` | Farq |
+|---|---|---|---|
+| Din 3 — jobs | `+10` | **`+9`** (`89`–`97`) | `−1` |
+| Din 4 — jobs | `+7` | **`+8`** (`98`–`105`) | `+1` |
+| Din 3 — executions | `+13` | **`+12`** | `−1` |
+| Din 4 — executions | `+17` | **`+18`** | `+1` |
+| **Total** | `107` / `94` | `107` / `94` | **`0`** |
+
+**Boundary row `97` hai** — reviewer probe, `created_at 2026-08-26 15:41:53` (Din 3 ka din), par uska **pehla
+dispatch Din 4 pe hua** aur Din 4 ki opening baseline usko *"Din 4 ki pehli claimable row"* kehti hai. Ek row
+jiska **creation** ek din ka hai aur **execution** dusre din ka, aur wo do alag deltas me count hoti hai.
+
+**Ye exactly wo cheez hai jiske against BRIEF ne warn kiya tha — *"difference ko nazdeeki din me fit na
+karo"* — aur wo pehle se fit ho chuki thi**, kyunki chain din-close ke likhe hue deltas se banti hai aur wo
+deltas ek doosre ke against reconcile nahi hote, sirf total ke against hote hain. **Total match karna do
+compensating errors ko chhupa leta hai.** Fix mechanical hai aur aaj hi mil gaya: per-day delta `created_at` /
+`executed_at` se derive karo, report ki gin-ti se nahi — ye ek `group by` hai aur wo **har** din chalayi ja
+sakti hai, sirf week close pe nahi.
+
+**Isko `E5` na kehna deliberate hai:** koi row banayi ya mitayi nahi gayi, koi day-boundary hilai nahi gayi,
+aur closing counts independently verify hue. Jo galat tha wo **attribution** thi — bilkul wahi shape jo Din 3
+ka `M9` tha (aath nayi ids, teen naam se likhi). *Chain judi, kahani me ek row galat din pe thi.*
+
+**`E5` trigger nahi hua.** Aur jo isne prove kiya, exactly wahi likha jaata hai: **recorded deltas ke bahar
+koi row bani ya mitti nahi.** Jo isne **nahi** prove kiya: din saaf the. Iss hafte teen din (Din 1, 2, 3)
+chain perfectly judi jabki ek bhoola hua process poll kar raha tha — teeno baar wajah ek: stray ke paas move
+karne ko kuch nahi tha. **Wo detection nahi, khaali queue hai.**
+
+**Aur ek line jo iss hafte nayi hai:** chain **paanch** status buckets par band hui jabki hafta **teen** se
+shuru hua tha. `dead_letter` Din 1 pe exist hi nahi karta tha, aur wo bucket pehli baar count hone par `0`
+**nahi** tha — to *"migration apply hui par transition nahi"* wala failure mode ruled out hai.
+
+**`failed = 15` ek number hai jo teen contracts pakad kar baitha hai `[MEASURED 2026-08-29]`:**
+
+| Group | ids | Matlab |
+|---|---|---|
+| unknown `type`, `attempts = 0` | `8`, `23`, `58` (`does_not_exist`), `75` (`send_receipt`) | koi handler registered nahi tha. **Aaj ka code bhi yahi produce karta hai**, aur wo branch `attempts` **dekhta hi nahi** |
+| Week 1 handler failure, `attempts = 0` | `5`, `20` (`sleep`), `6`, `21`, `57` (`boom`) | handler ne raise kiya, retry logic ke exist karne se pehle. Counter ko increment karne wala code hi nahi tha |
+| bounded out, `attempts = 3` | `98`, `99`, `100`, `101`, `102`, `103` (sab `boom`) | **aaj ka code inhe `dead_letter` kehta** |
+
+**`dead_letter` ne ek bhi historical row rename nahi ki**, aur karna bhi nahi chahiye — wo log ko jhootha
+banata. Iss table ka poora kaam ye hai ki agla padhne wala `failed 15` ko *"jo jobs ek baar fail hui"* na
+padhe.
+
+**Week close pe `running` rows — ye ek DoD item hai, aur zero ho ya na ho, dono cases likhe jaate hain:**
+
+| Kya | Value | Label |
+|---|---|---|
+| `running` count at close | **`0`** — aur ye measured zero hai, aaj ki date ke saath (`2026-08-29`). `group by status` me `running` ki row hi nahi aayi, jo `0` ka hi roop hai | `[MEASURED]` |
+| Uske ids (agar zero nahi) | **N/A.** Aur ye hafte ka ek chhota par asli result hai: hafta **teen** `running` rows (`41`, `63`, `65`) se shuru hua tha jo ek hafte se atki hui thi, aur **zero** pe khatam hua | `[MEASURED]` |
+| Ye ids Week 3 ka input hain — handoff me gaye? | Zero hone ki wajah se koi id nahi gayi. `pending` bhi `0` hai — to **Week 3 Din 1 ek khaali queue pe khulta hai**, aur yahi baat `CURRENT_WEEK.md` ke bench me likhi hui hai taki Week 3 ka pehla worker kisi purani row ko utha ke measurement contaminate na kare | `[MEASURED]` |
+
+Non-zero `running` ka matlab hai hafte ke end pe bhi kaam atka pada hai. Usko *"reaper chalake saaf kar
+diya"* karke count zero banana **arithmetic adjust karna** hai — wo E5 hai aur wo nahi hota.
+
+**Sequence:**
+
+| Kya | Value | Label |
+|---|---|---|
+| `jobs_id_seq` `last_value` | **`108`** | `[MEASURED]` |
+| `max(id)` | **`108`** | `[MEASURED]` |
+| Gap — aur wo `P-05` ka evidence hai | **Iss hafte koi naya gap nahi bana** (`seq = max(id)`). Poore table me ek hi gap hai, id **`79`** par, Week 1 Din 6 ka rolled-back `INSERT` — ek consumed sequence value, permanently. **Sequence reset nahi ki gayi**, aur wo deliberate hai: reset karna `P-05` ka evidence delete karna hai, sirf numbers tidy dikhane ke liye | `[MEASURED]` |
+
+**Agar chain nahi judi (E5):** mismatch **finding ki tarah** likhi jaati hai, difference ko kisi din me fit
+karke chain band nahi hoti.
+
+| Kya | Value |
+|---|---|
+| Kaunsa din toota | **Koi nahi** — closing totals ke against chain judi. Par **attribution** do jagah galat thi: **Din 3** aur **Din 4** ke deltas ek-ek row se galat the, opposite direction me (upar wali table dekho) |
+| Kitna difference | **Total pe `0`.** Per-day pe `∓1` job aur `∓1` execution row, Din 3 ↔ Din 4 ke beech. Boundary row **`97`** hai: `created_at` Din 3 ka, pehla dispatch Din 4 ka |
+| Kya check kiya gaya | **Bhoola hua worker (`P-13`):** `python.exe` count `0` aaj `[MEASURED]`, aur `pg_stat_activity` me sirf aaj ka review session — to koi stray claim nahi hui. **Extra reaper run:** `running` count `0` hai aur `claimed_at` kisi bhi non-terminal row pe nahi bacha, to reclaim ka koi bina-record wala nishaan nahi. **Delete hui row:** `count(*) = 107` aur `21` naye ids `88`–`108` contiguous hain, koi id missing nahi `[MEASURED]`. **Consumed sequence value:** `seq = max(id) = 108`, iss hafte koi rollback nahi; `P-05` ka purana gap `79` par hai. Aur asli cause **arithmetic nahi** nikla — `created_at`/`executed_at` ka `group by` |
+| **Ye din handoff ki teesri heading me naam se gaya?** | **Nahi, aur wo faisla hai:** koi din *"bharose ke layak nahi"* nahi hua — dono deltas ke errors cancel hote hain aur closing counts independently verify hue, to Week 3 kisi din ka number chhod nahi raha. Jo handoff me jaana chahiye tha wo **din ka naam nahi, habit ka naam** hai, aur wo `LEARNING_LOG.md` me hai: **per-day delta report ki gin-ti se nahi, `created_at`/`executed_at` ke `group by` se aata hai** |
+
+Toote hue din ka naam Week 2 ke handoff ki teesri heading me jaata hai, kyunki Week 3 ko pata hona chahiye
+ki **kis din ka number bharosa ke layak nahi hai**.
+
+---
+
+### Definition of Done — week close pe audit
+
+Plan ka koi box shipped file me ticked nahi tha. Ab har item ka ek status hai, aur **har untick ek line
+maangta hai**: *deliberately deferred* apne **owner** ke saath, **ya** *slipped* uske saath jo usko
+**specifically** chahiye. Do me se ek — dono nahi, koi nahi bhi nahi.
+
+| Group | DoD item | Status | Evidence | Untick ho to: deferred (owner) / slipped (kya chahiye) |
+|---|---|---|---|---|
+| Build | Lease column, claim `UPDATE` me likhi jaati hai | ✅ | `claimed_at timestamptz NULL`, migration `75a845575d2e`, Din 1 M2/M3 `[MEASURED]` | — |
+| Build | Reaper ek **alag** process, compare-and-set guard + `rowcount` ke saath | ✅ | `src/reaper.py`, compiled predicate Din 2 M2; guard `UPDATE` poora predicate re-assert karta hai `[MEASURED from source]` | — |
+| Build | Heartbeat | ✅ | `HEARTBEAT_INTERVAL_SECONDS = 10.0`, guard `status='running'`, `asyncio.create_task` + `stop_event`, Din 3 `[MEASURED-R from source]` | — |
+| Build | Bounded retry + backoff + jitter | ✅ | Din 4; formulas `D-23` me verbatim; `base` Din 5 pe `3.0 → 5.0` | — |
+| Build | `dead_letter` status value | ✅ | Do migrations, `convalidated false → true`, `models.py` usi commit me `[MEASURED-R]` | — |
+| Measured | Centrepiece duplicate count | ✅ | **Job 95 — 2 execution rows, overlap `14.783 s` proved**, do independent derivations `2 ms` ke andar, Din 3 `[MEASURED-R]` | — |
+| Measured | Reaper ki reclaim latency | ✅ | **`1.798192 s`**, reaper pehle start hua phir row seed hui; independently corroborated `≤ 207.098 ms` job 95 se `[MEASURED-R]`. Din 3 ka pehla number (`19.953818 s`) galat quantity ka tha → `P-22` | Load pe behaviour (>1 candidate per pass) **deferred: Week 4, metrics ke saath** |
+| Measured | Chuni hui lease duration + uske peeche ka measurement | 🟡 **partial** | `30 s` **chuna** Din 2 pe, aur uss din ki run ne usko exercise **nahi** kiya (saare reclaims `IS NULL` branch pe). Pehli baar measure **Din 3** pe hua — duplicate window aur reclaim latency dono usi `30 s` ke against `[MEASURED-R]` | Provenance line `D-22` Cost 1 me likhi hui hai: *"chosen Din 2 ahead of measurement, first measured Din 3."* **Untick nahi — honest partial** |
+| Measured | Always-failing job ka `attempts` `dead_letter` pe | ✅ **aur expected se zyada** | **`3`** normal path pe (`104`, `105`) aur **`4`** us path pe jahan row bound cross karke queue me wapas aayi (`108`) `[MEASURED-R]` → `P-27`, `D-23` | — |
+| Measured | Week close pe `running` rows ka count | ✅ | **`0`**, aaj `[MEASURED]`. Hafta `3` se shuru hua tha (`41`, `63`, `65`) | — |
+| Measured | Reaper run jo 41 · 63 · 75 ko **alag** karta hai | 🟡 **partial, aur ye `P-20` hai** | `41`/`63`/`65` reclaim hue, `75` untouched raha — **outcome** measured hai `[MEASURED-R]`. Par **ek hi output me chaaron ka farq nahi dikha**, aur dikh bhi nahi sakta tha: `75` kabhi candidate nahi thi, to reaper usko print hi nahi karta. `75` ka *not-matched* verdict ek alag `select` se aata hai | **Structural, deferred: `P-20`** — reaper ka output candidates ke bahar kuch nahi bol sakta. Chahiye: ek explicit *"not a candidate, and why"* line, ya accept karo ki verdict do queries se aata hai |
+| Measured | Expiry branch (`claimed_at < now() - lease`) ne kabhi match kiya | 🟡 **partial** | Din 2 pe **zero** rows (sab `IS NULL`) `[INFERRED from dump]`. Din 3 pe wo branch hi job 95 ka reclaim laayi `[MEASURED-R]` — to branch exercise ho gaya, sirf uss din nahi jis din wo likhi gayi | — |
+| Likha | `D-22` + `D-23`, har `Cost` line pe ek provenance tag | ✅ | Aaj, headings line `1080` / `1260`, disk se verify `[MEASURED]` | — |
+| Likha | `D-06` + `D-21` amendments, **append** karke | ✅ | Aaj; purani lines verbatim, amendment neeche apni date ke saath | — |
+| Likha | `P-19`..`P-27` apne apne din pe | ✅ | Nau nayi entries, ek bhi Din 6 pe nahi ghisatai gayi `[MEASURED, grepped]` | — |
+| Likha | `MAP.md` / `LEARNING_LOG.md` / `CURRENT_WEEK.md` / handoff | ✅ | Aaj; gitignored do files kholke padhi | — |
+| Likha | Har din ka log entry with filled 📊 Measured | ✅ | Din 1–6, chhe entries | `💡`/`🧠` sections **reviewer ke likhe hue hain** — **slipped, owner: user.** Chahiye: har section apne shabdon me, reviewer ka text pehle bina kholе |
+| Carried debt | Stage Day exit criteria — paanch written Week 2 answers | 🔴 **slipped, dasva carry** | Kabhi likhe nahi gaye; `CURRENT_WEEK.md` ka apna blocking rule das baar override hua | **Slipped, not deferred.** Chahiye: `Week 3 Din 1, Step 0 se pehle, user ke haath se`. Gyaarva slip ho to item delete karo |
+| Carried debt | Part B answers har din, step se pehle | 🔴 **fail** | `0/6 · 0/6 · 5/6 · 0/6 · 7/7 (mtime measurements ke baad, `E8`) · 0/7`. Aaj answers file **exist hi nahi karti** `[MEASURED]` | **Chahiye:** file **Step 0 se pehle** banao, saat headings, `idk` allowed aur recorded — par `idk — <poora sahi jawab>` **nahi**, wo self-inflicted zero hai |
+| Carried debt | Teesra cleanup check (`backend_start`) | 🔴 **fail, do din** | BRIEF me do baar aaya, dono din report nahi hua. PID `37` container restart se gaya `[MEASURED]` | **Chahiye:** ek line, har din close pe, output log me |
+| Carried debt | `DDIA_CH8_LINKS.md` lines 10–13 confirm | 🔴 **slipped, paanchva din** | File aaj touch nahi hui | **Chahiye:** chaar lines apne shabdon me, Week 3 |
+| Carried debt | Week 1 Din 7 ka log entry · `2026-08-24` ka record | 🔴 **carried, ab decision maangta hai** | Din 7 *chala* (Din 1 ke bench ne uske numbers reproduce kiye) par kya chala wo unrecoverable | **Deferred with owner: user, Week 3 Din 1.** Do endings: likho jo bacha hai usse, **ya** likh do ki kabhi nahi banega aur carry band karo |
+
+**Kitne clean, kitne nahi:** **`14` ✅ · `4` 🟡 partial · `5` 🔴** = 23 items. Teeno partial *honest*
+partials hain (lease provenance, reaper output ka structural limit, expiry branch ka timing) aur unme se ek bhi
+missing kaam nahi hai — teeno likhe hue hain. **Paanchon 🔴 process items hain, build ya measurement nahi** —
+aur wo hi hafte ka asli pattern hai: **code shipped aur measure hua; likhne aur discipline wale items slip
+hote rahe.**
+
+---
+
+### Week 2 handoff — Week 3 ka input
+
+Teen headings, exactly ye teen, Stage Day wale handoff ke **same shape** me. File:
+`docs/daily/WEEK_02_HANDOFF.md`.
+
+| Heading | Matlab | Likha? |
+|---|---|---|
+| **What Stuck** | bina notes ke, scratch se rebuild kar sakta hoon | ✅ **5 items** — lease ek deadline hai jo claim ke waqt likhi jaati hai (`claimed_at`) · reaper ek alag process kyun hona chahiye · **har** status transition pe compare-and-set · `NOT VALID` + `VALIDATE` se zero-downtime `CHECK` update · bounded retry + backoff + equal jitter aur jitter floor ka quantum se upar hona. ⚠️ **Ye list abhi ek claim hai jiske peeche test nahi hai**, kyunki iss hafte ke `💡` sections reviewer ke likhe hue hain |
+| **What Needs Reinforcement** | pehchaan leta hoon, par viva pressure me derive nahi kar paunga | ✅ **5 items** — dead node vs slow node · SQL me `NULL` ka three-valued logic · `now()` = transaction-start time · fencing token vs compare-and-set · `count(*) > 1` ke paanch causes |
+| **What Week 3 Must Not Assume** | wo baatein jo Week 3 taken-for-granted na le — isme toote hue din ka naam bhi | ✅ **4 items** — contract #2 **abhi bhi unprotected** hai · `attempts = 4` ka overdraft (`P-27`) · shutdown-lease interaction **untested** hai · heartbeat ki event-loop dependency (`P-21`). **Koi din naam se nahi gaya**, kyunki koi din toota nahi — dono attribution errors cancel hue aur closing counts independently verify hue (upar E5 wali table) |
+
+**Dono definitions file me likhi hui hain**, memory me nahi — `WEEK_01_HANDOFF.md` ke same shape me, aur pehli
+do headings word-for-word same. Teesri sirf week number me alag hai.
+
+**Aur ye check chala aur pehli baar FAIL hui, phir fix hui — likhna zaroori hai kyunki ye ek differential check
+ka poora point hai `[MEASURED]`.** Pehla run:
+
+```
+Select-String -Path docs\daily\WEEK_01_HANDOFF.md,docs\daily\WEEK_02_HANDOFF.md -Pattern '^## What'
+  WEEK_01_HANDOFF.md: ## What Stuck / ## What Needs Reinforcement / ## What Week 2 Must Not Assume
+  WEEK_02_HANDOFF.md: (kuch nahi)          <- teen headings the, par '## 1. What Stuck' shape me
+```
+
+Headings `## 1.` / `## 2.` / `## 3.` prefix ke saath likhi gayi thi — **content sahi tha aur shape nahi**, to
+*"pehli do headings word-for-word identical"* wali condition toot rahi thi aur Week 3 usko usi tarah consume
+nahi kar paata jaise iss hafte ke Din 1 ne Week 1 ka handoff kiya. **Numbering hata di, dobara chalayi, chhe
+lines aayi, teen-teen per file.** Aur `What Week 3 Must Not Assume` me do items add hue jo BRIEF ne naam se
+maange the aur pehle draft me nahi the: **`P-23` ka open-exercise half**, aur **chain ke attribution finding**
+(kyunki *"kis din ka number bharose ke layak nahi"* ka jawab *"kisi ka nahi, par method badalna hai"* hai). **Ye teesri heading Week 3 Din 1 ka
+problem statement hai**, exactly jaise Week 1 ki teesri heading iss hafte ke Din 1 ka thi.
+
+---
+
+### Hafte ke process findings
+
+Ye numbers nahi hain, par ye hi batate hain ki hafte ka evidence kitna bharosemand hai.
+
+| Kya | Kitni baar / kahan | Detail |
+|---|---|---|
+| **Seal tooti (E8)** — kisi step ka KEY section measurement se **pehle** khula | **Direct evidence: `0`. Indirect: `1` confirmed, `4` unknowable.** | Seal ka toot-na sirf tab detect hota hai jab answers file ka mtime measurement se **pehle** ka ho — aur wo test chalane ke liye file honi chahiye. **Din 5:** file thi, mtime `15:03`, migrations `14:27` aur dono `dead_letter` transitions `14:50–14:51` ke **baad** `[MEASURED-R]` → **reconstruction, prediction nahi.** **Din 1, 2, 4, 6:** koi file hi nahi, to seal ka status **unknowable** hai — aur wo `0` nahi hai. **Din 3** ek hi din hai jahan answers pehle likhe gaye aur score `5/6` aaya. Ye correlation iss hafte ka sabse saaf signal hai |
+| **Decorative check ship hui (E7)** — *mechanism maujood* aur *mechanism ghayab* column same nikle | **`3`, aur teeno alag layer pe** | (i) **Din 2 Step 6** — reaper ka expected output ek **khaali** output tha, aur khaali output ek mara hua reaper, ek truncated capture, aur ek sahi guarded reaper, teeno deta hai (`P-20`). **Rewrite:** per-pass `candidates=0 reclaimed=0` line, jo Din 3 pe ship hui aur usi din kaam bhi aayi. (ii) **Din 4 Part C — *"the cap engages"*** — `MAX_ATTEMPTS = 3` par wo row na pass ho sakti thi na fail (`P-26`), parameter-level decorative check. **Rewrite:** cap ko test karne ke liye `MAX_ATTEMPTS` badalna padega, warna row hatao. (iii) **Din 5 Step 7 — shutdown vs lease** — handler `8 s` < lease `30 s`, to check ka *subject* hi absent tha; wo pass hui aur mechanism produce hi nahi hua. **Rewrite:** `payload {"seconds": 45}`, jo `D-22` ke `Revisit when` me likha hua hai |
+| **Scope pressure (E9)** — mann kiya ki agla item aaj hi kar lein | **`3` resist hue, `1` earlier me nahi** | Aaj resist hue: (i) `attempts < :max` claim gate me daalna kyunki `P-27` chubh raha hai — wo `src/` change hota **uss din jab hafte ke numbers freeze hote hain**, aur usko ek sweep chahiye; (ii) `payload {"seconds": 45}` wala run *"ek minute ka hai"* — wo band ho rahi chain me execution rows add karta; (iii) Week 3 ka pehla din aaj plan karna — Week 3 ka plan **iss hafte ke handoff par** khada hai aur handoff aaj hi likha gaya, to pehle plan karna handoff ko decoration bana deta. **Aur ek pehle resist nahi hua:** Din 5 pe fencing token ka lalach — wo build nahi hua (sahi), par uska absence ab `D-22` Cost 7 ka untested case hai |
+| **Score wapas aaya?** — Week 1 me chaar din bina score gaye the, aur missing score ek acha score nahi hota | **6 me se 4 din score ke saath, aur unme se 2 shunya** | Din 1 `0/6` · Din 2 `0/6` · Din 3 **`5/6`** · Din 4 `0/6` · Din 5 **scoring skipped by request** (provenance likhi gayi) · Din 6 `0/7`. **To "score wapas aaya" ka jawab: haan, score likha gaya — par jis cheez ko wo naapta hai wo teen din maujood hi nahi thi.** `0/6` aur "answers submit nahi hue" ek hi number dete hain aur wo do bilkul alag failures hain; iss hafte ka `0` teen baar **absence** ka tha, galat jawab ka ek baar bhi nahi |
+
+---
+
+### ❓ Week 3 ki taraf — pehla sawaal
+
+**Key kis cheez ki identity hai — job ki, ya *dispatch* ki? Aur ye sawaal pehle aata hai, "key kaise banayein"
+se pehle.**
+
+Iss hafte ke do measurements isko forced karte hain, aur wo opposite directions me pull karte hain:
+
+- **Job 95:** ek job, do **overlapping** dispatch, dono legal (`14.783 s` overlap `[MEASURED-R]`). Dedup ko in
+  dono ko **ek** maanna hai, warna side effect do baar hoga.
+- **Job 98:** ek job, teen **sequential** dispatch, aur wo `D-23` ka **design** hai — bounded retry. Dedup ko
+  in teeno ko **alag** maanna hai, warna pehla retry hi block ho jaayega aur contract #3 toot jaayega.
+
+**To ek hi column dono nahi kar sakta.** Job-level key retry ko maar deta hai; dispatch-level key job 95 ke
+dono dispatch ko alag keys deta hai aur kuch nahi rokta. **Jo cheez in dono ko separate karti hai wo "kaunsa
+attempt" nahi hai — wo "kaunsa claim" hai**, aur wahi identifier hai jo `D-21` ne Week 3 pe defer kiya aur
+`D-22` Cost 11 ne *overdue* declare kiya. **Isi liye dono ek saath decide hote hain.**
+
+Aur uske turant peeche doosra sawaal, jo Week 0 Din 5 ka seedha continuation hai: **dedup ka check kis cheez pe
+atomic hoga?** Agar wo *"is key already present?"* padh ke phir likhta hai, to wo **check-then-act** hai aur
+concurrency me toot jaata hai — Week 0 ka lost update, naye kapde me. Teen shapes maujood hain aur teeno ki
+keemat alag hai: `UNIQUE` constraint (database faisla karta hai, loser ko error milta hai),
+`INSERT ... ON CONFLICT DO NOTHING` ka `rowcount` (wahi compare-and-set shape jo `D-06` ne chuna, aur jiska
+`rowcount` padhna Relay me already habit hai), ya handler ke andar ek guard — jo `MAP.md` T6 ki **aakhri** row
+hai, *state outside the database*, jahan koi isolation level madad nahi karta.
+
+**Aur ek constraint jo Week 3 ko iss hafte se inherit hoti hai:** key ko **bound ke baad ke ek extra dispatch**
+ko bhi survive karna hai (`P-27`, job `108`), sirf bound ke andar ke retries ko nahi.
+
+*(Week 3 ka preview plan me ek line hai: idempotency key, aur crash/retry interleavings ke upar ek property
+test. Iss hafte ke evidence me se wo sawaal jo uss line ko sharp karta hai — wo upar hai.)*
+
+---
+

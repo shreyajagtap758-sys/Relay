@@ -2012,3 +2012,105 @@ All four jobs ended with attempts=3 and status=failed, demonstrating that the re
 
 ---
 
+JOB STATES :
+
+pending
+   ↓
+running
+   ↓
+failure
+   ↓
+pending       ← retry possible
+   ↓
+running
+   ↓
+...
+   ↓
+max attempts reached
+   ↓
+dead_letter
+
+dead letter means that job is now removed from retry cycle permanently.
+
+
+TEST 1 :
+Dead letter execution :
+checks when job completes its maximum retry attempts and then goes into dead letter.
+
+
+TERMINAL :
+
+[worker-11256] Claimed job 31 (attempt=3, rowcount=1). Status is now 'running'.
+[worker-11256] Executing job 31 (type=boom, attempt=3/3)...
+[worker-11256] Job 31 reached max_attempts (3): Simulated handler failure: BOOM!. Marking terminal 'dead_letter'.
+[worker-11256] Marked job 31 as 'dead_letter' (rowcount=1).
+
+[worker-11256] Claimed job 30 (attempt=2, rowcount=1). Status is now 'running'.
+[worker-11256] Job 30 failed attempt 2/3... Scheduling retry in 3.15s
+[worker-11256] Claimed job 30 (attempt=3, rowcount=1)...
+[worker-11256] Job 30 reached max_attempts (3): Simulated handler failure: BOOM!. Marking terminal 'dead_letter'.
+[worker-11256] Marked job 30 as 'dead_letter' (rowcount=1).
+
+
+
+TEST 2 :
+Once job dead_letter ho gayi, kya koi worker ya reaper accidentally usko dobara touch kar sakta hai?
+
+we have multiple writers as :
+
+Worker:
+pending → running
+
+Reaper:
+running → pending
+
+Retry:
+running → pending
+
+now dead letter -> ??
+
+TERMINAL :
+
+select id, status, attempts from jobs where id in (30, 31);
+
+//Dono jobs ka status dead_letter raha aur execution count freeze raha.
+
+dead-letter job worker ke claim/retry path aur reaper ke recovery path dono se isolated hai.
+
+Worker sirf eligible jobs ko claim karta hai, aur Reaper sirf stale running jobs ko recover karta hai. dead_letter dono ke scope se bahar hai.
+
+Isliye accidentally same job dobara execute nahi hoti.
+
+
+TEST 3 :
+
+check if a worker is executing a long-running job and it gets shutdown signal mid job, then whats the behaviour of curr job, lease and heartbeat?
+
+Enqueued Jobs: Job 32 (slow, 12.0s) aur Job 34 (sleep, pending).
+Test: Worker chalu kiya. Job 32 claim hone ke 3 second baad (jab handler sleep me tha), worker ko SIGBREAK signal bheja.
+
+TERMINAL :
+
+[worker-1524] Starting worker process (PID: 1524)...
+[worker-1524] Claimed job 32 (attempt=2, rowcount=1). Status is now 'running'.
+[worker-1524] [SLOW HANDLER] Work started (12.0s)...
+
+[worker-1524] Signal SIGBREAK received. Finishing current job before shutdown...
+
+[worker-1524] Heartbeat sent for job 32
+[worker-1524] [SLOW HANDLER] Work completed.
+[worker-1524] Finished execution for job 32.
+[worker-1524] Marked job 32 as 'succeeded' (rowcount=1).
+[worker-1524] Clean shutdown complete. Exiting with code 0.
+
+
+1. Handler Pura Hua: Shutdown signal milne ke bawajood handler crash nahi hua, usne apna poora 12 second execution complete kiya.
+
+2. Heartbeat Zinda Raha: Shutdown ke dauran 10 second par [worker-1524] Heartbeat sent for job 32 fire hua, jisse lease extend hoti rahi aur reaper job ko steal nahi kar paya!
+
+3. Guard Matches & Mark Succeeded: Job 32 safely succeeded mark hua (rowcount = 1).
+
+4. No New Claims: Shutdown signal ke baad queue me pada Job 34 claim nahi hua aur pending hi raha.
+
+---
+

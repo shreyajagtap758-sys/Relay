@@ -63,8 +63,9 @@ async def handle_boom(payload: dict) -> None:
 
 
 async def handle_slow(payload: dict) -> None:
-    print(f"[{WORKER_ID}] [SLOW HANDLER] Work started...")
-    await asyncio.sleep(8.0)
+    seconds = payload.get("seconds", 8.0)
+    print(f"[{WORKER_ID}] [SLOW HANDLER] Work started ({seconds}s)...")
+    await asyncio.sleep(seconds)
     print(f"[{WORKER_ID}] [SLOW HANDLER] Work completed.")
 
 
@@ -186,9 +187,9 @@ async def run_worker() -> None:
                         f"[{WORKER_ID}] Job {job_id} failed attempt {current_attempts}/{MAX_ATTEMPTS}: {exc}. Scheduling retry in {actual_delay:.2f}s (new_status='pending')."
                     )
                 else:
-                    new_status = "failed"
+                    new_status = "dead_letter"
                     print(
-                        f"[{WORKER_ID}] Job {job_id} reached max_attempts ({MAX_ATTEMPTS}): {exc}. Marking terminal 'failed'."
+                        f"[{WORKER_ID}] Job {job_id} reached max_attempts ({MAX_ATTEMPTS}): {exc}. Marking terminal 'dead_letter'."
                     )
             finally:
                 stop_event.set()
