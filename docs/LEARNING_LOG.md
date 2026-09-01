@@ -2114,3 +2114,164 @@ TERMINAL :
 
 ---
 
+week 3 - day 1 :
+
+week 2 me dekha ki worker slow + lease expiry hone pr reaper wapas pending krke overlap/duplicate kr sakta.
+(duplicate hi nhi hota hamesha, pehla worker mar sakta + duja worker chalra = technically ek hi kaam hora, but rows 2 hori)
+
+
+Asli Problem: Ab tak hamara worker sirf print() karta tha ya asyncio.sleep() karta tha. Lekin real-world me background job ka matlab hota hai — Email bhejna, Payment katna, ya Database me Order record insert karna (Side Effect).
+
+Agar do worker chal gaye, to User ke account se 2 baar paise kat jayenge ya 2 emails chale jayenge!
+
+Lekin abhi tak hamare paas koi aisi table nahi thi jahan hum dekh sakein ki side effect kitni baar hua.
+
+
+- Aaj kya prove karna hai? (The Target) :
+
+Target: Hum database me ek nayi Side-Effect Table banayenge, ek naya handler banayenge jo wahan insert karega, aur jaan-boojh kar 2 workers chala kar ek job ko 2 baar chalayenge taaki us table me count 2 dikhe!
+
+Interim Guarantee (Aaj ki limit): Aaj hum duplicate ko rokenge nahi. Aaj sirf yeh guarantee hogi ki "Side effect kitni baar hua, wo ab database me saaf-saaf gina ja sakta hai (Observable hai)." (Rokege hum Din 2 par UNIQUE constraint laga kar).
+
+
+job enqueue (slow) -> worker a claims -> worker A inserts side eff = 1, worker A lease expire -> reaper -> worker b claims job -> worker b inserts side eff = 2, PROVEN.
+
+
+Relay yeh promise nahi karti ki "side effect 1 baar hoga". Aaj promise sirf yeh hai ki "side effect ka count ab database me measurable/observable hai."
+
+
+database me new table banani jisme handler apna record daale -> 
+option 1 : counter : Ek row jisme integer update hota rahe. (Nuksan: Kis worker ne kab kiya wo time aur ID mit jata hai, bcz counter update picchle kisne kya kiya wo overwrite krta he).
+option 2 : Ledger : har execution ka ek naya row insert(id, job_id, worker_id, created_at), porri timeline dikhegi with worker_id.
+
+
+
+Aaj is table par UNIQUE(job_id) NAHI lagana hai! Agar aaj hi UNIQUE laga diya to duplicate insert error de dega aur aaj ka target (Count = 2) fail ho jayega.
+
+
+aj ke experiment me kya hua :
+
+heartbeat mene disable/handler me time.sleep(45) kr diya jisse event loop block ho and heartbeat run hi na ho, warna lease expire hi nhi hone dega or test nhi chalega.
+
+
+The Execution Flow:
+Job enqueue karein (seconds = 45).
+Worker A Job claim karega 
+→
+→ Step 2 wali table me Row #1 daalega 
+→
+→ 45s ke kaam me lag jayega.
+30s baad Lease expire hogi 
+→
+→ Reaper job ko pending bana dega!
+Worker B usi job ko claim kar lega 
+→
+→ Step 2 wali table me Row #2 daalega!
+
+
+then : select count(*) from <side_effect_table> where job_id = <id>;
+
+
+2 rows aane se overlap pakka nhi hota, ek worker mar gya ho and dusra chala ho, prove krne :
+- worker A kab shuru hua and khatm hua
+- worker b kab claim kiya
+
+Dono ke beech kitne seconds ka actual concurrent overlap tha.
+
+
+slow job me worker ko sigbreak bhejo, shurtdown ke daruan lease expire hoti hai to kya reaper doosre worker ko job de dega?
+
+
+Side effect -> handler ke andar likha jaaye, uske baad nahi. Agar tum effect ko mark ke saath likhoge, to aaj ka duplicate dikhega hi nahi — kyunki doosre worker ka mark rowcount = 0 pe reject ho sakta hai aur effect uske saath rollback ho jaayega
+
+Duration payload se aaye, exactly jaise handle_slow payload.get("seconds", 8.0) padhta hai. Naya named handler har duration ke liye NAHI.
+
+bina Idempotency ke Relay system 'At-Least-Once' hai — yani agar worker slow hua to duplicate side-effects (emails) database me chale jate hain. Kal (Din 2) hum UNIQUE constraint lagakar in duplicates ko rokna seekhenge.
+
+Worker A aaya (Attempt 1):
+
+Usne insert kiya: (job_id=36, worker_id='worker-A', action='email')
+Database: ✅ Success! (Pehli email record ho gayi).
+Worker B aaya (Attempt 2 - Overlap/Duplicate):
+
+Usne wahi insert karne ki koshish ki: (job_id=36, worker_id='worker-B', action='email')
+Database: ❌ STOP! UniqueViolationError: Key (job_id)=(36) already exists.
+Insert REJECT ho gaya!
+
+Database me UNIQUE lagane ke baad code me hum us error ko handle karte hain: ON CONFLICT (job_id) DO NOTHING — jiska matlab hota hai: "Agar pehle se exist karta hai, to shanti se aage badh jao, error mat feko aur duplicate mat banao."
+
+---
+
+AWS : Timeouts, Retries, Backoff with Jitter :
+
+FAILURES :
+
+- Whenever one service or system calls another, failures can happen. These failures can come from a variety of factors. They include servers, networks, load balancers, software, operating systems, or even mistakes from system operators. We design our systems to reduce the probability of failure, but impossible to build systems that never fail.
+
+- so amazon says,we design our systems to tolerate and reduce the probability of failure, and avoid magnifying a small percentage of failures into a complete outage. To build resilient systems, we employ three essential tools: timeouts, retries, and backoff.
+
+
+Many kinds of failures become apparent as requests taking longer than usual, and potentially never completing. When a client is waiting longer than usual for a request to complete, it also holds on to the resources it was using for that request for a longer time. When a number of requests hold on to resources for a long time, the server can run out of those resources. These resources can include memory, threads, connections, ephemeral ports, or anything else that is limited. To avoid this situation, clients set timeouts. Timeouts are the maximum amount of time that a client waits for a request to complete.
+
+
+It's not always safe to retry. A retry can increase the load on the system being called, if the system is already failing because it’s approaching an overload. To avoid this problem, we implement our clients to use backoff. This increases the time between subsequent retries, which keeps the load on the backend even. The other problem with retries is that some remote calls have side effects. A timeout or failure doesn't necessarily mean that side effects haven't happened. If doing the side effects multiple times is undesirable, a best practice is designing APIs to be idempotent, meaning they can be safely retried.
+
+
+ If errors are caused by load, retries can be ineffective if all clients retry at the same time. To avoid this problem, we employ jitter. This is a random amount of time before making or retrying a request to help prevent large bursts by spreading out the arrival rate.
+
+
+TIME OUTS :
+
+the most difficult problem is choosing a timeout value to set.
+
+Setting a timeout too high reduces its usefulness, because resources are still consumed while the client waits for the timeout. 
+
+Setting the timeout too low has two risks:
+
+- Increased traffic on the backend and increased latency because too many requests are retried.
+
+- Increased small backend latency leading to a complete outage, because all requests start being retried.
+
+
+-> Isliye Amazon mein, jab hum ek service se kisi dusri service ko call karwate hain, toh hum sabse pehle false timeouts (galat ya premature timeouts) ka ek acceptable rate choose karte hain (jaise ki 0.1%).
+
+Uske baad, hum downstream service (service jisko call kiya ja rha he) par uske corresponding latency percentile ko dekhte hain (is example ke hisaab se p99.9 percentile).
+
+PITFALLS(where this approach fails) :
+
+- clients ke paas bohot zyada network latency hoti hai, jaise ki public internet ke through aane wali traffic.
+Aise cases mein, hum ek reasonable worst-case network latency ko bhi calculation mein jodte.
+
+-  latency bounds bohot tight (narrow) hote hain — yaani jahan p99.9 percentile aur p50 (median) percentile aapas mein bohot close hote hain.
+Aise cases mein, thoda sa padding (extra buffer time) add karna help karta hai, taaki latency mein aane wale small increases ki wajah se high numbers of unnecessary timeouts na hone lagein.
+
+
+In one system that I worked on at Amazon, we saw a small number of timeouts talking to a dependency immediately following deployments. The timeout was set very low, to around 20 milliseconds. Outside of deployments, even with this low timeout value, we did not see timeouts happening regularly. Digging in, I found that the timer included establishing a new secure connection, which was reused on subsequent requests. Because connection establishment took longer than 20 milliseconds, we saw a small number of requests time out when a new server went into service after deployments. In some cases, the requests retried and succeeded. We initially worked around this problem by increasing the timeout value in case a connection was established. Later, we improved the system by establishing these connections when a process started up, but before receiving traffic. This got us around the timeout issue altogether.
+
+
+RETRIES AND BACKOFF :
+
+- When failures are caused by overload, retries that increase load can make matters significantly worse. They can even delay recovery by keeping the load high long after the original issue is resolved. Retries are similar to a powerful medicine -- useful in the right dose, but can cause significant damage when used too much. Unfortunately, in distributed systems there's almost no way to coordinate between all of the clients to achieve the right number of retries.
+
+The preferred solution that we use in Amazon is a backoff. Instead of retrying immediately and aggressively, the client waits some amount of time between tries. The most common pattern is an exponential backoff, where the wait time is increased exponentially after every attempt. Exponential backoff can lead to very long backoff times, because exponential functions grow quickly. To avoid retrying for too long, implementations typically cap their backoff to a maximum value. This is called, predictably, capped exponential backoff. 
+
+However, this introduces another problem. Now all of the clients are retrying constantly at the capped rate.
+
+Despite these risks and challenges, retries are a powerful mechanism for providing high availability in the face of transient and random errors.
+
+
+JITTER :
+
+- When failures are caused by overload or contention, backing off often doesn't help as much as it seems like it should. This is because of correlation. If all the failed calls back off to the same time, they cause contention or overload again when they are retried. Our solution is jitter. Jitter adds some amount of randomness to the backoff to spread the retries around in time.
+
+
+ the traffic to our services, including both control-planes and data-planes, tends to spike a lot. These spikes of traffic can be very short, and are often hidden by aggregated metrics. When building systems, we consider adding some jitter to all timers, periodic jobs, and other delayed work. This helps spread out spikes of work, and makes it easier for downstream services to scale for a workload.
+
+
+CONCLUSION :
+
+Timeouts keep systems from hanging unreasonably long, retries can mask those failures, and backoff and jitter can improve utilization and reduce congestion on systems.
+
+At Amazon, we have learned that it is important to be cautious about retries. Retries can amplify the load on a dependent system. If calls to a system are timing out, and that system is overloaded, retries can make the overload worse instead of better. We avoid this amplification by retrying only when we observe that the dependency is healthy. We stop retrying when the retries are not helping to improve availability.
+
+---

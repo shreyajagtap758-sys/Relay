@@ -7,7 +7,7 @@ from sqlalchemy import (
     Integer,
     Text,
     func,
-    text,
+    text, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -102,4 +102,36 @@ class JobExecution(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
+    )
+
+
+class SideEffect(Base):
+    __tablename__ = "side_effects"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True
+    )
+
+    job_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )  # Note: UNIQUE constraint and Foreign Key are intentionally NOT added today!
+
+    worker_id: Mapped[str] = mapped_column(Text, nullable=False)
+
+    action: Mapped[str] = mapped_column(
+        Text, nullable=False, default="email"
+    ) # lets say action email bhejna tha ( 2 bar same email bhejna test)
+
+    effect_key: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )  # Nullable.
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("effect_key", name="uq_side_effects_effect_key"),
     )

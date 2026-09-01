@@ -3,12 +3,14 @@ import os
 import random
 import signal
 import sys
+import time
 from collections.abc import Callable, Coroutine
 from typing import Any
 from sqlalchemy import func, insert, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert
 
 from relay.db import async_session
-from relay.models import Job, JobExecution
+from relay.models import Job, JobExecution, SideEffect
 
 
 POLL_INTERVAL_SECONDS = 2.0
@@ -54,6 +56,59 @@ async def send_heartbeat(job_id: int, stop_event: asyncio.Event) -> None:
                     print(f"[{WORKER_ID}] Heartbeat sent for job {job_id}")
 
 
+async def record_side_effect(
+    job_id: int, worker_id: str, action: str = "email"
+) -> int:
+    """Inserts a business side-effect record committed in its own transaction.
+      return rowcount = 1 if inserted else 0 if duplicate skipped."""
+    effect_key = f"job:{job_id}:{action}"  # Stable key across all retries/workers
+
+    stmt = insert(SideEffect).values(
+        job_id=job_id,
+        worker_id=worker_id,
+        action=action,
+        effect_key=effect_key,
+    )
+
+    # Named constraint explicitly target karein
+    stmt = stmt.on_conflict_do_nothing(constraint="uq_side_effects_effect_key")
+
+    async with async_session() as session:
+        async with session.begin():
+            result = await session.execute(stmt)
+            rowcount = result.rowcount
+            await session.commit()
+    if rowcount == 1:
+        print(
+            f"[{worker_id}] [SIDE EFFECT] Committed '{action}' for job {job_id} (key='{effect_key}', rowcount=1)."
+        )
+    else:
+        print(
+            f"[{worker_id}] [SIDE EFFECT] Duplicate '{action}' skipped for job {job_id} (key='{effect_key}', rowcount=0)."
+        )
+    return rowcount
+
+
+async def handle_email(payload: dict) -> None:
+    """Handler that produces a persistent side-effect and supports payload-driven duration."""
+    seconds = payload.get("seconds", 0.0)
+    job_id = payload.get("job_id", 0)  # Pass job_id in payload if needed
+
+    print(
+        f"[{WORKER_ID}] [email HANDLER] Work started (duration={seconds}s)..."
+    )
+    await record_side_effect(job_id=job_id, worker_id=WORKER_ID, action="email")
+    if seconds > 0:
+        if payload.get("blocking", False):
+            print(
+                f"[{WORKER_ID}] [email HANDLER] Blocking event loop for {seconds}s (Fault Model b)..."
+            )
+            time.sleep(seconds)
+        else:
+            await asyncio.sleep(seconds)
+    print(f"[{WORKER_ID}] [email HANDLER] Work completed.")
+
+
 async def handle_sleep(payload: dict) -> None:
     await asyncio.sleep(2.0)
 
@@ -73,6 +128,7 @@ REGISTRY: dict[str, Callable[[dict], Coroutine[Any, Any, None]]] = {
     "sleep": handle_sleep,
     "boom": handle_boom,
     "slow": handle_slow,
+    "email": handle_email
 }
 
 
@@ -166,6 +222,8 @@ async def run_worker() -> None:
                     f"[{WORKER_ID}] Executing job {job_id} (type={job_type}, attempt={current_attempts}/{MAX_ATTEMPTS})..."
                 )
                 await record_execution(job_id, WORKER_ID)
+
+                payload["job_id"] = job_id
                 await handler(payload)
                 print(f"[{WORKER_ID}] Finished execution for job {job_id}.")
                 new_status = "succeeded"

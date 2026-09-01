@@ -138,3 +138,5 @@ Inspecting `pg_stat_activity` revealed the following multi-session lock contenti
 
 ---
 
+
+

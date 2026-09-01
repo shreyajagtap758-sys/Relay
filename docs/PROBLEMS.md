@@ -1373,3 +1373,21 @@ Four readings:
   claim gate and own the sweep. Silence produces a `Cost` line that the table itself refutes.
 
 ---
+
+## P-28 — Alembic ignores Relay's runtime `DATABASE_URL`; a disposable migration command can silently target the evidence database
+
+**Status: MEASURED-R on Week 3 Din 2 review.** The reviewer set `DATABASE_URL=.../relay_review_din2` and ran Alembic expecting isolation. Alembic reported and modified `.../relay` because `alembic/env.py` builds its engine from `alembic.ini`, whose `sqlalchemy.url` is fixed to the production/evidence database.
+
+**The failure:** runtime code (`src/database.py`) reads `os.environ["DATABASE_URL"]`; migration code does not. Two commands with the same environment therefore target different databases without an error. The console did print the real URL in verbose output, but the ordinary upgrade/downgrade output did not make the mismatch obvious.
+
+During review, `downgrade 4b0e6dcfdfa1` then `upgrade head` ran against `relay` and temporarily dropped/re-added `effect_key`, turning the two keyed rows into `NULL`. A pre-probe catalog snapshot held the exact original values, so rows `id=4/job=111` and `id=5/job=112` were restored to `job:111` and `job:112`. Final counts, keys, named constraint, Alembic head, worker count, and idle-transaction count all match the opening snapshot `[MEASURED-R]`.
+
+A corrected lifecycle rerun later targeted the disposable `relay_review_din2` database and reproduced the intended down/up behavior `[MEASURED-R; raw capture not retained]`. In particular, the raw `select current_database()` transcript was not retained, so this is reviewer observation rather than durable transcript evidence.
+
+**Why this matters:** a migration probe is allowed to be destructive inside a disposable database. Target ambiguity moves that blast radius to the one database whose evidence the probe was meant to protect. Exit code `0` and a correct revision graph say nothing about target identity.
+
+**Required invariant before the next migration lifecycle probe:** print/read the actual target database from the migration connection, and make runtime plus Alembic configuration share one source of truth. Until that is implemented, disposable runs must override Alembic's `sqlalchemy.url` explicitly (not only `DATABASE_URL`) and verify `select current_database()` before any downgrade.
+
+**Owner:** Week 4 configuration hardening, or earlier if Din 4 adds a migration. This is not a reason to build outbox/fencing early; it is a migration safety prerequisite.
+
+---
