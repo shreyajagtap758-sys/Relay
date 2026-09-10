@@ -59,7 +59,8 @@ async def reap_stuck_jobs() -> int:
                 post_status = returned_row[0] if returned_row else candidate.status
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
                 print(
-                    f"[{REAPER_ID}] [{ts}] id={candidate.id} pre_status={candidate.status} matched={matched} post_status={post_status}"
+                    f"[{REAPER_ID}] [{ts}] [reclaim] job_id={candidate.id} pre_status={candidate.status} matched={matched} post_status={post_status}",
+                    flush=True,
                 )
                 if matched > 0:
                     reclaimed_count += matched

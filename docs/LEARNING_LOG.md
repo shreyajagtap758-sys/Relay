@@ -2275,3 +2275,1635 @@ Timeouts keep systems from hanging unreasonably long, retries can mask those fai
 At Amazon, we have learned that it is important to be cautious about retries. Retries can amplify the load on a dependent system. If calls to a system are timing out, and that system is overloaded, retries can make the overload worse instead of better. We avoid this amplification by retrying only when we observe that the dependency is healthy. We stop retrying when the retries are not helping to improve availability.
 
 ---
+
+Din 1 par kya hua tha: 2 workers ne ek hi job chalaya 
+→
+→ job_executions me 2 rows bani 
+→
+→ aur side_effects me 2 duplicate emails chale gaye.
+Din 2 par kya karna hai: Hum wahi exact collision (2 workers, 
+45
+s
+45s duration, proved overlap) phir se repeat karenge...
+Lekin aaj ka Result: job_executions me 2 rows banengi, par side_effects table me count 1 hi rahega!
+Core Lesson: Database-level UNIQUE constraint (ON CONFLICT DO NOTHING) duplicate delivery ko execute hone se rok deta hai, jabki application level par SELECT-then-INSERT check concurrency me fail ho jata hai.
+
+
+
+job -> worker A claim -> inserts effect_key, rowcount = 1 -> worker A blocks event loop -> reaper reclaim -> worker B -> insert effect_key(same), DB unique constraint conflict, rowcount = 0(no operation) -> side_eff count =1.
+
+
+if i have already two same job rows sitting there and apply migration/unique constraint, it will reject.
+- so we make a new nullable column "effect_key" and apply unique there. so old rows get NULL and new jobs gets a stable key that enforces uniqueness.
+
+- Key ke andar worker_id, attempts, execution ID, timestamp ya random UUID kabhi mat daalna! Agar unhe key me daal diya to har duplicate dispatch alag key banayega aur UNIQUE constraint duplicate ko pakad hi nahi payega.
+
+
+OUTPUT TERMINAL :
+
+do worker + 1 reaper + no heartbeat.
+
+expectation :
+Worker A: Claims job 
+→
+→ inserts effect_key 
+→
+→ rowcount=1 
+→
+→ enters 45s sleep.
+Reaper (at 30s): Reclaims job running -> pending.
+
+
+Worker B: Claims same job 
+→
+→ tries to insert same effect_key 
+→
+→ DB catches unique conflict 
+→
+→ statement returns rowcount=0 (Duplicate skipped!) 
+→
+→ enters sleep.
+
+
+Worker A (at 45s): Conflict on mark (rowcount=0).
+Worker B (at ~75s): Marks succeeded (rowcount=1).
+
+
+
+id | job_id |  worker_id   |          executed_at          
+----+--------+--------------+-------------------------------
+ 67 |     39 | worker-24256 | 2026-09-01 14:18:00.736362+00
+ 68 |     39 | worker-4668  | 2026-09-01 14:18:07.948207+00
+
+
+
+ id | job_id |  worker_id   |  effect_key  |          created_at           
+----+--------+--------------+--------------+-------------------------------
+  7 |     39 | worker-24256 | job:39:email | 2026-09-01 14:18:00.765132+00
+(1 row)
+
+
+ effect_count 
+--------------
+            1
+(1 row)
+
+
+
+Worker A 
+14
+:
+18
+:
+00
+14:18:00 par shuru hua aur 
+45
+s
+45s chala (yani 
+14
+:
+18
+:
+45
+14:18:45 tak).
+Worker B 
+14
+:
+18
+:
+07
+14:18:07 par shuru hua (
+7.2
+s
+7.2s baad).
+Measured Overlap: 
+45
+−
+7.21
+=
+37.79
+ seconds
+45−7.21=37.79 seconds tak dono workers ne ek sath kaam kiya!
+
+
+Din 1 par kya hua tha: 2 workers chale the to side-effects 2 ban gaye the.
+Aaj Din 2 par kya hua: 3 dispatches huye, 2 alag workers chale, 
+37.8
+s
+37.8s ka overlap hua... LEKIN side_effects me count EXACTLY 1 raha!
+Pehle worker ne job:39:email insert kiya (rowcount=1), aur jab doosre worker ne insert karne ki koshish ki to Database ke UNIQUE(effect_key) constraint ne use block kar diya (rowcount=0)!
+
+
+
+THE RACE WINDOW (application level):
+
+# ❌ GALTI: Check-then-Act
+record = db.query("SELECT * FROM side_effects WHERE job_id = 39")
+if not record:  # 1. Pehle Check kiya
+  db.execute("INSERT INTO side_effects ...")  # 2. Phir Action liya
+
+
+Problem: Step 1 (Check karne) aur Step 2 (Insert karne) ke beech me kuch milliseconds ka gap hota hai.
+Jab do workers concurrently chalte hain, to dono ko Step 1 me yahi lagta hai ki "kisine abhi tak email nahi bheji hai", aur dono ke dono email insert kar dete hain!
+
+
+DATABASE UNIQUE CONSTRAINT (DB level):
+- ON CONFLICT DO NOTHING.
+
+Humne application ke upar bharosa chhod kar Database Engine (PostgreSQL) ko referee (Arbiter) bana diya.
+
+PostgreSQL ke paas disk/index level par atomic lock hota hai:
+
+Worker A aaya: Database index me job:39:email likh diya 
+→
+→ Success!
+Worker B aaya: Chahe usne pehle kuch bhi dekha ho, jab wo database me likhne gaya to Postgres ne bola:
+"Ruko! Yeh job:39:email pehle se index me darj hai. Main ise insert nahi karunga!"
+
+Nateeja: Kissi bhi race condition me duplicate banna mathematically IMPOSSIBLE ho jata hai!
+
+---
+
+WEEK 3 - DAY 3 :
+
+The Out-of-Memory (OOM) killer is a built-in Linux kernel safeguard that forcefully terminates a process to save the operating system from a total freeze when RAM and swap space are completely exhausted.
+
+
+Din 2 me humne kya dekha tha: Do zinda workers concurrently chal rahe the, aur database ke UNIQUE(effect_key) constraint ne duplicate insert ko rok diya tha (rowcount = 0).
+
+Din 3 ka Asli Sawaal: "Agar worker crash ho jaye (process achanak mar jaye, power cut ya OOM killer se), to kya hamara system recover ho payega? Aur recovery ke dauran kya duplicate side-effect banega ya nahi?"
+
+
+SIDE EFFECT : Job ko process karte waqt application ke bahar/DB mein koi actual persistent change karna.
+
+handler:
+    calculate invoice      ← execution
+
+    INSERT payment record  ← side-effect
+
+    send email             ← side-effect
+
+    charge credit card     ← side-effect
+
+
+
+-> Worker ke execution me 3 critical points (boundaries) hote hain jahan crash ho sakta hai:
+
+
+Case A (Before Effect): Worker ne job claim kiya, par side-effect insert hone se pehle mar gaya.
+
+claim job
+   ↓
+handler start
+   ↓
+❌ worker dies
+   ↓
+side-effect hua hi nahi
+
+Example: email send hone se pehle worker crash.
+
+
+Case B (After Effect, Before Mark — The Centrepiece): Worker ne side-effect database me commit kar diya, par job ko succeeded mark karne se pehle mar gaya! (Yahan Durable Orphan Effect banta hai).
+
+claim job
+   ↓
+side-effect execute
+   ↓
+DB mein side-effect COMMIT ✅
+   ↓
+❌ worker dies
+   ↓
+job = running
+
+
+Ab database mein:
+
+job  = running
+effect = already exists
+
+Lekin worker ko job succeeded mark karne ka chance nahi mila.
+
+
+Case C (After Mark — The Control): Worker ne job ko succeeded mark karke commit kar diya, aur theek uske baad mar gaya.
+
+side-effect COMMIT ✅
+   ↓
+job = succeeded COMMIT ✅
+   ↓
+❌ worker dies
+
+Ab database clearly bol raha hai:
+
+job       = succeeded
+effect    = exists
+
+Worker/reaper ko job dobara execute karne ki zarurat nahi.
+
+
+-> Din 3 ka Target: Hum code me temporary hooks daal kar in teeno jagahon par jaan-boojh kar worker ko hard kill (os._exit(86)) karenge aur dekhenge ki Reaper aur Recovery Worker har boundary par system ko kaise handle karte hain.
+
+os._exit(86): Python ka raw OS-level exit. Yeh try/except, finally, context managers, aur graceful shutdown sabko bypass karke process ko turant mar deta hai. Exit code 86 isliye use karte hain taaki prove ho sake ki exit crash hook se hua hai, normal crash se nahi.
+
+
+TESTS AND OBSERVATIONS :
+
+Pehle worker crash hoga (os._exit(86)).
+Phir hum database ki photo (Snapshot) lenge ki crash ke waqt database me kya haal tha.
+Phir hum Reaper aur Recovery Worker chalayenge yeh dekhne ke liye ki system us crash se kaise ubaarta hai!
+Phir hum final photo (Snapshot) lenge ki recovery ke baad kya duplicate banta hai ya sab kuch sahi ho jata hai.
+
+
+STEP 1 : worker me temporary crash hooks lagana jisse worker wahan jaan bujh kr crash kre :
+
+---------------
+
+CASE A :
+
+job claim -> crash(exit:86) -> Pre-reaper Snapshot:
+status = running, attempts = 1
+job_executions = 1 (worker ne claim kiya tha)
+side_effects = 0 (kyunki effect likhne se pehle hi mar gaya tha!) -> Hum SQL se hook hatayenge aur lease expire karenge. Reaper job ko running -> pending kar dega -> Doosra worker aayega, job ko claim karega, email side-effect insert karega (rowcount = 1), aur job ko succeeded kar dega.
+
+OBSERVATIONS :
+
+TERMINAL :
+WORKER A :
+
+[worker-17808] Claimed job 40 (attempt=1, rowcount=1). Status is now 'running'.
+[worker-17808] Executing job 40 (type=email, attempt=1/3)...
+[worker-17808] [CRASH HOOK] Crashing at before_effect_commit for job 40
+Worker exited with code: 86
+
+PRE REAPER SNAPSHOT : status: running | attempts: 1 | executions: 1 | effects: 0
+
+REAPER RECLAIM
+
+WORKER B :
+
+[worker-17092] Claimed job 40 (attempt=2, rowcount=1). Status is now 'running'.
+[worker-17092] [SIDE EFFECT] Committed 'email' for job 40 (key='job:40:email', rowcount=1).
+[worker-17092] Marked job 40 as 'succeeded' (rowcount=1).
+
+
+Post-Recovery Snapshot:
+Status: succeeded
+Attempts: 2
+Executions: 2
+Effects: 1 (At-least-once verified: Kaam khoya nahi, recovery ne effect create kar diya!).
+
+------------------
+
+CASE B :
+
+Crash AFTER Effect Commit, Before Mark.
+
+Database me email ja chuki hai, par Relay ko lagta hai job abhi bhi chal raha hai (Durable Orphan Effect). Jab recovery worker aayega, to kya wo doosri email bhej dega? Yahan hamara Din 2 ka UNIQUE constraint test hoga!
+
+Worker side-effect insert karega (COMMIT hoga), fir Hook 2 fire hoga aur worker Exit 86 par mar jayega!
+Pre-reaper Snapshot:
+status = running, attempts = 1
+side_effects = 1 (Email already database me commit ho chuki hai!)
+Reaper Reclaim karega: Reaper job ko wapas pending bana dega.
+Recovery Worker B chalega (Asli Test):
+Recovery worker B job claim karega.
+Wo side-effect insert karne jayega.
+🎯 Database Unique Index use rok dega!
+Worker B ke log me aayega: Side-effect duplicate skipped (rowcount=0).
+Worker B job ko succeeded mark karega.(isne email wapis nhi bheji, success mark kr diya)
+
+
+OBSERVATIONS :
+
+TERMINAL :
+WORKER A :
+
+[worker-1104] Claimed job 41 (attempt=1, rowcount=1). Status is now 'running'.
+[worker-1104] [SIDE EFFECT] Committed 'email' for job 41 (key='job:41:email', rowcount=1).
+[worker-1104] [CRASH HOOK] Crashing at after_effect_commit for job 41
+Worker exited with code: 86
+
+PRE REAPER SNAPSHOT : status: running | attempts: 1 | executions: 1 | effects: 1 (key='job:41:email')
+
+REPAER RECLAIM
+
+WORKER B :
+
+[worker-4756] Claimed job 41 (attempt=2, rowcount=1). Status is now 'running'.
+[worker-4756] [SIDE EFFECT] Duplicate 'email' skipped for job 41 (key='job:41:email', rowcount=0).
+[worker-4756] Marked job 41 as 'succeeded' (rowcount=1).
+
+
+Post-Recovery Snapshot:
+Status: succeeded
+Attempts: 2
+Executions: 2
+Effects: EXACTLY 1 (Duplicate suppress ho gaya!).
+
+
+Conclusion: Dedup Proven! Crash hone ke bawajood recovery worker ne duplicate email nahi bheji, balki use skip karke job ko safely succeed kar diya!
+
+-------------------
+
+CASE C :
+
+Yahan worker ne job ko succeeded mark kar diya aur transaction COMMIT ho gayi, aur uske theek baad worker mar gaya.
+
+Sawaal: Kya Reaper ya koi doosra worker is job ko dobara chhedega?
+Nahi! Kyunki job already succeeded ho chuki hai, to system ko ise bilkul ignore karna chahiye.
+
+
+Crash Worker chalega: Mark UPDATE 
+→
+→ COMMIT 
+→
+→ Hook 3 fire 
+→
+→ Exit 86.
+Snapshot: Job already succeeded hai, side_effects = 1, executions = 1.
+Liveness Test (Reaper & Worker):
+Hum Reaper ko chalayenge kam se kam 6 seconds ke liye. Reaper poll karega par Job ko touch nahi karega (candidates=0, reclaimed=0).
+Hum Worker ko chalayenge kam se kam 6 seconds ke liye. Worker queue dekhega par Job ko claim nahi karega.
+Conclusion: Terminal commit process death ke baad bhi survive kar gaya, aur live workers ne ise sahi tarike se chhod diya (No accidental re-execution).
+
+
+OBSERVATIONS :
+
+TERMINAL :
+WORKER A :
+
+[worker-4296] Claimed job 42 (attempt=1, rowcount=1). Status is now 'running'.
+[worker-4296] [SIDE EFFECT] Committed 'email' for job 42 (key='job:42:email', rowcount=1).
+[worker-4296] Marked job 42 as 'succeeded' (rowcount=1).
+[worker-4296] [CRASH HOOK] Crashing at after_mark_commit for job 42
+Worker exited with code: 86
+
+
+PRE TEST SNAPSHOT : status: succeeded | attempts: 1 | executions: 1 | effects: 1
+
+Post-Control Snapshot:
+Status: succeeded
+Attempts: 1
+Executions: 1
+Effects: 1 (Terminal Invariant verified: Completed job ko kisi ne re-execute nahi kiya!).
+
+----------------------
+
+ id |  status   | attempts | has_hook | executions | effects 
+----+-----------+----------+----------+------------+---------
+ 40 | succeeded |        2 | f        |          2 |       1   <-- Case A (Before Effect)
+ 41 | succeeded |        2 | f        |          2 |       1   <-- Case B (After Effect)
+ 42 | succeeded |        1 | f        |          1 |       1   <-- Case C (After Mark)
+
+
+KUCH SAWAAL :
+
+
+Kya Case A aur Case B ka Recovery-Relevant Projection Same Tha?
+Haan! Dono cases me recovery se pehle database me: Status running, attempts 1, lease expired thi. 
+Recovery worker ko bahar se dekhne par dono jobs identical dikhti hain, lekin Case B me effect pehle hi durable tha aur Case A me nahi tha. Yahi wajah hai ki recovery worker ka idempotent hona compulsory hai!
+
+
+Local Effect aur Job Mark ko ek hi transaction me merge kyu nahi kar dete?
+Real Cost: Agar hum side-effect aur mark ko ek transaction me daalenge, to handler ka poora execution time database transaction ke andar fas jayega (long-running transaction locks pakad kar rakhegi).
+Aur agar mark statement rowcount = 0 par fail ho jaye, to pura transaction rollback karna padega.
+
+
+External Effect (Stripe/Email) same transaction me kyu nahi aa sakta?
+Kyunki PostgreSQL ka COMMIT ya ROLLBACK sirf database rows par kaam karta hai. Agar aapne Stripe se paise kaat liye ya email bhej diya, aur uske baad Postgres me crash ya rollback hua, to database to rollback ho jayega par user ke paise wapas nahi aayenge! Isliye Transactional Outbox pattern ki zaroorat padti hai (Week 4 topic).
+
+
+CONCLUSION :
+
+to aj humne dekha ki har worker cliam - execute - commit krta he, har ek step pr worker fail krke deka ki kya hota he .
+
+first fail : agar job claim ki but mar gya claim ke baad.
+recovery : lease expiry + reaper(duja worker reclaim krega and execute krega).
+GUARANTEE : "At-Least-Once Execution Guarantee" (Loss Prevention)
+Matlab: Agar worker kaam shuru karte hi mar jaye, to kaam hamesha ke liye gayab (lost) nahi hoga. Reaper use zinda karega aur kam se kam ek baar effect zaroor execute hoga!
+
+
+sec fail : worker claim + execute and commit kiya, but mark success krna reh gya jisse running hi rhega db me. ab reaper running fasi jobs ko duje ko dega.
+recovery : DATABASE unique constraint = table me duje worker ko ghusne nhi diya, ON CONFLICT DO NOTHING = duje worker ko crash nhi hone diya and statement ko safe no-op banaya(rowcount=0) jisse worker agge badhke status successed kr dega.
+GUARANTEE : "At-Most-Once Side-Effect Guarantee / Idempotency" (Duplicate Prevention)
+Matlab: Chahe worker email likhte hi mar jaye aur doosra worker recovery ke liye aaye, user ko kabhi bhi doosri email nahi jayegi! Side-effect hamesha EXACTLY 1 hi rahega.
+
+
+third fail : worker ne sb kuch kr diya(commit, execute, mark), or fir mar gya.
+recovery : DATABASE ACID DURABILITY : process commit krke mara jisse commit status safe he, reaper sirf running job ko dhundega, yaha wo reclaim krne nhi dega, or kisi worker ne nahi uthaya bcz status pending nhi tha.
+GUARANTEE : "Terminal State Invariant" (Zombie Prevention / Completion Durability)
+Matlab: Ek baar jab Relay ne kisi job ko succeeded mark kar diya, to wo pathar ki lakeer hai. Uske baad process mare ya computer reboot ho jaye, koi bhi Reaper ya Worker us completed job ko dobara restart (zombie execution) nahi karega!
+
+---
+
+WEEK 3 - DAY 4
+
+Enqueue Idempotency: Ek hi caller intent jab network fail hone par retry kare, to system use wahi pehle wali job identity wapas kare, naya duplicate job create na kare.
+
+
+Pehle (Din 2/3): Humne dekha ki agar 1 job database me hai aur 2 workers use chala dein, to duplicate email nahi jaani chahiye (Execute Dedup).
+
+Aaj (Din 4): Hum yeh dekh rahe hain ki agar client ne network slow hone ki wajah se Button 2 baar daba diya aur API ko 2 baar request bhej di, to database me 2 alag jobs nahi banne chahiye! API ko pehli hi job ka response wapas kar dena chahiye (Enqueue Dedup).
+
+
+
+STEP 1 : 
+
+Agar client do baar request bhejta hai, to server ko kaise pata chalega ki yeh wahi puraani request hai ya koi nayi request?
+
+WHAT ADDING IN CODE :
+
+- Caller-minted Key: Client har request ke sath ek ID bhejega: idempotency_key = "req-123".
+
+BLANK KEY REJECTED, MAX LEN = 128 CHAR.
+
+- Request Fingerprint (SHA-256 Hash): Agar client ne key wahi rakhi ("req-123"), par payload badal diya ({"amount": 10} ki jagah {"amount": 500}), to kya hum use purani job ka success de dein? Bilkul nahi! Yeh fraud ya bug ho sakta hai. Isliye hum request ke content ka ek SHA-256 Fingerprint nikaal kar store karenge.
+
+KEY ORDER AGGE PICHE HONE SE BHI FINGERPRINT SAME BAN RHI(order_same=True), payload ya type badlne se fingerprint badl jata.
+
+- Canonical JSON: {"a": 1, "b": 2} aur {"b": 2, "a": 1} ka hash same aana chahiye. 
+- JSON = json me ye dono bilkul ek hi chiz he same, lekin hashing algo(SHA-256) character by char padhega jisse iska HASH alag aa sakta he.
+
+
+
+- CONONICAL JSON = isme client ne chaahe {"b": 2, "a": 1} bheja ho ya {"a": 1, "b": 2}, sort_keys=TRUE dono ko alphabetic order me sort krega, to dono ab {"a": 1, "b": 2} ban jayege.
+- ab string ek jesi ban gyi, to SHA-256 hash bhi SAME ho jayega.
+
+JSONB = ye whie-space, duplicate keys hata deta he + SORT krke store krta he.
+
+- agar postgres ka jsonb dono ko same manta he, to hum isme python ka SHA-256 hash fingerprint kyu banayege?
+- Kyunki Database me UNIQUE constraint sirf simple types (jaise Text ya Number) par tezi se index banata hai.
+- Agar hum pure payload jsonb par unique constraint lagate, to badi JSON payloads par database slow ho jata, aur hum idempotency_key ke sath fingerprint mismatch ko detect nahi kar paate.
+
+Humara rule hai:
+
+- idempotency_key par database ka UNIQUE constraint lagega.
+- request_fingerprint me Python ka canonical hash jayega.
+
+
+
+STEP 2 :
+
+Ek client request bhejta hai: key = "k1", payload = {"a": 1, "b": 2}. Server use insert karta hai aur job_id = 116 deta hai.
+
+Client ka network drop ho gaya. Client ne dobara wahi request bheji: key = "k1", payload = {"b": 2, "a": 1}.
+
+Expectation: Server naya job nahi banayega! Wo dekhega ki "k1" pehle se hai, fingerprint match karega, aur wahi purana job_id = 116 wapas return kar dega.
+
+
+Request 1 bheji:
+
+Payload: type='sleep', payload={'a': 1, 'b': 2}, key='din4-seq-7f03...'
+
+API ne Return kiya: Job ID: 43, Status: pending (HTTP 202)
+
+
+Request 2 bheji (Same key, par reversed keys {'b': 2, 'a': 1}):
+
+API ne Return kiya: Job ID: 43, Status: pending (HTTP 202)
+
+
+Database Check:
+
+select count(*) from jobs where idempotency_key='din4-seq-7f03...';
+-- Result: 1 row!
+
+
+JOB SEQUENCE MOVEMENT :
+
+Customer 1 aaya (Request 1):
+
+Machine ka button dabaya 
+→
+→ Token nikla #43.
+Counter ho gaya 43.
+Customer 1 counter par gaya, apna form bhara aur account khul gaya (Commit ho gaya!).
+Customer 2 aaya (Duplicate Replay):
+
+Usne machine ka button dabaya 
+→
+→ Machine ne turant agla Token generate kar diya #44!
+Machine ka counter ho gaya 44.
+Ab Customer 2 counter par gaya. Officer ne dekha: "Arey! Aap to wahi Customer 1 ho, aapka account to pehle se khula hua hai (Duplicate Key Conflict)!"
+Officer ne uska form faad kar dustbin me phenk diya (Rollback ho gaya!).
+Ab Token #44 ka kya hua?
+
+customer 2 ka Form to dustbin me chala gaya, isliye DB me sirf Customer 1 ki 1 hi row bachi rahi, lekin Token #44 machine ke andar wapas reverse nahi ja sakta!
+Machine ka counter ab 44 par hi khada rahega.
+Agla naya customer aayega to use Token #45 milega!
+
+43(row=1) -> 44(no row exist) -> 45(next job)
+
+POSTGRES Rollback ke sath sequence ko wapas 43 kyu nahi karta?
+
+- Agar Postgres sequence ko rollback karne lagta, to jab tak ek transaction poori nahi hoti, tab tak doosre transactions ko sequence lock karke wait karwana padta. System bohot slow ho jata.
+
+Database me IDs hamesha 1, 2, 3, 4... lagataar nahi aayengi. Beech me gaps aayenge (jaise 43 ke baad seedha 45).
+Never Assume count(*) == max(id): Agar database me 100 rows hain, to zaroori nahi ki aakhri ID 100 ho, wo 120 bhi ho sakti hai!
+
+
+
+STEP 3 :
+
+CODE bugs to see :
+
+1. Mismatch Control: Client ne wahi key use ki par payload badal diya ({"a": 1, "b": 3}). Agar server ne purana job_id return kar diya, to client samjhega uska naya payload accept ho gaya! Server ko 409 Conflict fekna chahiye.
+
+HTTP_STATUS: 409
+BODY: {"detail": {"code": "idempotency_key_mismatch", "job_id": 43}}
+
+
+2. Postgres 25P02 Control: The Scenario: Jab database me duplicate key takrati hai, to PostgreSQL transaction ko Aborted State me daal deta hai. Postgres ka rule hai: "Jab tak tum ROLLBACK nahi karte, tab tak tum is connection par koi naya SELECT ya query nahi chala sakte."
+
+WRONG :
+
+try:
+  await db.commit()  # Duplicate key takrayi!
+
+except IntegrityError:
+  # Galti: Rollback karna bhool gaye aur seedha original row dhundhne chale gaye!
+   // await db.rollback() -> missing.
+  existing = await db.execute(select(Job).where(...))
+
+- Error 25P02: current transaction is aborted, commands ignored until end of transaction block!`**  
+  Aur user ko milta hai **500 Internal Server Error**!
+
+
+- before_rollback_caught = PendingRollbackError (SELECT fail hua!)
+- after_rollback_rows = 1 (Rollback ke baad SELECT successful!)
+
+
+3. Unrelated Integrity Control: Agar job status check constraint (jobs_status_check) violate hui, to generic except IntegrityError use replay na maan le! Use 500 Internal Error hi aana chahiye.
+
+Hamara code kisi bhi random error ko replay nahi maanta. Wo sirf aur sirf uq_jobs_idempotency_key ke conflict ko replay maanta hai, baki integrity errors par 500 deta hai.
+
+
+STEP 4 :
+
+Agar do requests ek hi millisecond me concurrently aayi, to application layer ka koi if check kaam nahi aayega. Dono DB me insert karne jayengi.
+
+-> Database me kya hoga?
+- Ek transaction Winner banegi aur insert karegi.
+
+- Doosri transaction Loser banegi aur database ke lock par wait (block) karegi jab tak Winner commit na ho jaye!
+
+- Winner ke commit hote hi Loser ko unique violation milega, wo replay contract me convert hoga aur winner ka job_id return karega.
+
+
+- Dono clients ko response mila aur dono ke paas same job_id tha!
+
+- Database me EXACTLY 1 row bani!
+
+-> Conclusion: Concurrency me application timing nahi, Postgres ka unique index referee banta hai aur loser safely wait karke replay paata hai.
+
+TERMINAL :
+
+Humne DB me ek trigger lagaya jo pehle request (Winner) ko 5 second ke liye sula deta hai (pg_sleep(5)).
+
+
+=== PG_STAT_ACTIVITY DURING 5s RACE HOLD ===
+ pid | wait_event_type |  wait_event   | query                                  
+-----+-----------------+---------------+------------------------------------------------
+ 695 | Timeout         | PgSleep       | INSERT INTO jobs ...
+ 531 | Lock            | transactionid | INSERT INTO jobs ...
+(2 rows)
+
+
+AFTER 5 SECONDS :
+
+Client 1: status=202, elapsed=5227.5ms, body={'job_id': 53, 'status': 'pending'}
+Client 2: status=202, elapsed=5207.7ms, body={'job_id': 53, 'status': 'pending'}
+DB Rows count for race key: 1
+
+
+(NOTE : yaha clients queue me daal rhe he job ko, not success/running hore because worker ne nhi liya abi, isliye status pending retrun hua. winner jo client 1 tha ne job ko db me insert kiya initial status = pending. loser client 2 wait krega jab tk winner commit nhi hota, or ab isko unique conflict milega, or whi original job ka current status bhej dega jo he pending. to jab worker ayega, usko ek hi row job = 53 milegi, duplicate job loser daal nhi paya)
+
+
+STEP 5 :
+
+Key wali job (Opt-in): Client bolta hai "Yeh mera request #123 hai. Agar main network drop hone par dobara #123 bhejoon, to mujhe naya job mat dena, purana hi dena."
+
+Bina key wali normal job (Opt-out): Client key nahi bhejta. Wo bolta hai "Mujhe ek email bhejni hai." Agar wo 5 minute baad dobara bina key ke wahi email bhejta hai, to wo chahta hai ki doosri email bhi jaye!
+
+Dikkat kya ho sakti thi: Agar hum galti se bina key wale jobs ko bhi payload ke hisab se dedup kar dete, to client jab bhi same data bhejta, purani job merge ho jati aur naya kaam chalta hi nahi!
+
+Postgres me yeh kaise kaam karta hai: Postgres ka UNIQUE index NULL values par enforce nahi hota (NULL != NULL). Isliye jitni marzi unkeyed jobs aane do, unpe koi constraint error nahi aata!
+
+
+=== STEP 5 UNKEYED RESULTS ===
+Request 1 -> Status: 202, Job ID: 55
+Request 2 -> Status: 202, Job ID: 56
+Are Job IDs distinct?: True
+
+Dono requests ko alag-alag Job IDs (55 aur 56) mile aur database me 2 rows bani
+
+
+"Bina key wali jobs me to ek hi email do baar ja sakta hai na? To kya hum bina key ke bhi duplicate rok sakte hain, ya answer yahi hai ki key wala hi bhejo?"
+
+Iska answer hai: Answer yahi hai ki Client ko KEY hi bhejni padegi! Server bina key ke duplicate rok hi nahi sakta.
+- bina key tb use kre jab same work intensionally do bar krvana ho(no duplication manage), jisse same work pr bhi alag job assign hogi or usko NAYA work mana jayega jo execute hoga.
+- key(idempotency_key) ke sath tb bhejo jab ek hi baar krvana ho and retry pr safely no duplication ho.
+
+
+STEP 6 :
+
+1. Enqueue Dedup (Din 4)
+- API Layer par
+- prevent failure : Client ke browser/app ke network retry se database me 2 rows banne se rokti hai.
+
+2. Execute Dedup (Din 2/3)
+- Worker / DB Engine par
+- prevent failure : Agar database me 1 job hai, aur worker crash ho gaya ya lease expire ho gayi, to doosre worker ko duplicate side-effect (email/payment) karne se rokti hai.
+
+
+Kyu ek ke bina doosra adhoora hai?
+Agar aap sirf Enqueue dedup lagaoge aur worker crash ho gaya, to Reaper job ko restart karega aur naya worker aakar dobara email bhej dega! Isliye Execute Dedup zinda rehna compulsory hai.
+
+
+FLOW WORK :
+
+WORKER A :
+
+[worker-19136] Claimed job 58 (attempt=1)
+[worker-19136] [SIDE EFFECT] Committed 'email' for job 58 (rowcount=1)
+
+Worker A 45s sleep me gaya. Humne lease expire karke Reaper chalaya:
+
+[reaper-9964] id=58 pre_status=running matched=1 post_status=pending
+
+WORKER B :
+
+[worker-14812] Claimed job 58 (attempt=2)
+[worker-14812] [SIDE EFFECT] Duplicate 'email' skipped for job 58 (key='job:58:email', rowcount=0).
+[worker-14812] Marked job 58 as 'succeeded' (rowcount=1).
+
+
+id: 58 | status: succeeded | attempts: 2 | executions: 2 | workers: 2 | effects: 1.
+
+---
+
+WEEK 3 - DAY 5
+
+Pehle ke Dino me humne kya kiya?
+
+Humne manually kuch scenarios test kiye: 2 concurrent workers chalaye (Din 2), exact 3 points par crash kiya (Din 3), aur network replay bheja (Din 4).
+
+Lekin ek reviewer ya interviewer keh sakta hai: "Tumne to wahi tests chalaye jo tumne soche the. Agar workers ka koi ajeeb random order ho jaye (Interleaving), ya achanak 5 baar crash aur 3 baar retry ho jaye, to kya tab bhi side effect ek hi baar hoga?"
+
+
+Aaj hum Hypothesis library use karke ek Property-Based Test likhenge jo random sequences of actions (claim, crash, retry, reclaim, execute) generate karega.
+
+Aur yeh prove karega: Chahe events ka order kitna bhi random ya chaotic kyu na ho, side effect count hamesha ≤ 1 hi rahega!
+
+
+WHY EFFECTS ≤ 1(AT MOST ONCE), NOT EXACTLY ONE ?
+
+- Job fail ho gayi (boom handler): Worker ne job uthai, par pehli line par hi code fat gaya (Exception). Kaam hua hi nahi. To side effect kitna hoga? 0!
+
+- Worker effect likhne se pehle hi mar gaya: Worker ne job claim ki, par database me email likhne se theek 1 millisecond pehle server ka power cut ho gaya. Effect kitna hua? 0!
+
+- Job Dead-Letter me chali gayi: Job ne 3 attempts try kiye, teeno baar network error aaya aur job dead_letter ban gayi. Effect kitna hua? 0!
+
+
+Agar hum test me likhte: assert effects == 1: To jaise hi koi job crash hoti ya fail hoti, hamara test chilaane lagta: "Error! Effect 0 kyu hai, 1 hona chahiye tha!" — Yeh galat hota, kyunki failure ek valid state hai.
+
+Isliye Distributed Systems me do alag niyam hote hain:
+
+- Safety Rule (Buri cheez kabhi na ho):
+
+Side effect kabhi bhi 1 se zyada nahi hoga → effects <= 1 (0 chalega agar fail hua, 1 chalega agar pass hua, par 2 ya 3 KABHI NAHI!).
+
+- Conditional Liveness Rule (Agar sab theek raha to kaam zaroor ho):
+
+AGAR handler bina error ke commit ho gaya, TAB effect exactly 1 hoga → effects == 1.
+
+
+Din 2, 3 aur 4 me humne kya kiya?
+
+Humne ek car banayi jisme humne naye brakes lagaye (hamara UNIQUE constraint).
+Humne seedhi saaf road par car chala kar brake dabaya: "Dekho car ruk gayi (Dedup ho gaya)!"
+
+Ab Din 5 par interviewer ya senior engineer aapse aakar kehta hai:
+
+"Tumne to sirf wahi 2-3 situations test ki jo tumhare dimaag me aayi thi.
+Agar car pahaad par ho, barish ho rahi ho, achanak pahiya slip kare, 5 baar starter band ho, tab kya car rukegi?
+Kya tumne hazaron ajeeb-o-gareeb random situations me test karke dekha hai?"
+
+
+
+Real database me 30 second ki lease aur 10 second ka heartbeat hota hai. Agar hum random testing real DB par time sleep ke sath karenge, to 100 tests chalane me ghanto lag jayenge! Isliye hum pehle ek In-Memory State Machine (Model) banate hain jo Relay ke lifecycle (claim, effect_write, crash, reclaim, retry, mark) ko microseconds me run karti hai.
+
+
+Aaj hum 4 aasan kaam kar rahe hain:
+
+1. Computer se hazaron random situations banwana (Step 2 & 3)
+Hum khud hath se test nahi likhenge. Hum Hypothesis naam ke ek tool ko bolte hain:
+
+"Tu ek pagal monkey ki tarah behave kar. Kabhi job claim kar, achanak process crash kar de, kabhi 3 baar retry kar, kabhi 4 baar reclaim kar — jo marzi aaye ajeeb sequence bana kar test kar."
+
+Aur hum check karte hain: Chahe events ka order kitna bhi ajeeb ho, kya side-effect hamesha ≤1 rehta hai?
+
+TEST AND OBSERVATIONS :
+
+Humne kya kiya: 
+
+Humne Python ke andar Relay ka ek chhota fast model (Simulation) banaya, bina database aur bina 30-second ke sleep ke (microseconds me chalne wala).
+Kya test kiya (4 Scenarios):
+
+Write se pehle crash → Effect = 0.
+
+Normal ek worker chala → Effect = 1.
+
+Worker A chala → Crash hua → Reclaim hua → Worker B chala → Dispatches = 2, Effect = 1.
+
+Extra retries hue (P-27 Overdraft) → Dispatches = 4, Effect = 1.
+
+
+Terminal Observation: 4 passed in 0.05s.
+
+Conclusion: In-memory simulation prove karta hai ki hamari state-machine transitions bilkul sahi hain.
+
+
+
+2. Jaan-boojh kar Brake tod kar dekhna (Step 4 - Mutation)
+Hum yeh check karte hain: "Kahin hamara test jhootha to nahi hai jo har baar pass ho jata hai?"
+
+Hum code me se dedup logic ko thodi der ke liye band (tod) kar dete hain.
+Aur test ko dobara chalate hain.
+Test turant RED (FAIL) ho jata hai!
+Isse prove hota hai ki hamara test sach me kaam kar raha hai, koi dikhava nahi hai.
+
+TESTS AND OBSERVATION :
+
+Humne kya kiya: 
+
+Humne Hypothesis library ko bola ki wo ek pagal monkey ki tarah behaves kare aur Relay ke actions (claim, write, crash, reclaim, retry, mark) ko random order me ghuma-phirakar 300 alag-alag ajeeb scenarios generate kare.
+
+- 200 random legal sequences.
+
+- 100 forced-redispatch sequences (jisme kam se kam 2 workers ka chalna 100% guaranteed tha).
+
+
+Terminal Observation: 300 passed, 0 safety failures.
+
+Conclusion: Chahe events ka order kitna bhi ulta-pulta, chaotic ya ajeeb ho jaye, side effect count kisi bhi scenario me 1 se upar nahi gaya!
+
+
+
+3. Asli Database me do-do workers daudana (Step 5, 6, 7)
+Hypothesis to computer ki memory me chala. Par kya asli PostgreSQL database me bhi yeh sach hai?
+
+Hum ek alag khali ground (disposable DB) banate hain.
+Usme do real worker processes ko ek sath daudate hain.
+Ek worker ko beech me goli maar kar (crash) dekhte hain.
+Aur dekhte hain ki real Postgres bhi duplicate email ko rok deta hai.
+
+TESTS AND OBSERVATION :
+
+Humne kya kiya: 
+
+Humne socha: "Kahin hamara Hypothesis test bekar to nahi hai jo har baar pass ho jata hai?" Isliye humne model ke andar se dedup ko band kar diya (DIN5_MUTANT=no_dedup) — matlab ab har insert duplicate row banayega.
+
+Terminal Observation (FAIL HUA!): Test turant RED ho gaya! Hypothesis ne 30 steps ke complex sequence ko shrink (chhota) karke seedha 2 step ka minimal case dikha diya:
+
+```
+Falsifying example: [claim -> write -> reclaim -> claim -> write]
+AssertionError: effect_count = 2 (Expected <= 1)
+```
+
+Conclusion (Mutation Killed): Isse saabit hua ki hamara test koi "dummy" test nahi hai. Jab dedup tootega, to yeh test 100% use pakad lega! Aur jab humne mutant hataya, to test wapas GREEN ho gaya.
+
+
+4. Humne kya kiya: 
+
+Ab hum memory se nikal kar asli PostgreSQL me gaye (ek naye temporary database relay_din5_... me). 
+
+Humne 2 real worker processes ko ek hi millisecond me ek hi job ke side-effect par attack karwaya.
+
+
+Terminal Observation (JSON output):
+
+dispatches: 2
+
+distinct_workers: 2
+
+effect_rowcounts: [1, 0] (Ek worker ko insert mila, doosre ko DB constraint ne skip kar diya).
+
+final_effects_in_db: 1!
+
+
+Conclusion: Real multi-process concurrency me PostgreSQL ka Unique Index ek atomic referee ki tarah kaam karta hai aur duplicate insert nahi hone deta.
+
+
+5. Humne kya kiya: 
+
+Real PostgreSQL me Worker A ne side-effect likha, aur theek agle pal humne Worker A ko OS-kill (goli maar di) status update hone se pehle (Durable Orphan state). 
+
+Phir Reaper ne job reclaim ki aur Worker B ne kaam shuru kiya.
+
+
+Terminal Observation:
+
+Worker A ke marne ke baad DB state:
+
+running | attempts=1 | effects=1.
+
+
+Reaper ne reclaim kiya:
+
+pending | 1 | true.
+
+
+Worker B ne dobara email insert karni chahi → Database ne use rowcount = 0 diya!
+
+
+
+Final DB state: succeeded | attempts=2 | executions=2 | effects=1.
+
+Conclusion: Hard process crashes ke baad bhi jab doosra worker recovery karta hai, to system safe rehta hai aur duplicate side effect create nahi hota.
+
+
+
+6. Hamare system ki aakhri kamzori dhoondna (Step 8 - Fencing)
+Hum yeh dekhte hain ki hamara UNIQUE constraint kya NAHI rok sakta?
+
+UNIQUE constraint email ko duplicate hone se to bacha leta hai.
+Lekin agar koi purana mara hua worker neend se jaag kar job ka Status badalne chala aaye, to constraint use nahi rok pati!
+Isse hume pata chalta hai ki agle hafte (Week 4) hume Fencing Token banana padega.
+
+
+Terminal Observation:
+
+effect_count = 1 (Email to 1 hi rahi, Dedup ne bacha liya!)
+
+LEKIN: stale_mark_rowcount = 1 aur current_owner_mark_rowcount = 0!
+
+
+
+Universal claim "har job ka side effect = 1" galat hai kyunki boom/crash/dead_letter jobs bina effect write ke terminate ho sakti hain. Safety invariant strictly effects <= 1 hai, aur conditional exactness effects = 1 sirf un jobs par laagu hota hai jinka handler legal effect-write transaction complete kare.
+
+
+
+----
+
+WEEK4 - DAY 1 
+
+
+Week 3 ki Jeet: Humne UNIQUE(effect_key) constraint lagakar yeh guarantee kar di thi ki chahe 10 workers retry karein, asli duniya ka side-effect (email/payment) sirf 1 hi baar commit hoga.
+
+
+Week 3 ki Haar (The Stale-Writer Vulnerability):
+
+- Worker A ne job uthayi aur email bhej di.
+- Worker A ka event loop freeze/block ho gaya (jaise heavy CPU task ya garbage collection pause).
+- 30s ki lease expire hui → Reaper ne job reclaim karke Worker B ko de di.
+- Worker B ne job execute karna shuru kiya (Job ka status abhi running hai).
+
+-> THE DISASTER: Worker A achanak neend se jaag gaya! Usne query chalayi:
+
+```
+UPDATE jobs SET status = 'succeeded' WHERE id = :id AND status = 'running';
+```
+
+Kyunki Worker B ki wajah se status running tha, Worker A ka UPDATE pass ho gaya (rowcount = 1)!
+
+Jab Worker B ne apna kaam khatam karke status mark karna chaha, to wo fail ho gaya (rowcount = 0)!
+
+
+
+FENCING TOKEN / CLAIM GENERATION :
+
+- put a Monotonic Epoch counter claim_generator in DB.
+
+- each worker has its own generator count
+
+- Agar koi purana worker (Generation 1) neend se jaag kar status ya heartbeat likhne aayega, to database use bolega:
+
+"Tu purana hai! Abhi generation 2 chal rahi hai!" aur uska write rowcount = 0 dekar fence (block) kar dega!
+
+
+
+Compare-And-Set (CAS):
+
+SQL me atomic update: UPDATE jobs SET status='running' WHERE id=:id AND status='pending'.
+
+Agar rowcount = 1 aaya to main jeeta. Agar 0 aaya to kisi aur ne mujhse pehle le liya.
+
+
+Blocking Handler : 
+
+asyncio.sleep() = heartbeat stays active in background and lease dont expire.
+
+time.sleep() = poor python thread and event loop blocks. lease expires.
+
+
+STALE WORKER : worker who's lease is expired while its code is still active in background.
+
+
+CLAIM GENERATION BLINDNESS :
+
+to mark a job status from running to succeeded, WHERE status = 'running'.
+
+- this check can lead to make WORKER A with expired lease still make status = succeeded as it had status = 'running' that was updated by WORKER B.
+
+
+TESTS AND OBSERVATIONS :
+
+TEST1 :
+
+SEE THE HARM FIRST :
+
+T=0s: Worker A ne job claim ki (attempts = 1, status = running). Email likhi (rowcount = 1). 45s sleep me gaya.
+
+T=30s: Worker A ka event loop freeze tha, heartbeat nahi gayi. Reaper ne lease expire dekhi aur job ko wapas pending kar diya.
+
+T=31s: Worker B ne wahi job claim kar li (attempts = 2, status = running). Worker B ne email likhni chahi, par UNIQUE constraint ne skip kar di (rowcount = 0). Worker B ab apna kaam kar raha hai.
+
+T=45s (THE CORRUPTION):
+Worker A ki 45s ki neend poori hui!
+
+Worker A ne query chalayi: UPDATE jobs SET status='succeeded' WHERE id=$step1Job AND status='running'.
+
+Kyunki Worker B ne status running kar rakha tha, Worker A ka update pass ho gaya (rowcount = 1)!
+
+T=76s: Worker B ka kaam poora hua. Usne status succeeded mark karna chaha, par dekha status to pehle hi succeeded hai → Worker B ka mark fail ho gaya (rowcount = 0)!
+
+
+TEST2 AFTER FENCING TOKEN :
+
+TERMINAL :
+
+[Worker A] Claimed job 60 (generation=1, attempt=1, rowcount=1). Status is now 'running'.
+[Worker A] Executing job 60 (type=effect, generation=1, attempt=1/3)...
+[Worker A] [SIDE EFFECT] Committed 'email' for job 60 (key='job:60:email', rowcount=1).
+[Worker A] [email HANDLER] Blocking event loop (15s)...
+
+
+REAPER TOOK THE JOB
+
+
+[Worker B] Claimed job 60 (generation=2, attempt=2, rowcount=1). Status is now 'running'.
+[Worker B] Executing job 60 (type=effect, generation=2, attempt=2/3)...
+[Worker B] [SIDE EFFECT] Duplicate 'email' skipped for job 60 (key='job:60:email', rowcount=0).
+[Worker B] [email HANDLER] Blocking event loop (15s)...
+
+
+
+[Worker A] [email HANDLER] Work completed.
+[Worker A] Finished execution for job 60.
+[Worker A] Mark fenced: job_id=60 held_generation=1 rowcount=0
+
+// held_generation 1 < current_generation 2 => purana worker
+// worker A's rowcount = 0, rejected, no status updated.
+
+
+[Worker B] [email HANDLER] Work completed.
+[Worker B] Finished execution for job 60.
+[Worker B] Marked job 60 as 'succeeded' (generation=2, rowcount=1).
+
+
+
+har ek job keliye generation count 0 se start hoga, or monotonically agge hi badhega.
+
+---
+
+WEEK 4 - DAY 2
+
+
+
+lets say we have 5000 job rows in job table, postgres doesn't store row1, row2... row 5000 linear file.
+
+postgres stores and organizes data in pages :
+
+HEAP PAGE :
+
+HEAP
+
+┌───────────────┐
+│ Page 0        │ 8192 bytes
+├───────────────┤
+│ Page 1        │ 8192 bytes
+├───────────────┤
+│ Page 2        │ 8192 bytes
+├───────────────┤
+│ Page 3        │ 8192 bytes
+├───────────────┤
+│ ...           │
+└───────────────┘
+
+
+- each page has 8192 bytes ~ 8KB
+- lets say we ave a row = 100 bytes, one 8KB page can fit roughly 8192 / 100 = 81 rows.
+
+- usually successful/new jobs has NULL so its row is small.
+
+- now worker polls every 2 seconds(search pending jobs in DB(postgres)), if postgres uses a sequential scan in a query, so worker needs to examine heap pages of table.
+
+jobs table
+
+Page 0
+Page 1
+Page 2
+Page 3
+...
+Page 111
+
+lets say table is 112 pages, so scan need to touch around 112 pages.
+
+so 5000 job rows ab 112 heap pages me he
+
+toh database ab har ek page inspect krega.
+
+LETS say last_error aya and wo kuch zyada bada he ~400 bytes, toh ab ek job ki row moti hui.
+
+- pehle 8KB ke page me bhot jobs fit thi, ab har job moti ho gyi bcz uska last_error aane laga.
+
+- same 8KB page me kam jobs fit hongi, same 5000 job, now 250 pages.
+
+
+- now agar worker 250 seuential scan krega to scan ka physical page workload substantially badh gaya.
+
+TOAST : 
+
+Agar row ke andar koi value bahut badi ho rahi hai, PostgreSQL usko handle karne ki koshish karta hai. compress krke
+
+row ~10 KB -> compression -> 298 bytes(this change is done in main heap row, not in separate table)
+
+NOW lets say we have 100 KB, and its not getting compressed sufficiently, so postgres has option :
+
+
+Main jobs table
+┌─────────────────────┐
+│ id = 42             │
+│ status = failed     │
+│ last_error → pointer│
+└─────────────────────┘
+          │
+          ▼
+     TOAST table
+┌─────────────────────┐
+│ actual large value  │
+└─────────────────────┘
+store separately
+
+
+100 KB
+  ↓
+compress
+  ↓
+still huge?
+  ↓
+TOAST storage
+
+
+wrong thinking :
+
+"Arey! last_error me agar Python ka 30-40 line ka lamba traceback daal diya, to row 2032 bytes cross kar jayegi aur TOAST table me chali jayegi. Jab worker poll karega to use TOAST table se data uthana padega aur system slow ho jayega!"
+
+Facts :
+
+Python traceback me repeated file paths (jaise C:\Users\Admin\..., line numbers, repeated words) hote hain.
+PostgreSQL ka compression algorithm traceback ko 10:1 ratio me compress kar deta hai!
+Yani 10 KB ka lamba traceback compress hokar sirf 298 bytes ka reh jata hai!
+298 bytes threshold (2032 bytes) se bohot chhota hai, isliye wo hamesha main table ke andar hi rehta hai, kabhi TOAST table me nahi jata!
+
+Asli Khatra TOAST nahi, HEAP PAGES hain!
+
+Worker har 2 second me jobs dhundhne ke liye Sequential Scan chalata hai (poori table shuru se aakhri tak padhta hai).
+Jab last_error = NULL tha, to 5,000 rows sirf 112 heap pages me fit aa jati thi.
+Lekin jab har row me 200-300 bytes ka inline error jud gaya, to wahi 5,000 rows 250 heap pages me phail gayi!
+Iska matlab: Worker ko har poll par 2.2 guna zyada disk I/O padhna padega!
+
+
+Hum last_error ke size ko isliye bound (chhota) rakhte hain taaki main table ke heap pages kam rahein aur worker ka poll fast chale, TOAST table se bachne ke liye nahi!
+
+
+Graceful Shutdown ka wada: Worker ko jab band karne ka signal (SIGBREAK / Ctrl+C) milta hai, to wo bolta hai: "Main chalu job ko adhoora nahi chhodunga, poora karke hi exit karunga."
+Lease ka niyam: Reaper har job ko sirf 30 second ki lease deta hai.
+Ab sochiye: Agar job 45 second lambi ho, aur T=3s par shutdown signal aa jaye:
+Shutdown pehle poora hoga ya lease pehle expire hogi? Aur jab Reaper beech me job chheen lega, to 45s baad worker jab status likhne aayega to kya hoga?
+
+
+time.sleep ne event loop freeze kar diya, heartbeat band ho gayi!
+Timeline:
+T=3s par signal aaya, worker shutdown mode me gaya. T=30s par Reaper ne dekha heartbeat nahi aayi, usne job ko reclaim karke pending kar diya! T=45s par Worker A ki neend khuli aur usne status succeeded likhna chaha.
+THE DISCOVERY: Kyunki kal humne claim_generation fencing gate lagaya tha, isliye Database ne Worker A ka update reject kar diya!
+Worker A ne log kiya: Mark fenced ... rowcount=0.
+
+
+Worker A freeze hua → Reaper ne reclaim kiya → Worker B ne Generation 2 ke sath job utha li!
+Worker A jaaga aur status likhna chaha with Generation 1 → FENCE FIRED!
+Worker B ne Generation 2 ke sath kaam khatam karke status succeeded mark kiya.
+Database me side-effects sirf 1 raha, status sahi worker se mark hua, aur Worker A chup-chaap exit ho gaya!
+
+
+FULL DAY :
+
+Dono columns (completed_at, last_error) sirf jobs table me add hote hain.
+worker.py me status marks ke sath completion timestamp aur error clearing lag chuka hai.
+TOAST se zyada main table ke Heap Pages matter karte hain sequential scan ke liye.
+boom job retry aur lifecycle log ko prove karti hai, aur SQL se pehla latency number nikalta hai.
+SIGBREAK run prove karta hai ki chahe worker graceful shutdown me ho, agar lease expire ho gayi to Fencing Token use database corrupt nahi karne dega! 🚀
+
+
+ id | type |   status    | attempts | claim_generation |         completed_at          |            last_error            |    duration     
+----+------+-------------+----------+------------------+-------------------------------+----------------------------------+-----------------
+ 62 | boom | dead_letter |        3 |                3 | 2026-09-08 19:13:29.708878+00 | Simulated handler failure: BOOM! | 00:00:46.819622
+
+
+
+ n |       p50       |       p99       |  min_duration   |  max_duration   
+---+-----------------+-----------------+-----------------+-----------------
+ 2 | 00:00:44.421245 | 00:00:46.771654 | 00:00:42.022867 | 00:00:46.819622
+(1 row)
+
+   status    | count |       p50       
+-------------+-------+-----------------
+ dead_letter |     2 | 00:00:44.421245
+
+
+n = db me two terminal jobs jiska completed_at record hua
+p50 = 44.4s: Aadhi jobs lagbhag 44 seconds me finish hui.
+p99 = 46.7s: 99% jobs 46.7 seconds ke andar khatam ho gayi!
+
+---
+
+week 4 - day 3 :
+
+
+Maan lijiye aapke system ko do kaam karne hain:
+
+Database me likhna ki order complete ho gaya (side_effects table).
+
+Customer ko email ya Stripe payment API call karni hai (POST /charge).
+
+
+Agar pehle Database me commit kiya, aur uske baad API call fail ho gayi (network cut gaya), to database bolega kaam ho gaya, par email/paisa kabhi gaya hi nahi!
+
+Agar pehle API call ki aur wo chali gayi, par uske baad Database commit fail ho gaya (power cut), to customer ke paise cut gaye par database me koi record hi nahi hai!
+
+
+PostgreSQL ka COMMIT sirf database ke andar atomic hota hai, wo bahar ke internet/API call ko rollback nahi kar sakta! Is problem ko bolte hain "Dual Write Problem".
+
+
+Solution: "Transactional Outbox Pattern"
+Hum API call seedha worker se nahi karenge!
+
+Worker ek hi transaction ke andar do cheezein likhega:
+
+- Asli side-effect (side_effects table).
+- Bhejne ka irada (outbox table me ek row: "Yeh email bhejna baki hai").
+
+Ek COMMIT: Ya to dono tables me row likhi jayegi, ya kisi me nahi!
+
+Phir ek alag process (src/dispatcher.py) aayega, wo outbox table se pending rows padhega aur bahar ke receiver (src/sink.py) ko HTTP request bhejega.
+
+
+```
+lets say we have two work to do in a transaction, and one work has background work, so we put that into queue :
+
+BEGIN
+  ↓
+db_op1()
+  ↓
+queue_job()
+  ↓
+db_op2()
+  ↓
+COMMIT
+
+now, if db_op1() data got inserted into db and job is queued, so when worker executes this job, data will be in database?
+
+- no, data is in transaction, transaction is not yet committed.
+
+RACE CONDITION :
+
+now db_op1() does insert user id and email
+- but transaction is not yet committed, then queue_job() will send this job into queue.
+- lets say queue is extremely fast so it picks this immediately, not it does select user, but its not found as data is not yet committed, while user is inserted into uncommitted transaction, yet user is not visible to another transaction(get user).
+- worker ran before commit.
+```
+
+ imagine db_op1() inserts a user record. queue_job() puts a job in the queue to retrieve that record, and add that user’s email address (along with a unique internal ID) to an email whitelist managed by another service. A background worker dequeues the job, but finds that the user record it’s looking for is nowhere to be found in the database.
+
+- User DOES exist conceptually,
+but the transaction that inserted it hasn't committed yet.
+
+- if transaction gets rollback :
+
+insert user 43, Queue job 20, db_op2() fails, rollback.
+
+- if this happens again and again, worker will try 100 attempts and user 43 still doesn't exist.
+
+- SO, retry is not a solution to every failure.
+
+
+so why dont we do :
+- begin transaction -> create user -> commit, then Queue job ?
+
+this solves one problem only to introduce another:
+
+API PROCESS
+
+BEGIN
+  ↓
+INSERT user
+  ↓
+COMMIT ✅
+  ↓
+💥 CRASH
+  ↓
+queue_job() never runs
+
+
+just after commit and before Queue job, application crashed, now user exist in db, but job doesn't exist in queue(email never sent).
+
+- this problem doesn't even give any error, no log, no retry.
+
+- can we just add retry ?
+worker starts at 10 ms -> attempt 1 -> fail -> retry after 1 sec -> 1010ms -> so attempt 2 success.
+
+Attempt 1 → expected failure
+Attempt 2 → maybe expected failure
+Attempt 3 → maybe succeeds
+
+this is a timing assumption, also in high traffic, repeated retry and failed attempts would make a LOT executions(lot of wasted work is done), worker unnecessarily consumes cpu, db conn, db queries, network calls, logs, retry storage, lot of errors etc.
+
+
+SO WHAT CAN WE DO FOR THIS PROBLEM ?
+
+Problem: DB transaction aur external queue ko directly coordinate karoge toh ya toh job too early run ho sakti hai, ya lost ho sakti hai.
+
+solution : Queue ko transaction ke andar directly touch hi mat karo. Pehle job ko same DB transaction mein ek staging table mein save karo. Commit ke baad ek separate process us staged job ko actual queue mein bheje.
+
+
+so after commit :
+COMMIT ✅
+        ↓
+job visible
+        ↓
+enqueuer can take it
+
+
+so now architecture : 
+
+Application
+    ↓
+DB transaction
+    ↓
+staged_jobs table
+    ↓
+does other execution
+    ↓
+COMMIT
+
+then AFTER commit, separately :
+
+Enqueuer
+    ↓
+staged_jobs
+    ↓
+actual queue(when job is safely committed)
+    ↓
+Worker
+
+-jobs are not immediately sent to job queue, it first sets in staged_jobs(waiting area), we dont touch queuing in transaction.
+
+Transaction A
+     ↓
+INSERT staged job
+     ↓
+uncommitted
+     ↓
+❌ Enqueuer cannot see it
+DUE to the ACID properties of the running transaction keep them invisible until they’re ready to be worked.
+
+1. Application
+
+Creates DB data + staged job.
+
+2. Enqueuer
+
+Moves staged job → actual queue. delete staged job row.
+
+3. Worker
+
+Actually performs the job.
+
+
+- if enqueuer crashes, still at least once delivery are guaranteed, but duplication can happen :
+
+eg : staged_jobs :
+1,2,3,4
+
+enueued : 1,2,3 CRASH
+NOW when enueuer restarts :
+job 1 → enqueue again
+job 2 → enqueue again
+job 3 → enqueue again
+job 4 → enqueue
+
+so this can make duplicates, but permanent loss is avoided with atleast once delivery. 0 execution is avoided but 2 executions can happen.
+
+IN ROLLBACK, THIS stays safe :
+
+BEGIN
+ ↓
+INSERT user
+ ↓
+INSERT staged_job
+ ↓
+ERROR
+ ↓
+ROLLBACK
+
+so user and staged_job both doesn't have this job data.
+
+TESTS AND OBSERVATIONS :
+
+TEST 1 :
+
+relay/sink.py
+ banaya (FastAPI receiver on port 8001) with endpoint POST /deliver.
+Isme receiver-side idempotency (ON CONFLICT DO NOTHING on idempotency_key) aur ek DEDUP_OFF switch diya.
+Dedup ON (DEDUP_OFF=0): Same idempotency key se 2 baar POST kiya.
+Dedup OFF (DEDUP_OFF=1): Nayi idempotency key se 2 baar POST kiya.
+
+Network par at-least-once delivery me duplicate calls aana natural hai. Receiver ko pata hona chahiye ki kya request nayi hai (applied) ya duplicate hai (duplicate).
+
+
+OBSERVATIONS :
+
+DEDUP ON :
+
+Request 1 -> [deliver] idempotency_key=w4d3-manual-... result=applied (HTTP 200)
+Request 2 -> [deliver] idempotency_key=w4d3-manual-... result=duplicate (HTTP 200)
+sink_deliveries rows: 1
+
+
+DEDUP OFF :
+
+Request 1 -> [deliver] idempotency_key=w4d3-manual-off-... result=applied (HTTP 200)
+Request 2 -> [deliver] idempotency_key=w4d3-manual-off-... result=applied (HTTP 200)
+sink_deliveries rows: 2
+
+
+Receiver ka dedup switch positively prove ho gaya: Dedup ON hone par duplicate reject hota hai aur table me sirf 1 row aati hai; Dedup OFF hone par wahi same request 2 rows bana deti hai.
+
+
+TEST 2 :
+
+dispatched_at : Outbox mein jo event/job abhi dispatch nahi hua (dispatched_at IS NULL), usko uthao → sink ko bhejo → successfully bhejne ke baad dispatched_at bhar do.
+(ye outbox table me job save kiya hue ko actual queue/sink tk bhejta he)
+
+flow :
+BEGIN
+ ↓
+row lock
+ ↓
+HTTP call
+ ↓
+dispatched_at update
+ ↓
+COMMIT
+
+if dispatcher crashes, db rollbacks, and dispatched_at is not updated(so it says this job is not yet dispatched)
+
+
+TEST 3(THE CORE) :
+
+Outbox pattern at-least-once delivery deta hai, exactly-once nahi.
+Jab dispatcher HTTP 200 lene ke baad aur DB mark karne se pehle mar jata hai, to recovery ke waqt wahi delivery dobara network pe jayegi (2 requests).
+
+Agar receiver ke paas dedup ON hai (Run A) to application safe hai. Agar receiver ke paas dedup OFF hai (Run B) to double execution / duplicate records create ho jate hain.
+
+
+Run A (Dedup ON + Crash After HTTP):
+
+Job 65 enqueue ki (crash_at: 'after_http'). Worker ne 1 side_effect + 1 outbox row banayi.
+
+Dispatcher Attempt 1: Sink ko POST bheja (result: applied). Lekin mark karne se pehle crash ho gaya (os._exit(1)). Transaction rollback ho gayi, row unlock ho gayi, dispatched_at NULL raha.
+
+Dispatcher Attempt 2 (Recovery): Dispatcher ne row dobara pick ki, sink ko dobara POST bheja (result: duplicate). Dispatcher ne safely mark karke commit kiya. NO EXTERNAL REAPER NEEDED IF DISPATCHER CRASHES AND TO BRING IT BACK/RETRY, ROLLBACK DOES THE WORK.
+
+
+Run B (Dedup OFF + Crash After HTTP):
+
+Job 66 enqueue ki (crash_at: 'after_http'). Worker ne 1 side_effect + 1 outbox row banayi.
+
+Dispatcher Attempt 1: Sink (dedup off) ko POST bheja (result: applied). 
+
+Dispatcher crash hua (os._exit(1)).
+
+Dispatcher Attempt 2 (Recovery): Sink ko dobara POST bheja (result: applied). Dispatcher commit hua.
+
+
+run A : SINK HTTP Requests: 2(applied, duplicate).
+       SIDE EFFECTS row = 1
+      SINK_DELIVERIES row = 1(deduplication protected)
+
+run B : SINK HTTP Requests: 2(applied, APPLIED).
+       SIDE EFFECTS row = 1
+      SINK_DELIVERIES row = 2(deduplication inserted).
+
+
+Outbox dual-write ko khatam karta hai, duplicate delivery ko nahi: Worker aur Outbox ek atomic boundary me hain, par dispatcher crash hone par network pe 2 deliveries jati hain.
+Exactly-Once is an end-to-end property: Outbox at-least-once delivery ensure karta hai; receiver-side deduplication uske upar milkar system ko effectively "exactly-once" banata hai. Run B ne prove kiya ki bina receiver dedup ke outbox duplicate effects ko rok nahi sakta.
+
+---
+
+WEEK 4 - DAY 4
+
+
+Iss project me jo bhi safety claim likha hai (jaise "fencing stale writes ko rokti hai", ya "dedup duplicate side effects ko rokti hai"), wo usi code path ke against measure hona chahiye jo production me chalta hai — kisi mathematical model ya test mock ke against nahi. Aur ye measurement evidence database (relay) ko bina chhue witness DB par repeat kiya ja sake.
+
+ye saare test WITNESS DB pr chale jo temporary database create kiya :
+
+alembic.ini me database URL hardcoded thi. Agar hum bina guard ke migration chalate to wo temporary DB ke bajaye permanent DB ko alter kar deta.
+Isko rokne ke liye Pre-flight Check lagaya gaya: Har process (API, Worker A, Worker B, Reaper, Dispatcher) startup par print karta hai [db] resolved_db=relay_w4_witness. Agar koi ek bhi relay bolta, to run abort ho jata.
+Day 4 ka sabse aakhri check ye tha ki evidence DB me 53 jobs the aur aakhri me bhi exact 53 hi bache!
+
+
+TEST 1 : mark fenced
+
+Jab ek worker kisi slow ya blocking task me phans jata hai aur uska heartbeat band ho jata hai:
+
+Worker A job claim karta hai (claim_generation = 1).
+Worker A 15 second ke liye block hota hai (time.sleep(15)).
+5 second baad lease expire hoti hai. Reaper job ko reclaim karta hai (status = 'pending').
+Worker B job ko claim karta hai (claim_generation = 2).
+Worker B execution khatam karke job ko succeeded mark kar deta hai (claim_generation = 2).
+Worker A 15 second baad neend se jaagta hai! Wo sochta hai "mera kaam ho gaya, ab main success mark karta hoon".
+Worker A mark query chalata hai:
+
+UPDATE jobs SET status='succeeded', completed_at=clock_timestamp()
+WHERE id = 2 AND status = 'running' AND claim_generation = 1;
+
+CAS Fencing Action: Rowcount milta hai 0!
+Worker A turant DB me dekhta hai ki actual_generation = 2 hai jabki uske paas held_generation = 1 tha.
+Worker A log karta hai: [worker-8820] Mark fenced: job_id=2 worker_id=worker-8820 held_generation=1 actual_generation=2 rowcount=0 event=fenced
+
+
+Snapshot 1 (Pre-Reaper): Job ID 2, status='running', claim_generation=1, attempts=1.
+Snapshot 2 (Post-Reaper): Job ID 2, status='pending', claim_generation=1, attempts=1.
+Snapshot 3 (Terminal): Job ID 2, status='succeeded', claim_generation=2, attempts=2.
+Job Executions Table: 2 distinct worker executions: (worker-8820, gen=1) aur (worker-15252, gen=2).
+Side Effects Table: Exactly 1 row (job:2:email).
+
+
+NOTE : WORKER A KI LEASE KESE RUKI :
+- Agar payload me asyncio.sleep(15) hota, to Python ka event loop chalta rehta aur background me send_heartbeat coroutine har 10s me claimed_at = now() update karti rehti! Lease kabhi expire hi nahi hoti!
+Humne block: true karke time.sleep(15) chalaya, jisne Python OS thread aur event loop dono ko freeze (block) kar diya.
+Is wajah se heartbeat ruk gayi aur Reaper ko lease expire mili
+
+
+TEST 2 : side effect dedup
+
+Worker ne external effect commit kiya, lekin network/system uske baad crash ho gaya:
+
+Worker A job claim karta hai (claim_generation=1).
+Worker A record_side_effect chalata hai -> side_effects table me row insert hoti hai aur commit ho jati hai.
+Commit ke turant baad Worker A crash ho jata hai (payload: {crash_at: 'after_effect'} -> os._exit(1)).
+Job DB me status='running' reh jati hai.
+Lease expire hone par Reaper isko reclaim karta hai (status='pending').
+Worker B job ko claim karta hai (claim_generation=2) aur dobara wahi handler execute karta hai.
+Worker B jab record_side_effect chalata hai, to uq_side_effects_effect_key par conflict hota hai.
+on_conflict_do_nothing() trigger hota hai aur rowcount = 0 milta hai.
+Worker B log karta hai: [SIDE EFFECT] Duplicate 'email' skipped for job 3 (key='job:3:email', rowcount=0).
+Worker B job ko succeeded mark karta hai.
+
+
+Total Worker Executions: 2 (worker-17952 aur worker-14252).
+Total side_effects Rows: Exactly 1 row!
+Conclusion: D-25 design rule production path par successfully verify hua: handler ke multiple executions ke bawajood business side-effect duplicate nahi hua.
+
+
+
+TEST 3 : Poison Pill Loop
+
+
+Job ka payload har attempt par before_commit crash trigger karta hai:
+
+Worker job claim karta hai -> handler dono rows insert karne ki koshish karta hai -> os._exit(1).
+PostgreSQL transaction abort ho jati hai. DB me 0 rows likhi jati hain.
+Lekin PostgreSQL sequences (id_seq) transaction rollback ke bawajood wapas peeche nahi aate (sequences monotonic hote hain).
+Worker mar chuka hai, to except Exception wala MAX_ATTEMPTS dead-letter branch kabhi nahi chalta.
+Reaper job ko wapas reclaim karta hai, aur loop chalta rehta hai.
+
+
+Measured Observations (3 Iterations Run):
+
+Initial Sequences: side_effects_id_seq = 7, outbox_id_seq = 7.
+Iteration 1: Worker crashed via os._exit(1). Job state: running -> pending.
+Iteration 2: Worker crashed via os._exit(1). Job state: running -> pending.
+Iteration 3: Worker crashed via os._exit(1).
+Committed DB Rows: side_effects = 0, outbox = 0.
+Final Sequences: side_effects_id_seq = 10, outbox_id_seq = 10.
+Sequence Delta: +3 in side_effects, +3 in outbox.
+
+Conclusion & Proof of P-36: Har crash iteration par database me 0 rows commit hoti hain, par har iteration 1 sequence number permanently burn kar deti hai. Aur iteration ka cycle period application backoff se nahi, balki reaper ke lease timeout (~5s) se drive hota hai!
+
+
+TEST 4 :
+
+Outbox table se HTTP dispatch karte waqt agar dispatcher crash ho ya do dispatchers ek saath deliver karein:
+
+Outbox me row create hoti hai with payload: {crash_at: "after_http"}.
+Dispatcher 1 HTTP POST bhejta hai sink ko (http://127.0.0.1:8011/deliver).
+Sink delivery save kar leta hai (result = applied).
+Dispatcher 1 mark karne se pehle crash ho jata hai (os._exit(1)).
+Do dispatchers concurrently recovery attempt karte hain.
+Sink receiver ke paas uq_sink_deliveries_idempotency_key constraint laga hua hai.
+Ek request applied hoti hai aur baaki saari requests duplicate return hoti hain.
+Sink deliveries table me exactly 1 row save hoti hai.
+
+
+Serial Delivery: first=applied, second=duplicate -> 1 row in DB.
+Concurrent 
+N
+=
+2
+N=2: ['duplicate', 'applied'] -> 1 row in DB.
+Concurrent 
+N
+=
+5
+N=5: ['applied', 'duplicate', 'duplicate', 'duplicate', 'duplicate'] -> 1 row in DB.
+
+Conclusion: Receiver-side idempotency constraint race conditions ko 100% defeat karta hai.
+
+
+
+TEST 5 : concurrent claim with for update skip locked
+
+Jab 1 pending job ho aur do workers exact same millisecond par use claim karne aate hain:
+
+Worker A aur Worker B dono SELECT ... FOR UPDATE SKIP LOCKED execute karte hain.
+PostgreSQL row-level lock Worker A ko milta hai.
+Worker B block nahi hota (zero delay), balki wo us row ko skip karke khaali haath laut jata hai (rowcount = 0).
+
+
+Measured Output:
+
+Worker A Result: ('Worker_A', 'CLAIMED', job_id=7).
+Worker B Result: ('Worker_B', 'EMPTY_SKIPPED', None).
+Conclusion: Exactly 1 worker ne claim kiya, rival process block nahi hua aur conflict error ke bina clean empty skip mila.
+
+
+Conclusion: Zero lock contention: Exactly 1 worker ne claim kiya, rival process bina kisi delay ke clean empty skip ke saath laut gaya.
+
+---
+
+WEEK 4 - DAY 5
+
+"Relay Ko Todo, Aur Naam Se Todo: Pool Exhaustion, Sustained Load, Postgres-Down, Aur /healthz Ka Sach"
+
+- Pehle ke dino me humne Relay ke safety features (fencing, outbox, dedup) ko ek-ek karke verify kiya. Din 5 ka maksad Relay ko todna (break karna) hai — par bina samjhe nahi, balki "naam se todna". Hume ye prove karna hai ki jab system bohot heavy load me aata hai ya database crash hoti hai, to system kis tarike se degrade hota hai, uska pehla bottleneck (binding constraint) kaunsa banta hai, aur wo exact kaunsa error deta hai.
+
+- Aaj ka saara heavy load testing, pool exhaustion, aur database band karne ka dangerous kaam sirf aur sirf Disposable Witness DB par chalega.
+- Permanent Evidence DB (relay) ka delta strictly 0 hona chahiye (ek bhi nayi row nahi jaani chahiye).
+- Ek aur zaroori rule: Aaj ke din ke baad Evidence DB (relay) Alembic ke HEAD revision par upgraded honi chahiye.
+
+
+pool_size: Engine kitne active database connections ko future queries ke reuse ke liye hamesha zinda rakhta hai.
+
+max_overflow: Jab load peak par ho aur pool_size ke saare connections busy hon, to engine temporary taur par kitne extra connections khol sakta hai. (Kaam khatam hote hi overflow connections band ho jaate hain).
+
+pool_timeout: Agar pool_size + max_overflow ke saare connections busy hain, to naya aane wala request kitne seconds tak line (queue) me khada hokar intezaar karega. Default: 30 seconds. 30s ke baad ye TimeoutError phenk deta hai.
+
+max_connections: PostgreSQL server ka overall global limit (default 100). Isse zyada connection pura server accept nahi karega.
+
+superuser_reserved_connections: max_connections me se kitni connections superuser (postgres) ke emergency login ke liye reserve rehti hain (default: 3).
+
+pg_stat_activity: PostgreSQL ka real-time system view jo batata hai ki kaunsa backend process active hai, kaunsa idle hai, kaunsa lock ke liye wait kar raha hai (wait_event), aur kis query par atka hai.
+
+application_name: Client ka apna naam jo pg_stat_activity me chhapta hai (e.g. relay-api, relay-worker).
+
+pool_pre_ping: SQLAlchemy ka flag jo pool se connection nikal kar query chalane se pehle ek sasta check (SELECT 1) karta hai taaki ye pata chal sake ki kya connection abhi bhi zinda hai ya Postgres peeche se band ho chuka hai.
+
+Liveness vs Readiness:
+
+Liveness: "Kya mera process zinda hai ya crash ho gaya?" (Agar zinda hai to restart mat karo).
+
+Readiness: "Kya mera process is waqt traffic lene ke kabil hai ya DB/pool full hone ki wajah se saturated hai?" (Traffic mat bhejo, par kill bhi mat karo).
+
+
+TESTS AND OBSERVATIONS :
+
+Engine Defaults:
+SQLAlchemy default: pool_size = 5, max_overflow = 10.
+Iska matlab ek single engine maximum 15 connections le sakta hai.
+
+Processes Count:
+Hamare paas 5 processes hain: API (uvicorn) + Worker A + Worker B + Reaper + Dispatcher = 5 engines
+
+Teen Numbers Calculate Karna:
+- Ceiling (Maximum theoretical limit): 5 processes × 15 connections = 75 connections (+ psql sessions + test scripts). Total ≈80 connections. Postgres limit 100 hai, to ye safe margin me hai.
+- Idle State: Jab saare 5 process shuru ho chuke hain par koi kaam nahi kar rahe, to DB connections kitni hain? (Kyunki pool lazy hai, ye number ceiling se bohot kam hoga).
+- Peak State: Load ke waqt kitni connections khulti hain.
+
+application_name Set Karna:
+src/database.py me connect_args={"server_settings": {"application_name": "..."}} daalna taaki pg_stat_activity me har process ka alag naam dikhe.
+
+
+TEST1 : 
+

@@ -15,24 +15,99 @@ app = FastAPI(title="Relay API")
 app.middleware("http")(limit_payload_size)
 #check size before doing anything
 
+import hashlib
+import json
+from sqlalchemy.exc import IntegrityError
+
+
+def request_fingerprint(job_type: str, payload: dict) -> str:
+    # Canonical JSON: sort_keys=True ensure karta hai ki key order se hash na badle
+    canonical_payload = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    )
+    raw = f"{job_type.strip()}:{canonical_payload}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_exc_metadata(exc: Exception):
+    objects = [
+        exc,
+        getattr(exc, "orig", None),
+        getattr(getattr(exc, "orig", None), "__cause__", None),
+    ]
+    state = next(
+        (
+            getattr(o, name)
+            for o in objects
+            if o
+            for name in ("sqlstate", "pgcode")
+            if getattr(o, name, None)
+        ),
+        None,
+    )
+    constraint = next(
+        (
+            getattr(o, "constraint_name")
+            for o in objects
+            if o and getattr(o, "constraint_name", None)
+        ),
+        None,
+    )
+    return state, constraint
+
+
 @app.post(
     "/jobs",
     response_model=JobCreateResponse,
-    status_code=status.HTTP_202_ACCEPTED # success response default : 202(accepted) not 200 (ok)
+    status_code=status.HTTP_202_ACCEPTED
 )
 async def create_job(
         request_data: JobCreateRequest,
         db: AsyncSession = Depends(get_db)
 ):
+    fp = (
+        request_fingerprint(request_data.type, request_data.payload)
+        if request_data.idempotency_key
+        else None
+    )
+
     new_job = Job(
         type=request_data.type,
-        payload=request_data.payload
+        payload=request_data.payload,
+        idempotency_key=request_data.idempotency_key,
+        request_fingerprint=fp,
     )
 
     db.add(new_job)
 
     try:
         await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        state, constraint = get_exc_metadata(exc)
+        if state == "23505" and constraint == "uq_jobs_idempotency_key":
+            result = await db.execute(
+                select(Job).where(Job.idempotency_key == request_data.idempotency_key)
+            )
+            existing = result.scalar_one()
+            if existing.request_fingerprint != fp:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "idempotency_key_mismatch",
+                        "job_id": existing.id,
+                    },
+                )
+            return JobCreateResponse(
+                job_id=existing.id,
+                status=existing.status,
+            )
+        # Unrelated integrity errors (e.g. jobs_status_check) must not be treated as replay
+        print(f"[API] Integrity error: state={state}, constraint={constraint}", flush=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Integrity violation: {constraint or state}",
+        )
     except Exception as e:
         await db.rollback()
         raise HTTPException(
@@ -44,8 +119,6 @@ async def create_job(
         job_id=new_job.id,
         status=new_job.status
     )
-# result shows : job_id    status
-#                  1      pending -> while terminal : 202 accepted
 
 
 @app.get(

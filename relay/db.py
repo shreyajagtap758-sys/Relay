@@ -16,6 +16,7 @@ engine = create_async_engine(
     DATABASE_URL,
     echo=True,
 )
+print(f"[db] resolved_db={engine.url.database}", flush=True)
 
 async_session = async_sessionmaker(
     bind=engine,

@@ -1408,3 +1408,15 @@ taken: Week 3, alongside dedup.
 **Revisit when:** Din 3 measures the effect-commit/status-mark crash seam; Din 4 adds enqueue identity; or one job legitimately owns more than one logical effect kind. `D-24` remains reserved for the broader enqueue-versus-execute idempotency decision after both layers are measured.
 
 ---
+
+### Din 3 amendment — committed-effect / terminal-mark crash seam measured (`2026-09-02`)
+
+Din 3 exercised three real process-death boundaries around the chosen local-ledger insert. In the middle case, the first worker committed `effect_key=job:114` and died before terminal mark; recovery produced a second execution row, the repeated insert returned `rowcount=0`, the effect count stayed `1`, and the job reached `succeeded` `[RECORDED]`. An isolated reviewer rerun reproduced the same state and additionally measured the no-op conflict advancing `side_effects_id_seq` from `2` to `3` `[MEASURED-R]`.
+
+This strengthens the chosen mechanism only inside its written boundary: a new non-null keyed local-ledger effect survives legal redispatch after the effect/mark split without a second ledger row `[INFERRED from the two measurements]`. It does not eliminate duplicate handler execution, sequence gaps, multiple-effect identity design, legacy `NULL` rows, or duplicate external actions `[INFERRED]`.
+
+The local ledger insert and terminal mark **could** share one Postgres transaction, but that is not free: current handler/worker transaction ownership would couple; current ordering can hold the transaction across handler work; and guarded mark `rowcount=0` must force rollback or the effect can still commit alone `[INFERRED from source]`. External email/HTTP/payment cannot join that transaction `[INFERRED]`. A future outbox may make local state+intent atomic; it does not eliminate remote redelivery `[INFERRED]`.
+
+**Revisit now:** Din 4 adds enqueue identity and records `D-24` decision input in the Day 4 log only; Din 6 performs the same-day decision-number grep and publishes reserved `D-24` in `docs/DECISIONS.md`. Also revisit if one job gains multiple legitimate effect kinds or an external receiver contract is introduced `[INFERRED process ownership]`.
+
+---
