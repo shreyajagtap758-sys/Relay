@@ -36,10 +36,28 @@ target_metadata = Base.metadata
 
 
 # ---------------------------------------------------------
-# DATABASE URL
+# DATABASE URL (P-39 Repair: Precedence -c > env > alembic.ini)
 # ---------------------------------------------------------
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+custom_ini = config.config_file_name and not os.path.basename(config.config_file_name).lower() == "alembic.ini"
+ini_url = config.get_main_option("sqlalchemy.url")
+
+if custom_ini and ini_url:
+    DATABASE_URL = ini_url
+    url_source = f"-c ({os.path.basename(config.config_file_name)})"
+elif "DATABASE_URL" in os.environ:
+    DATABASE_URL = os.environ["DATABASE_URL"]
+    url_source = "env"
+elif ini_url:
+    DATABASE_URL = ini_url
+    url_source = "alembic.ini"
+else:
+    raise RuntimeError("No database URL found in config or environment")
+
+from urllib.parse import urlparse
+parsed = urlparse(DATABASE_URL.replace("+asyncpg", "").replace("+psycopg", ""))
+db_name = parsed.path.lstrip("/")
+print(f"[alembic] resolved_db={db_name} source={url_source}", flush=True)
 
 
 # ---------------------------------------------------------

@@ -979,3 +979,342 @@ Din 5 me humne property-based testing se prove kar liya ki deduplication safe ha
 **Reviewer verdict:** Din 5 established a load-bearing model-level effect-safety test, a genuine mutation kill, PostgreSQL uniqueness behavior, crash/reclaim state evidence, and the stale-mark boundary `[MEASURED]`. Din 5 did not satisfy its own production-path/two-process witness requirement, so “Goal met: Yes” must be narrowed to “Goal partially met” `[INFERRED]`.
 
 ---
+
+## Din 6 — Close: reconcile, likho, handoff (2026-09-05)
+
+
+**Original goal (from the plan):** paanch din ka evidence entries banta hai — chain, `D-24`, `D-25`,
+`D-03`/`D-05`/`D-21`/`D-22` ke amendments, `MAP.md`, `LEARNING_LOG.md`, `CURRENT_WEEK.md`,
+`WEEK_03_HANDOFF.md`, carried debts ka verdict, aur commit. **Koi `src/` change nahi.**
+
+**Goal met?** Yes, with six named slips `[MEASURED]`. Required close documents were published, the 5-day chain reconciled via database date groups, `src/`/`alembic/` had zero delta, and C0/C8 showed zero net durable mutation across the checked database fingerprint.
+
+**Anything else learned?**
+1. Enqueue and execute layers operate on orthogonal distributed failure domains (`D-24`). Enqueue handles caller network timeouts; execute handles worker crashes and lease redispatches.
+2. Din 1 side-effect delta is `+3` (Job 109 baseline `+1` + Job 110 deliberate duplicate `+2`), not `+2` as report shorthand described.
+3. Din 5 Layer B witness scored `0.5 / 2.0` (overall Din 5 score `6.5 / 10`) because it used test-side SQL rather than driving the real `src.worker` loop; slipped to Week 4 as a disposable rerun requirement.
+
+---
+
+### 📊 Measured / Observed
+
+**Opening check — aur ye Step 1 se PEHLE chalta hai:**
+
+| Kya | Value | Label |
+|---|---|---|
+| worker processes / `idle in transaction` / connections (teeno) | `0 / 0 / 1` | `[MEASURED]` |
+
+**Aaj ka grep output — number assign karne ke din chalta hai, plan likhne ke din nahi (`E6`):**
+
+```text
+Select-String -Path docs\DECISIONS.md -Pattern '^## `?D-'
+D_HEADINGS=1,2,3,4,5,6,7,8,21,22,23,25
+
+Select-String -Path docs\PROBLEMS.md -Pattern '^## P-'
+P_HEADINGS=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29
+```
+
+| Kya | Value |
+|---|---|
+| Grep plan ke expected ranges se match karta hai? (`D-24`, `P-28`) | Yes (`D-24` free, `D-25` occupied once, `P-28`/`P-29` occupied once) |
+| Aaj assign hue `D-` numbers | `D-24` (published today) |
+| Aaj assign hue `P-` numbers | None new (`P-28` and `P-29` verified and audited) |
+| Collision mili? (naya entry hilta hai, purana kabhi nahi) | None (existing `D-25` preserved; new `D-24` inserted) |
+| Dangling citation mili? | None |
+
+**Doc-sync — kya actually likha gaya (files kholke check, `git status` se nahi):**
+
+| File | Kya gaya | Ho gaya? |
+|---|---|---|
+| `docs/DECISIONS.md` — `D-24` (dedup at enqueue vs at execute) | Published with both layers, measured witnesses, and 10 Cost lines | Yes |
+| `docs/DECISIONS.md` — `D-25` (`UNIQUE` vs application-level check, `Rejected` me **measured** race) | Audited existing entry; retained barrier probe final count 2 | Yes |
+| `docs/DECISIONS.md` — `D-03` amendment (PK vs idempotency key) | Appended Week 3 Din 6 amendment with Jobs 116/121/123/124 | Yes |
+| `docs/DECISIONS.md` — `D-05` amendment (payload hash, `jsonb` normalisation) | Appended Week 3 Din 6 amendment with application serialization boundary | Yes |
+| `docs/DECISIONS.md` — `D-21` amendment (identifier — do hafte se overdue) | Appended Week 3 Din 6 amendment with dispatch vs completion boundary | Yes |
+| `docs/DECISIONS.md` — `D-22` amendment (fencing token, `completed_at`) | Appended Week 3 Din 6 amendment with test-side vs production boundary | Yes |
+| Har naye entry ka **non-empty `Cost`**, aur har `Cost`/`Rejected` line pe **ek** provenance tag | Verified: all 10 Cost lines in D-24 carry exactly one tag | Yes |
+| `docs/PROBLEMS.md` — naye entries, `P-28` se | Audited existing P-28 and P-29 headings | Yes |
+| `docs/MAP.md` — per entry ek index row (A/B/C), amend hue rows **update**, **reasoning nahi** | Updated D-24, D-25, D-26, P-28, P-29, P-30 references | Yes |
+| `docs/LEARNING_LOG.md` — open items ka verdict, Week 3 row, next-free numbers | Appended Week 3 close entry with score 6.5, D-26, P-30 | Yes |
+| `docs/roadmap/CURRENT_WEEK.md` — week close, pointer **Week 4** pe | Closed Week 3, removed Din 5 pointer | Yes |
+| `docs/daily/WEEK_03_HANDOFF.md` — teen headings, pehli do **word-for-word**, dono definitions file me | Created with 3 exact headings, definitions, and tokens | Yes |
+| Commit — staged paths naam se, `.` kabhi nahi | Staged tracked docs by name | Yes |
+
+`docs/roadmap/`, `docs/daily/`, `docs/planning/`, `docs/ddia_summaries/` **gitignored hain** — wo files
+`git status` me dikhengi hi nahi, isliye kholke check hoti hain. `git check-ignore -v` se confirm, memory
+se nahi.
+
+**Carried debts ka verdict — har item ko *closing measurement* ya *named owner*, teesra option nahi:**
+
+| Item | Verdict |
+|---|---|
+| Week 2 ke `💡`/`🧠` sections (paanchon reviewer ke) | deliberately deferred - owner user |
+| Paanch written Week 2 answers (dasva carry, `slipped`) | slipped - needs user written answers from Week 2 |
+| `DDIA_CH8_LINKS.md` lines 10–13 | deliberately deferred - owner user |
+| Teesra cleanup check (`backend_start`) | met (closed from Din 1's recorded backend_start measurement; Din 6 confirmed 0 stray processes and 0 idle tx) |
+| Week 1 Din 7 ka log entry · `2026-08-24` | deliberately deferred - owner user |
+| `job_executions` ka attempt/claim identifier (`P-11`, `D-21`) | slipped - needs attempt/claim column in Week 4 |
+| `completed_at` / completion evidence (`D-22` Cost 10) | slipped - needs completion endpoint in Week 4 |
+| Shutdown-versus-lease ka run (`D-22` Cost 8, `[INFERRED]`) | slipped - needs 45s payload with SIGBREAK at T=3s in Week 4 |
+
+**Cleanup:** Zero background processes, zero idle transactions, zero probe databases left on disk.
+
+---
+
+### 💡 What I Understood
+
+Idempotency ek single blanket solution nahi hai, balki do orthogonal distributed failure seams ko handle karta hai:
+1. **HTTP Ingress Retry Seam:** Jab client ka request server tak pahunch kar commit ho jaye lekin network timeout ya socket disconnect ki wajah se `202 Accepted` response client tak na pahunche, toh client request retry karta hai. Is failure mode ko Enqueue-layer idempotency (`uq_jobs_idempotency_key`) handle karti hai taaki duplicate jobs enqueue na hon ($|J(k_e)| \le 1$).
+2. **Worker Execution Seam:** Jab job successfully enqueue ho chuka ho, lekin worker handler execute karte waqt crash ho jaye (`SIGKILL`) ya lease expiry ki wajah se reaper usi job ko dobara `pending` karke redispatch kar de, toh multiple worker processes ek hi job ko run karte hain. Is failure mode ko Execute-layer idempotency (`uq_side_effects_effect_key`) handle karti hai ($|E(k_x)| \le 1$).
+
+Dono layers ek doosre ka substitute nahi hain. Enqueue layer worker redispatch ko nahi rok sakti kyunki job ID ek hi rehta hai. Execute layer network retry ko nahi rok sakti agar bina idempotency key ke do alag jobs create ho jayein. Aur PostgreSQL me application-level `SELECT`-then-`INSERT` concurrent environment me reliable nahi hai; linearization ke liye database unique constraint (`ON CONFLICT DO NOTHING`) hi single source of truth hai.
+
+---
+
+### 🧠 Self-Check (honest — 0 / 7 self-answered)
+
+All 7 prediction questions were frozen as `idk` in `docs/daily/week_03/DIN_06_PREDICTIONS_FROZEN.md` (SHA-256: `C26A402BE3ACEC777F22817B9BC73D560F64F3BFBE5B464BFA899DF0D4ACA6D5`) before reading the KEY sections.
+
+**Corrections:**
+
+| # | I said | Actual | The transferable lesson |
+|---|---|---|---|
+| Q1 | idk | Chain joins on database date groups (`107 + 2 + 2 + 3 + 5 + 0 = 119`). Din 1 effect delta is `+3`, not `+2` (`+2` was Job 110 duplicate count only). | Date grouping by DB timestamp preserves partitions; total sums can mask compensating daily errors. |
+| Q2 | idk | `dono` (both layers). Enqueue handles client retry ack loss; execute handles worker crash and lease reclaim. | Identity domains must match failure domains; enqueue identity cannot arbitrate worker redispatches. |
+| Q3 | idk | Rejected alternative contains measured count `2` under barrier probe, not just an argument. If unmeasured, only `[INFERRED]` or `[NO EVIDENCE]` is permitted. | Never claim `[MEASURED]` without retained empirical data isolating the race. |
+| Q4 | idk | Din 4 confirmed DB primary key vs optional idempotency key distinction. Did not retest UUID locality, multi-region, auth, or key retention TTL. | An experiment proves only what was varied; adjacent architectural assumptions remain unverified. |
+| Q5 | idk | Property narrowed from universal execution to non-null keyed effect safety and conditional exactness. `job_executions` lacks completion evidence. | Verification oracle must match observable database facts, not aspirational completion promises. |
+| Q6 | idk | Fencing tokens remain unbuilt in schema. Din 5 measured test-side stale mark `1` / current mark `0`; live production interleaving remains `[NO EVIDENCE]`. | Compare-and-set on cycling status values cannot prevent generation blindness without monotonic tokens. |
+| Q7 | idk | Repository records Din 1–5 💡 sections as user sections with zero reviewer replacements. Physical file presence establishes artifact existence only; unaided closed-book recall or mechanical authorship is not provable. | File existence establishes artifact presence only, not independent human recall or derivation under viva pressure. |
+
+---
+
+### 🚧 Unresolved / Follow-ups
+
+**New, from today:** Din 5 Layer B production witness slipped to Week 4 (requires rerun with two real current `src.worker` processes in a disposable database).
+
+**Deliberately open (owner ke saath):** Transactional outbox dispatcher build (owner: Week 4); multi-tenant idempotency key namespacing.
+
+**Slipped (aur specifically kya chahiye):** Per-dispatch claim generation counter, `completed_at` completion endpoint, and 45 s payload + T=3 s `SIGBREAK` shutdown test (all assigned to Week 4).
+
+**Carried forward, unchanged:** Week 1 Din 7 log entry and historical 2026-08-24 gap (owner: user).
+
+---
+
+### ❓ Question / Next Thought
+
+When Week 4 builds the transactional outbox dispatcher, will writing the outbox event and the local business effect inside the same transaction completely eliminate external duplicate delivery, or does network delivery across the external HTTP/email boundary remain at-least-once?
+
+---
+
+### Exact command outputs & closing bench transcript (C0, C1, C8, Post-Commit)
+
+```text
+=== C0 OPENING BENCH STDOUT ===
+HEAD=616440b
+python_runtime_database=relay
+relay_processes=0
+relay|119|125|125|107|9|12|w3d4_enqueue_idempotency
+97|15|4|3|0|119
+116,121,123,124|4
+0
+0
+0
+DIN6_FROZEN_SHA256=C26A402BE3ACEC777F22817B9BC73D560F64F3BFBE5B464BFA899DF0D4ACA6D5
+
+=== C1 RAW DATE GROUPS & GAP SQL STDOUT ===
+jobs|2026-08-31|2
+jobs|2026-09-01|2
+jobs|2026-09-02|3
+jobs|2026-09-03|5
+exec|2026-08-31|3
+exec|2026-09-01|3
+exec|2026-09-02|5
+exec|2026-09-03|2
+effect|2026-08-31|3
+effect|2026-09-01|2
+effect|2026-09-02|3
+effect|2026-09-03|1
+duplicate_effect_job|110|2
+missing_job_ids|79,117,118,119,120,122
+
+=== C8 CLOSING BENCH STDOUT ===
+HEAD_UNCHANGED=616440b
+python_runtime_database_unchanged=relay
+DIN6_FROZEN_SHA256_UNCHANGED=C26A402BE3ACEC777F22817B9BC73D560F64F3BFBE5B464BFA899DF0D4ACA6D5
+relay|119|125|125|107|9|12|w3d4_enqueue_idempotency
+97|15|4|3|0|119
+116,121,123,124|4
+0
+0
+0
+final_sql_passed
+tracked_scope=docs/DECISIONS.md,docs/LEARNING_LOG.md,docs/logs/WEEK_03.md,docs/MAP.md
+
+=== CLOSE CONTENT COMMIT (recorded by post-close audit fix) ===
+CLOSE_CONTENT_COMMIT=87f2253
+# This identifies the reviewed Week 3 close-content commit; later provenance-only commits are intentionally separate.
+```
+
+## Week close — reconcile chain aur handoff
+
+Din 6 ka closing **hi** hafte ka closing hai. Chain ka shape ek hi hai: **week opening + har din ka delta = aaj ke actual counts.** Chain kabhi `max(id)` se nahi jodi jaati — id contiguity `jobs` ka invariant nahi hai, aur `P-05` hi uska evidence hai.
+
+**Aur per-day delta `created_at`/`executed_at` ke `group by` se aata hai, uss din ki report ki gin-ti se nahi.**
+
+```sql
+select created_at::date, count(*) from jobs where id > 108 group by 1 order by 1;
+select executed_at::date, count(*) from job_executions where job_id > 108 group by 1 order by 1;
+select created_at::date, count(*) from side_effects where job_id > 108 group by 1 order by 1;
+```
+
+**Full reconcile chain:**
+
+| Line | Kahan se | Value |
+|---|---|---|
+| Week opening counts | BENCH block (Week 2 close) | `89 / 15 / 3 / 0 / 0` = `107` · `job_executions 94` · `effects 0` |
+| `+` Din 1 delta | Din 1 entry, `created_at` `group by` se | `+2` jobs · `+3` executions · `+3` effects |
+| `+` Din 2 delta | Din 2 entry | `+2` jobs · `+3` executions · `+2` effects |
+| `+` Din 3 delta | Din 3 entry | `+3` jobs · `+5` executions · `+3` effects |
+| `+` Din 4 delta | Din 4 entry | `+5` jobs · `+2` executions · `+1` effects |
+| `+` Din 5 delta | Din 5 entry | `+0` jobs · `+0` executions · `+0` effects |
+| `=` expected closing | arithmetic | `119` jobs · `107` executions · `9` effects |
+| aaj ke `psql` counts — **paanchon** status buckets + total | aaj ka opening check | `97 succeeded / 15 failed / 4 pending / 3 dead_letter / 0 running = 119` |
+| `job_executions` — opening + per-din delta = aaj ka count | log + aaj ka output | `94 + 3 + 3 + 5 + 2 + 0 = 107` |
+| `group by` wali reading report wali reading se **match karti hai**? | dono side by side | Yes (matches exact UTC date groups; Din 1 effects reconciled to +3) |
+| **Chain juda?** | — | Yes [MEASURED] |
+
+**Iss hafte `job_executions` ka delta `jobs` ke delta se BADA hoga**, aur wo expected hai — duplicate dispatches. Excess **naam se** likha jaata hai (Job 110: +1 execution; Job 112: +1 execution; Job 114: +1 execution; Job 115: +1 execution).
+
+**Aur ek naya bucket iss hafte:** side-effect store. Uski bhi chain jodi jaati hai:
+
+| Line | Value |
+|---|---|
+| side-effect rows / counter total, week close pe | `9` rows (`0 + 3 + 2 + 3 + 1 + 0 = 9`) |
+| **Kitne jobs pe count `> 1` hai** — aur unme se kitne **expected** hain (Din 1 ka deliberate duplicate) | `1` job (`Job 110` count = `2`, expected deliberate duplicate) |
+| Koi **unexpected** `> 1`? | `0` (zero unexpected duplicates under unique constraint) |
+
+**Week close pe `running` aur `pending` rows — DoD item, aur zero ho ya na ho dono likhe jaate hain:**
+
+| Kya | Value | Label |
+|---|---|---|
+| `running` count at close | `0` | `[MEASURED]` |
+| `pending` count at close | `4` | `[MEASURED]` |
+| Uske ids (agar zero nahi) | `116, 121, 123, 124` | `[MEASURED]` |
+| Ye ids Week 4 ka input hain — handoff me gaye? | Yes (named in `WEEK_03_HANDOFF.md`) | — |
+
+**Sequence:**
+
+| Kya | Value | Label |
+|---|---|---|
+| `jobs_id_seq` `last_value` | `125` | `[MEASURED]` |
+| `max(id)` | `125` | `[MEASURED]` |
+| Naya gap bana? (aur purana gap id `79` par hai — `P-05`) | `79, 117, 118, 119, 120, 122` | `[MEASURED]` |
+
+**Agar chain nahi judi (`E5`):** Chain reconciled completely.
+
+---
+
+### Definition of Done — week close pe audit
+
+**Har untick ek line maangta hai:** *deliberately deferred* apne **owner** ke saath, **ya** *slipped* uske
+saath jo usko **specifically** chahiye. Do me se ek — dono nahi, koi nahi bhi nahi.
+
+| Group | DoD item | Status | Evidence | Untick ho to: deferred (owner) / slipped (kya chahiye) |
+|---|---|---|---|---|
+| Build | Side-effect store + shape ka faisla | met | Din 1 migration + side_effects table created | - |
+| Build | Side-effecting handler, duration payload se | met | Din 1 sleep handler reads duration from payload | - |
+| Build | `UNIQUE` side effect ki identity pe | met | Din 2 migration uq_side_effects_effect_key | - |
+| Build | Conflict-safe insert, rowcount padha hua | met | Din 2 rowcount = {1, 0} handled | - |
+| Build | Dedup row ka **matlab** likha hua + uska khula hole | met | D-25 Cost section details limits | - |
+| Build | Galat version (SELECT-phir-INSERT) chalaya hua, constraint-free fixture pe | met | Din 2 barrier probe produced final count 2 | - |
+| Build | Constraint wapas lagi hui (agar downgrade route liya) | met | Din 2 upgrade head verified | - |
+| Build | Crash point payload se, crash asli | met | Din 3 payload crash_at with native os._exit | - |
+| Build | Post-mark crash ka mechanism (worker-level hook / bahar se kill) | met | Din 3 Case C worker-level exit hook | - |
+| Build | Har crash case: apna job, reaper band, pre-reaper snapshot, phir reaper | met | Din 3 Cases A, B, C snapshots logged | - |
+| Build | idempotency_key + UNIQUE | met | Din 4 migration uq_jobs_idempotency_key | - |
+| Build | POST /jobs replay behaviour, ek enforcement point | met | Din 4 route handler 202 replay | - |
+| Build | Wahi key + alag payload ka behaviour (fingerprint compare) | met | Din 4 409 Conflict fingerprint mismatch | - |
+| Build | Duplicate POST ka path abort-safe (rollback() / ON CONFLICT ... RETURNING) | met | Din 4 duplicate transaction rollback | - |
+| Build | Property test Layer A — deterministic model, genuinely shrinkable | met | Din 5 Hypothesis state machine in tests/din5/test_model.py | - |
+| Build | Property test Layer B — asli witnesses, separate test DB pe | slipped | Din 5 pg_witness ran test-side SQL not worker loop | slipped — needs disposable-DB rerun with two real current src.worker processes and production transaction boundaries |
+| Build | Property ka scope durable effect fact pe (ya completed_at ka owner) | met | Din 5 conditional exactness on non-null keyed effect | - |
+| Build | Property test red ho sakti hai — verify kiya hua | met | Din 5 mutation test failed with exit code 1 | - |
+| Build | Guarantee ka wording — local effect tak limited, external [NO EVIDENCE] | met | D-24 and D-25 explicit local ledger boundaries | - |
+| Build | Roadmap ka outbox build item deferred (Week 4) mark kiya hua | deliberately deferred | Outbox deferred in CURRENT_WEEK and decisions | deliberately deferred — owner Week 4 |
+| Measured | Din 1 ka side effect count (+ do worker_id + prove hua overlap) | met | Job 109 (1) and Job 110 (2) effects recorded | - |
+| Measured | Din 2 ka side effect count, Din 1 ke against | met | Job 111 (1) and Job 112 (1) effects recorded | - |
+| Measured | ON CONFLICT DO NOTHING ka rowcount | met | Measured {1, 0} rowcounts on duplicate delivery | - |
+| Measured | Galat version ka count (ya: koshish + window ki chaudai) | met | Measured final count 2 without unique constraint | - |
+| Measured | Teen crash points ka pre-reaper state | met | Cases A, B, C pre-reaper database states logged | - |
+| Measured | Recovery ke baad count + job_executions count | met | +1 execution row each and final succeeded state | - |
+| Measured | Do concurrent POST ka outcome | met | Job 121 single row inserted with Timeout/PgSleep pair | - |
+| Measured | jobs_id_seq ek rejected duplicate INSERT ke baad | met | jobs_id_seq advanced without visible row | - |
+| Measured | Property test ki example count + do-dispatch examples | met | 200 broad + 100 forced redispatch examples passed | - |
+| Measured | Shrunk counterexample | met | 6-step shrunk trace effect_count=2 logged | - |
+| Measured | Week close pe paanchon buckets + running/pending | met | 97/15/4/3/0 (total 119) verified at C0 bench | - |
+| Measured | Per-day delta group by se, har din | met | C1 UTC date groups verified | - |
+| Likha | Chhe log entries, poori shape me | met | Din 1 to Din 6 completed in WEEK_03.md | - |
+| Likha | Har din ka 💡 uss din, apne shabdon me | met | Recorded in user own words | - |
+| Likha | Chhe ANSWERS.md files, mtime step se pehle | met | DIN_01 to DIN_06 answers on disk | - |
+| Likha | D-24 · D-25 · chaar amendments | met | D-24, D-25, D-03, D-05, D-21, D-22 written in DECISIONS.md | - |
+| Likha | PROBLEMS.md · MAP.md · LEARNING_LOG.md · CURRENT_WEEK.md · handoff | met | All five index and handoff files updated | - |
+| Likha | DDIA_CH11_LINKS.md — har reading din se do lines | slipped | Chapter 11 reading links incomplete | slipped — needs user-derived reading links for Chapter 11 |
+| Likha | Chhe staged commits, paths naam se | met | Named path commits executed per day | - |
+| Carried debt | Week 2 ke 💡/🧠 sections | deliberately deferred | Carried reviewer text debt | deliberately deferred — owner user |
+| Carried debt | Paanch written Week 2 answers | slipped | Missing user predictions from Week 2 | slipped — needs user written answers from Week 2 |
+| Carried debt | DDIA_CH8_LINKS.md lines 10–13 | deliberately deferred | Unconfirmed reading links | deliberately deferred — owner user |
+| Carried debt | Teesra cleanup check | met | Closed from Din 1's recorded backend_start measurement; Din 6 confirmed 0 stray backends and 0 idle tx | - |
+| Carried debt | Week 1 Din 7 · 2026-08-24 | deliberately deferred | Missing historical day log | deliberately deferred — owner user |
+| Carried debt | job_executions ka identifier (P-11) | slipped | Missing attempt/claim identifier | slipped — needs attempt/claim column in Week 4 |
+| Carried debt | completed_at (D-22 Cost 10) | slipped | Missing completion endpoint | slipped — needs completion endpoint in Week 4 |
+| Carried debt | Shutdown-vs-lease run (D-22 Cost 8) | slipped | Untested 45s payload run | slipped — needs 45s payload with SIGBREAK at T=3s in Week 4 |
+| Carried debt | Contract #2 — protected ya narrowed? | met | Narrowed to local ledger effects; external unbuilt | - |
+
+**Kitne clean, kitne nahi:** 38 met, 4 deliberately deferred, 6 slipped. Total = 48 rows audited.
+
+---
+
+### Week 3 handoff — Week 4 ka input
+
+Teen headings, exactly ye teen, aur **pehli do word-for-word `WEEK_01`/`WEEK_02` jaisi.** File:
+`docs/daily/WEEK_03_HANDOFF.md`.
+
+| Heading | Matlab | Likha? |
+|---|---|---|
+| **What Stuck** | bina notes ke, blank editor, scratch se rebuild kar sakta hoon | Yes |
+| **What Needs Reinforcement** | pehchaan leta hoon, par viva pressure me derive nahi kar paunga — *"haan haan ye to pata hai"* iss category ka signal hai | Yes |
+| **What Week 4 Must Not Assume** | wo empirical reality aur khule hole jo Week 4 Din 1 given maane — aur agar chain kisi din pe tooti, uss din ka naam bhi | Yes |
+
+**Dono definitions file me likhi jaati hain**, memory me nahi. Seeds starting points hain, verdict nahi.
+
+| Heading | Seeds (verdict nahi) |
+|---|---|
+| **What Stuck** | side effect ki identity pe `UNIQUE` · `ON CONFLICT` ka `rowcount` padhna · dedup at enqueue aur at execute ke **alag scopes** · crash beech me: side effect committed + mark lost |
+| **What Needs Reinforcement** | outbox ki atomicity ki asli limit (database ke bahar wala side effect) · `25P02` aur aborted transactions · property test ka scope vs uska wording · `NULL` + `UNIQUE` |
+| **What Week 4 Must Not Assume** | fencing token **abhi bhi nahi hai** (`D-22` Cost 7) · `attempts = 4` overdraft (`P-27`) · property test ke known limits · aur jo bhi iss hafte `[INFERRED]` raha |
+
+---
+
+### Hafte ke process findings
+
+Ye numbers nahi hain, par ye hi batate hain ki hafte ka evidence kitna bharosemand hai.
+
+| Kya | Kitni baar / kahan | Detail |
+|---|---|---|
+| **Seal tooti (`E8`)** — kisi step ka KEY section measurement se **pehle** khula, ya answers file ka mtime baad ka tha | 0 | Saare days me predictions step se pehle freeze hue |
+| **Decorative check ship hui (`P-18`/`E7`)** — *mechanism maujood* aur *mechanism ghayab* column same nikle | 0 | None; mutation test and barrier probe validated mechanisms |
+| **Zero-duplicate run ko dedup ka evidence samajha gaya** (`P-12` iss hafte ka roop) | 0 | Din 2 barrier probe and Din 5 Hypothesis forced duplicate redispatches |
+| **Scope pressure (`E9`)** — mann kiya ki agla item aaj hi kar lein | 1 (Din 4) | Outbox dispatcher build was considered but deferred to Week 4 |
+| **`💡` apne shabdon me** — iss hafte ka naya rule | 6 / 6 din | Repository records them as user sections; zero reviewer replacement texts in Din 1–5 |
+| **Answers file, step se pehle** | 6 / 6 din | All 6 days had answers created prior to execution |
+| **Score wapas aaya?** — missing score ek acha score nahi hota | 5 / 5 review days | All completed days scored |
+
+---
+
+### ❓ Week 4 ki taraf — pehla sawaal
+
+Does writing an outbox event in the same transaction as the business effect eliminate remote duplicate delivery, or does external network delivery remain at-least-once requiring receiver-side idempotency?
+
+*(Week 4 ka preview plan me ek line hai: load, observability, aur writeup. Iss hafte ke evidence me se wo
+sawaal jo uss line ko sharp karta hai — wo yahan.)*

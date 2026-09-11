@@ -139,7 +139,17 @@ async def get_job_status(
             detail="Job not found."
         )
 
-    return db_job
+@app.get("/healthz")
+async def healthz(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(text("SELECT 1"))
+        return {"status": "ok"}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"database_unreachable: {type(exc).__name__}: {exc}",
+        )
+
 
 # result : {"id":1,"type":"send_email","payload":{"to":"vikas@example.com"},"status":"pending","attempts":0,"created_at":"2026-08-15T19:30:03.022215Z","updated_at":"2026-08-15T19:30:03.022215Z"}
 # status : 200 ok

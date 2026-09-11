@@ -6,6 +6,8 @@ docs/revision.md
 docs/daily/
 docs/DDIA_SUMMARIES/
 docs/MAP.md
+logs/
+docs/LEARNING_LOG.md
 
 __pycache__/
 *.py[cod]

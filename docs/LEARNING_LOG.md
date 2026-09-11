@@ -3897,9 +3897,9 @@ Processes Count:
 Hamare paas 5 processes hain: API (uvicorn) + Worker A + Worker B + Reaper + Dispatcher = 5 engines
 
 Teen Numbers Calculate Karna:
-- Ceiling (Maximum theoretical limit): 5 processes × 15 connections = 75 connections (+ psql sessions + test scripts). Total ≈80 connections. Postgres limit 100 hai, to ye safe margin me hai.
+- Ceiling (Maximum theoretical limit): 5 processes × 15 connections = 75 connections (+ psql sessions + test scripts ~5 conn). Total ≈80 connections. Postgres limit 100 hai, to ye safe margin me hai.
 - Idle State: Jab saare 5 process shuru ho chuke hain par koi kaam nahi kar rahe, to DB connections kitni hain? (Kyunki pool lazy hai, ye number ceiling se bohot kam hoga).
-- Peak State: Load ke waqt kitni connections khulti hain.
+- Peak State: Load ke waqt kitni connections khulti hain. 1 se badh kar 5 aur phir overflow hoke 15 tak jaate hain.
 
 application_name Set Karna:
 src/database.py me connect_args={"server_settings": {"application_name": "..."}} daalna taaki pg_stat_activity me har process ka alag naam dikhe.
@@ -3907,3 +3907,228 @@ src/database.py me connect_args={"server_settings": {"application_name": "..."}}
 
 TEST1 : 
 
+Humne 5 alag processes start kiye (relay-worker-a, relay-worker-b, relay-reaper, relay-dispatcher, relay-api) aur pg_stat_activity query kiya:
+
+```commandline
+--- pg_stat_activity by application_name and state ---
+ application_name | state  | count 
+------------------+--------+-------
+ psql             | active |     1
+ relay-api        | idle   |     1
+ relay-dispatcher | idle   |     1
+ relay-reaper     | idle   |     1
+ relay-worker-a   | idle   |     1
+ relay-worker-b   | idle   |     1
+(6 rows)
+
+Total connections on relay_w4d5_probe: 6
+```
+
+- Har process exactly 1 connection idle state me hold kar raha hai.
+
+TEST 2 :
+
+Pool Exhaustion Measurement (test_step2_pool.py)
+Humne engine ko configure kiya:
+
+POOL_SIZE = 2
+MAX_OVERFLOW = 0 (no extra connections allowed)
+POOL_TIMEOUT = 3.0 seconds
+Humne 3 concurrent asynchronous tasks run kiye jo database connection hold karte hain:
+
+Task 1 ne Connection 1 acquire kiya aur SELECT pg_sleep(4.0) chalaya.
+Task 2 ne Connection 2 acquire kiya aur SELECT pg_sleep(4.0) chalaya.
+Task 3 ne Connection maanga. Dono connections occupied the aur overflow 0 tha!
+Task 3 ne 3.0 seconds tak wait kiya (pool_timeout).
+3.0 seconds baad Task 3 crash hua.
+
+OBSERVATIONS :
+
+[22:38:45] Task 1 ACQUIRED connection! (took 0.001s)
+[22:38:45] Task 2 ACQUIRED connection! (took 0.000s)
+[22:38:45] Task 3 requesting connection...
+[22:38:46] Mid-flight pg_stat_activity count for 'relay-pool-test': 2
+[22:38:48] Task 3 FAILED after 3.011s: sqlalchemy.exc.TimeoutError: QueuePool limit of size 2 overflow 0 reached, connection timed out, timeout 3.00
+[22:38:49] Task 1 completed sleep, releasing.
+[22:38:49] Task 2 completed sleep, releasing.
+
+
+- Exhaustion Origin: Exception sqlalchemy.exc.TimeoutError hai. Ye error PostgreSQL server se nahi aaya — ye Python client-side application pool (QueuePool) ne throw kiya hai! Postgres ko to pata bhi nahi chala ki Task 3 ne connection maanga tha kyunki connection checkout client memory me fail ho gaya.
+- Wait Duration: Measured wait 3.011s tha, jo strictly pool_timeout=3.0s se match karta hai.
+- Per-Process Boundary: Pool exhaustion hamesha per-process hoti hai. Agar API ka pool exhaust ho gaya, to Worker ya Dispatcher ka pool exhaust nahi hota kyunki har process ka apna independent engine aur pool instance hota hai.
+
+
+TEST 3 :
+
+- Concept: relay/sink.py me incoming delivery ko INSERT INTO sink_deliveries (...) VALUES (...) ON CONFLICT (idempotency_key) DO NOTHING se write kiya jata hai.
+- Agar koi holder transaction pehle se kisi idempotency_key par open write karke baitha ho, to PostgreSQL ka row-level speculative locking doosri transaction ko WAIT state me daal deta hai jab tak pehli transaction commit ya rollback na kare!
+- Aur kyunki relay/dispatcher.py outbox row ko lock karke HTTP request bhejta hai, receiver ka ye wait sidha Relay ke dispatcher process aur DB connection ko freeze kar deta hai!
+
+OBSERVATIONS :
+
+- Holder transaction ne key 'p41_contention_test_key' par insert kiya aur transaction ko 3.0s tak open rakha (rollback nahi kiya).
+- At +0.5s, client ne usi key par POST http://127.0.0.1:8001/deliver hit kiya.
+
+Measured Response:
+
+[22:39:07] Holder TX inserted row! Holding transaction open for 3.0s...
+[22:39:08] Client sending POST /deliver for same key 'p41_contention_test_key'...
+[22:39:10] Holder TX rolling back...
+[22:39:10] Client received response: 200 in 2.604s
+[MEASURED P-41] Receiver response time: 2.604s (against a 3.0s holder)
+
+
+- Conclusion: Receiver ka response time upstream lock hold time se direct bound hai!
+
+
+TEST 4 :
+
+in relay/main.py :
+```commandline
+@app.get("/healthz")
+async def healthz(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(text("SELECT 1"))
+        return {"status": "ok"}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"database_unreachable: {type(exc).__name__}: {exc}",
+        )
+```
+          OPTIONS            KYA CHECK KRTA HE                       KYA RISK/JOOTH BOLEGA
+OPTION 1 : 200 always	   Sirf uvicorn web server alive hai	Agar Postgres mar gaya, tab bhi 200 bolega (False Healthy).
+OPTION 2 : SELECT 1 (Chosen)	API process zinda hai + is process ke pool se Postgres reachable hai	Worker mar gaya to bhi 200 bolega (Liveness only, not full system readiness).
+OPTION 3 : SELECT 1 + pending count	   Queue backlog depth	    Inventory Leak! Endpoint public hai (no auth per D-03). Business competitors queue volume infer kar sakte hain.
+OPTION 4 : SELECT 1 + worker heartbeat	   Worker liveness	    Heartbeat sirf tab chalti hai jab job execute ho rahi ho. Idle worker false "dead" report hoga.
+
+- /healthz liveness deta hai, readiness nahi, aur inventory kabhi nahi (jab tak authentication na ho).
+
+The Catastrophic "Saturation to Outage" Trap (Measured!)
+Mechanism:
+Agar /healthz usi application connection pool (get_db) se connection maangta hai jo pool_size=2 pe chal raha hai:
+Jab peak load aata hai aur dono connections heavy POST /jobs ya queries me busy hote hain, tab agar orchestrator (jaise Kubernetes) liveness probe bhejta hai GET /healthz, to /healthz ko connection pool se connection nahi milta!
+/healthz queue me baith jata hai aur pool_timeout (3.0s) tak block hoke 503 Service Unavailable return karta hai.
+Kubernetes orchestrator sochta hai: "API dead ho gayi hai!" aur container ko KILL karke restart kar deta hai!
+Restart hone se in-flight transactions abruptly drop hoti hain, clients ko 502 milti hai, queue backlog aur badh jata hai, aur naya pod start hote hi dobara saturate hoke restart loop me phas jata hai (Crash Loop / Saturation to Outage)!
+
+OBSERVATIONS : 
+
+[Healthy] /healthz returned 200 {'status': 'ok'} in 113.34ms
+
+Acquiring exclusive table lock on 'jobs' to simulate slow/blocked queries...
+Table lock held! Sending 2 concurrent POST /jobs to occupy both connections...
+
+[Saturation Trap] Now hitting GET /healthz while pool is 100% occupied...
+[Saturated] /healthz returned status 503 in 3.021s: {"detail":"database_unreachable: TimeoutError: QueuePool limit of size 2 overflow 0 reached, connection timed out, timeout 3.00 (Background on this error at: https://sqlalche.me/e/20/3o7r)"}
+
+- Measured Fact: /healthz ne 3.021s wait karke 503 diya jabki database bilkul healthy tha — sirf pool saturated tha!
+
+
+TEST 5 : 
+
+Tool Choice: httpx + asyncio script choose kiya gaya. Locust reject kiya gaya kyunki pip install locust 28 extra packages (Flask, gevent monkey patching, pywin32) laata hai, jo Month 1 ke end me unnecessary footprint badhata.
+Ingestion Path: Humne HTTP POST /jobs burst path use kiya taaki poora pipeline (API parsing + middleware + pool + commit) measure ho sake.
+
+
+see code of relay/worker.py :
+```commandline
+if not claimed_job:
+    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+    continue
+```
+
+- Critical Trap: POLL_INTERVAL_SECONDS = 2.0 tab chalta hai jab queue empty ho! Agar queue me pending jobs hain (claimed_job is not None), to loop sleep ko bypass karke turant next job claim karne chala jata hai!
+- Iska matlab: POLL_INTERVAL_SECONDS throughput ko bound nahi karta — wo sirf empty queue par naye job ki discovery latency (0 se 2.0s) ko bound karta hai!
+- Backlog Throughput Formula: 
+T(job) = T(handler) + T(claim) + T(record_exec) + T(side_effect) + T(mark)
+- Fast handler me execution ≈0ms
+- 4 DB roundtrips with echo=True ≈4×25ms=100ms−150ms.
+- Single worker drain capacity ≈ 1 / 0.15s ≈ 6.5 jobs/sec.
+
+OBSERVATIONS :
+
+[Queue Series] 22:41:18 (no jobs)
+Enqueued 1/60 jobs...
+Enqueued 16/60 jobs...
+[Queue Series] 17:11:20 | succeeded |    25
+Enqueued 31/60 jobs...
+Enqueued 46/60 jobs...
+[Queue Series] 17:11:22 | pending   |    18   <-- Queue depth grows!
+[Queue Series] 17:11:22 | succeeded |    31
+Finished Enqueuing 60 jobs in 6.28s (~9.6 jobs/sec)
+
+Waiting for worker to drain backlog...
+[Queue Series] 17:11:24 | succeeded |    60   <-- Drained back to 0
+[Queue Series] 17:11:27 | succeeded |    60
+
+
+- Lag Direction: Jab enqueue rate (9.6/s) worker drain rate (~6/s) se zyada thi, to queue lag ka direction monotonically upward tha (pending 18 tak pahucha). Enqueue khatam hote hi worker ne use drain karke 0 kar diya.
+
+-[ RECORD 1 ]-------+-----------
+queue_depth_pending | 0
+latency_p50_sec     | 1.02493
+latency_p99_sec     | 2.08249418
+retry_rate_pct      | 0.00
+dlq_count           | 0
+
+
+TEST 6 : Postgres Mid-Flight Stop & The Two Distinct Failures
+
+1. Outage Behavior During DB Stop (docker stop relay-db-1)
+- Jab Postgres band tha, humne API request bheji:
+
+/healthz request: 0.014s me fail hui with 503 Service Unavailable:
+{"detail":"database_unreachable: InterfaceError: (sqlalchemy.dialects.postgresql.asyncpg.InterfaceError) <class 'asyncpg.exceptions._base.InterfaceError'>: connection is closed\n[SQL: SELECT 1]"}
+
+POST /jobs enqueue request: 4.069s me fail hui with 500 Internal Server Error:
+{"detail":"Failed to enqueue job securely."}
+
+- Contract Guarantee: Client ko immediate rejection mila. Request silently accept nahi hui aur na hi data drop hua.
+
+2. Failure 1 vs Failure 2 (The Heart of Step 5)
+Postgres band hone aur wapas aane par do bilkul alag-alag failure modes hote hain:
+
+Failure 1 (Live Socket Disconnection):
+Jab Postgres band hota hai, to active queries ke live TCP sockets toot jaate hain. Driver turant InterfaceError ya ConnectionResetError phekta hai.
+
+Failure 2 (Stale Pooled Connection — The Silent Killer):
+Postgres wapas UP aa gaya (docker start relay-db-1).
+Lekin application pool ke andar jo connections pehle se cache the, unke sockets to purane (dead) Postgres instance se jude the!
+
+2A = Without pool_pre_ping (Arm A):
+Client query karta hai. SQLAlchemy pool se wahi cached dead connection bina check kiye utha ke de deta hai!
+
+OBSERVATIONS :
+Measured Result:
+
+[MEASURED STALE FAILURE] pool_pre_ping=False raised:
+  sqlalchemy.exc.InterfaceError: connection is closed [SQL: SELECT 1]
+
+
+- Nateeja: Database zinda hone ke baad bhi pehli query fail hoti hai!
+
+2B = With pool_pre_ping=True (Arm B):
+SQLAlchemy pool se connection checkout karte waqt ek ultra-lightweight ping maarta hai.
+Dead socket pakadte hi use chupke se discard karke naya fresh connection establish karta hai!
+
+OBSERVATIONS :
+Measured Result:
+
+[MEASURED PRE_PING SUCCESS] pool_pre_ping=True transparently reconnected! Result: 1
+
+
+3. Contract #1 Under Outage Stress: Running Jobs Fate
+
+Outage ke waqt DB me Job 101 running state me tha jiska lease expire ho chuka tha (claimed 10s ago).
+Outage ke dauran Reaper bhi band tha (kyunki DB down thi).
+Jaise hi DB start hui, humne Reaper run kiya.
+
+OBSERVATIONS :
+Measured Reaper Action:
+
+[reaper-26816] [2026-09-10 22:43:04.869511] [reclaim] job_id=101 pre_status=running matched=1 post_status=pending
+
+- Job 101 turant wapas pending me recover ho gaya!
+
+- Conclusion: Contract #1 ("Accepted job is never silently lost") 100% hold karta hai.
