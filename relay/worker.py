@@ -196,57 +196,64 @@ async def run_worker() -> None:
     while not SHUTDOWN_REQUESTED:
         claimed_job = None
 
-        async with async_session() as session:
-            async with session.begin():
-                claim_query = (
-                    select(Job.id, Job.type, Job.payload, Job.attempts)
-                    .where(
-                        Job.status == "pending",
-                        or_(
-                            Job.next_attempt_at.is_(None),
-                            Job.next_attempt_at <= func.now(),
-                        ),
+        try:
+            async with async_session() as session:
+                async with session.begin():
+                    claim_query = (
+                        select(Job.id, Job.type, Job.payload, Job.attempts)
+                        .where(
+                            Job.status == "pending",
+                            or_(
+                                Job.next_attempt_at.is_(None),
+                                Job.next_attempt_at <= func.now(),
+                            ),
+                        )
+                        .order_by(Job.created_at, Job.id)
+                        .limit(1)
+                        .with_for_update(skip_locked=True)
                     )
-                    .order_by(Job.created_at, Job.id)
-                    .limit(1)
-                    .with_for_update(skip_locked=True)
-                )
-                result = await session.execute(claim_query)
-                job = result.first()
+                    result = await session.execute(claim_query)
+                    job = result.first()
 
-                if job:
-                    update_stmt = (
-                        update(Job)
-                        .where(Job.id == job.id, Job.status == "pending")
-                        .values(
-                            status="running",
-                            claimed_at=func.now(),
-                            attempts=Job.attempts + 1,
-                            claim_generation=Job.claim_generation + 1,
+                    if job:
+                        update_stmt = (
+                            update(Job)
+                            .where(Job.id == job.id, Job.status == "pending")
+                            .values(
+                                status="running",
+                                claimed_at=func.now(),
+                                attempts=Job.attempts + 1,
+                                claim_generation=Job.claim_generation + 1,
+                            )
+                            .returning(Job.claim_generation)
                         )
-                        .returning(Job.claim_generation)
-                    )
-                    update_result = await session.execute(update_stmt)
-                    current_generation = update_result.scalar_one_or_none()
+                        update_result = await session.execute(update_stmt)
+                        current_generation = update_result.scalar_one_or_none()
 
-                    if current_generation is None:
-                        print(
-                            f"[{WORKER_ID}] Conflict: Job {job.id} was claimed by another writer (rowcount=0).",
-                            flush=True,
-                        )
-                    else:
-                        current_attempts = job.attempts + 1
-                        claimed_job = (
-                            job.id,
-                            job.type,
-                            job.payload,
-                            current_attempts,
-                            current_generation,
-                        )
-                        print(
-                            f"[{WORKER_ID}] Claimed job_id={job.id} worker_id={WORKER_ID} claim_generation={current_generation} attempt={current_attempts} rowcount=1 event=claim. Status is now 'running'.",
-                            flush=True,
-                        )
+                        if current_generation is None:
+                            print(
+                                f"[{WORKER_ID}] Conflict: Job {job.id} was claimed by another writer (rowcount=0).",
+                                flush=True,
+                            )
+                        else:
+                            current_attempts = job.attempts + 1
+                            claimed_job = (
+                                job.id,
+                                job.type,
+                                job.payload,
+                                current_attempts,
+                                current_generation,
+                            )
+                            print(
+                                f"[{WORKER_ID}] Claimed job_id={job.id} worker_id={WORKER_ID} claim_generation={current_generation} attempt={current_attempts} rowcount=1 event=claim. Status is now 'running'.",
+                                flush=True,
+                            )
+        except Exception as exc:
+            print(
+                f"[{WORKER_ID}] Claim poll failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            claimed_job = None
 
         if not claimed_job:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
