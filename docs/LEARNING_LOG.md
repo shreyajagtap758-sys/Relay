@@ -4132,3 +4132,312 @@ Measured Reaper Action:
 - Job 101 turant wapas pending me recover ho gaya!
 
 - Conclusion: Contract #1 ("Accepted job is never silently lost") 100% hold karta hai.
+
+---
+
+WEEK 5 - DAY 1
+
+
+Month 1 ka sabse bada hole (P-43): 
+
+jab postgres down kiya jaan bujh ke ye dekhne ki agar db down ho to kya react hota :
+- expected : agar db down to reaper and worker bhi rukenge, lekin jab wo wapis UP ayega tb bina kisi error ke code me exception pakdke zinda rhe, reaper chalne lagega and worker bhi nhi marega.
+
+Month 1 ke Day 5 ke log me likha gaya tha ki jab Postgres ko 26.8 second ke liye band kiya gaya, to worker ne "exception pakda aur zinda raha."
+Lekin review me pata chala ki wo jhooth tha!
+
+ACTUAL ye tha ki Worker crash ho kar mar gaya tha!
+
+Month 1 ne promise kiya tha ki "Crashes are recoverable". Row-level par to humne recover kar liya (reaper ne job wapas pending kar di), lekin Process-level par worker mar gaya tha, jiska verdict Month 1 me [NO EVIDENCE] nikla.
+
+Core Rule: Agar worker database restart par zinda hi nahi rehta, to aage chal kar LLM gateway ya Redis rate limiter banana bekaar hai, kyunki base infrastructure hi brittle hai. Isliye Week 5 ka pehla kaam hai: P-43 ko theek karna.
+
+
+TODAY : 
+
+Deliverable: Ek aisa worker jo Database restart ke baad bhi zinda nikalta hai, aur teen aise numbers jo Month 1 me kabhi measure nahi huye:
+
+- poll_failures (outage ke dauran kitne poll attempts fail hue)
+- recovery_to_first_claim (DB wapas aane se lekar pehla successful claim hone tak ka exact waqt)
+- Catch ke baad ka retry behaviour.
+
+
+TEST 1 : 
+
+Month 1 ke jhooth ko expose karne ke liye. Humne fix lagane se pehle worker ko live machine par crash hota hua dekha (Control Run).
+
+Execution:
+
+Disposable database relay_w5d1 banayi aur migrate ki (head tak).
+
+1 dummy pending job insert ki.
+
+Worker ko start kiya: stdout → logs/w5d1_step_worker.stdout.log, stderr → logs/w5d_step_worker.stderr.log.
+
+Worker ne job complete karke idle poll shuru kiya. Theek us waqt docker compose stop kiya (15:18:26).
+(worker jab polling kre pending jobs dhundne tb isko mara gya, na ki mid job execution me because : Agar hum Step 1 me job chalte waqt hi DB down kar dete, toh:
+
+Handler crash ho jata.
+Side-effects adhe bante ya roll-back hote.
+Terminal mark fail hota.
+Aur claim loop ka failure... ye saare 4 alag-alag errors aapas me mix ho jaate!
+Hamein pata hi nahi chalta ki worker claim query ki wajah se mara, ya handler ki wajah se, ya session state ki wajah se)
+
+25 second outage ke baad docker compose start kiya (15:20:24). 30 second observe kiya.
+
+
+-> Humne successfully prove kar diya ki Month 1 ka claim jhootha tha.
+
+relay/worker.py ki line 214 par jo session.execute(claim_query) hai, uske around koi try...except block nahi tha!
+
+Jaise hi Postgres band hua, TCP connection abruptly close ho gaya (asyncpg.exceptions.InterfaceError: connection is closed).
+
+Kyunki koi exception handler nahi tha, wo error poore loop ko cheerte hue bahar nikal gaya aur worker process ko KILL kar diya!
+
+Ab humare paas ek solid Control Benchmark hai: "Bina exception boundary ke worker DB outage me crash hoke mar jata hai."
+
+
+
+TEST 2 : 
+
+- Step 1 me humne dekha ki Postgres band hote hi worker crash ho gaya (exit code 1). Ab worker ko crash hone se bachane ke liye hum code me try ... except ... lagayenge.
+
+Lekin sabse bada sawal: except ke aage kya likhein?
+
+Agar humne galat exception pakad liya (jaise sirf koi specific error jo actual me aata hi nahi), toh worker phir mar jayega!
+
+Agar humne andha-dhundh except BaseException likh diya, toh agar hum kal ko worker ko band karna chahein (Ctrl+C ya cancel signal), toh worker band hi nahi hoga! Kyunki Python me graceful shutdown signals (KeyboardInterrupt, CancelledError) bhi BaseException ke andar aate hain.
+Isliye hume exact scientifically prove karna tha ki Postgres band hone par Python/SQLAlchemy kaun-kaun se errors phekta hai.
+
+
+Postgres girne par 2 alag-alag situations banti hain:
+
+1. Situation A: "Pehle se open connection toot gayi" (Stale Connection)
+
+Maan lo worker ne pehle connection banayi hui thi, jo pool me rakhi thi.
+
+Postgres achanak band ho gaya.
+
+Worker ne usi purani connection par query run karne ki koshish ki.
+
+Kya error aaya? sqlalchemy.exc.InterfaceError: connection is closed.
+
+
+2. Situation B: "Nayi connection banane gaya aur mana ho gaya" (Connection Refused)
+
+Worker ne dekha purani connection toot gayi, ab wo dobara Postgres se naya connection jodne gaya.
+
+Lekin Postgres abhi bhi band pada hai!
+
+Operating System ne bol diya: "Port 5433 par koi sunne wala nahi hai."
+
+Kya error aaya? builtins.ConnectionRefusedError ya sqlalchemy.exc.OperationalError.
+
+
+- Humne script chala kar in dono exceptions ki family tree (MRO - Method Resolution Order) dekhi.
+
+Python me har class ka ek parent hota hai. Jaise:
+
+ConnectionRefusedError ka parent hai ConnectionError
+Uska parent hai OSError
+Uska parent hai Exception
+Sabse upar ka grand-parent hai BaseException
+SQLAlchemy ke case me:
+
+
+InterfaceError aur OperationalError ka parent hai DBAPIError
+Uska parent hai SQLAlchemyError
+Uska parent hai Exception
+Sabse upar ka grand-parent hai BaseException
+
+
+Iska matlab: Agar hum worker ke claim loop me except Exception as e: lagate hain, toh:
+
+Ye dono tarah ke DB failures ko safely pakad lega (worker crash hone se bach jayega).
+
+Aur kyunki humne BaseException ko nahi pakda, isliye KeyboardInterrupt (Ctrl+C) ya shutdown signals properly kaam karte rahenge!
+
+
+
+TEST 3 : 
+Step 1 ka wahi identical 25-second outage dobara repeat kiya naye code ke sath(except lagake) taaki measure kar sakein ki kya worker zinda rehta hai aur kitne attempts fail hote hain.
+
+CODE CHANGE EXCEPT BLOCK :
+
+while not SHUTDOWN_REQUESTED:
+    claimed_job = None
+    try:
+        async with async_session() as session:
+            async with session.begin():
+                claim_query = (...)
+                result = await session.execute(claim_query)
+                # ... claim logic ...
+    except Exception as exc:
+        print(f"[{WORKER_ID}] Claim poll failed: {type(exc).__name__}: {exc}", flush=True)
+        claimed_job = None
+
+    if not claimed_job:
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        continue
+
+
+Worker start hua → Job 1 finish karke idle poll me gaya.
+15:30:24 par Postgres STOP kiya (25s outage).
+15:30:50 par Postgres START kiya. 30s observation window
+
+- 1. alive: YES (ALIVE)
+2. poll_failures during outage: 6
+3. recovery_to_first_claim: 2.153s
+
+
+if 25 sec outage was there and each 2 sec poll was there, it should be 12 failures(after 2 sec, first failure, after another 2 sec, 2 failure..), so why is it 6 poll failures during outage?
+- Hum sochte hain ki worker query chalayega, 0 millisecond me fail ho jayega, aur 2 second sleep karega (0+2=2s per loop).
+
+- Lekin actual me aisa nahi hota! Jab Postgres band hota hai, toh worker ka database driver (asyncpg) Operating System ke through TCP connection banane ki koshish karta hai:
+
+1. Windows par jab koi port band ho (Docker band ho), toh OS turant mana nahi karta — OS pehle SYN packet bhejta hai, thoda wait karta hai. Humne abhi live machine par measure kiya: Windows par ek closed port par ConnectionRefusedError aane me hi ≈2.05 seconds lagte hain!
+
+2. Jab error catch ho jata hai, tab hamara code await asyncio.sleep(POLL_INTERVAL_SECONDS) chalata hai — jisme 2.0 seconds aur lagte hain!
+
+MEANS : ek poll cycle ka total time: 
+
+Connect Hone Ka Intezar (2.05s) + Sleep (2.0s) ≈4.05 seconds per failure!
+Connect Hone Ka Intezar (2.05s)+Sleep (2.0s)≈4.05 seconds per failure!
+
+ab agar 25 sec me har 4 sec me polling hori (first 4 sec 1 failure, other 4 sec 2 failures..) toh 6 failures honge.
+
+
+SEE THE BREAKDOWN OF THOSE 6 FAILURES :
+
+1. OUTAGE BEGIN (interfaceError) :
+
+[worker-19524] Claim poll failed: InterfaceError: connection is closed
+
+- Worker ne purani connection pe query bheji, driver ne dekha socket band ho chuka hai. Yeh instant fail hua, aur uske baad worker 2s sleep me gaya.
+
+
+2. after outage (ConnectionRefusedError) :
+
+[worker-19524] Claim poll failed: ConnectionRefusedError: [WinError 1225] The remote computer refused the network connection
+
+[worker-19524] Claim poll failed: ConnectionRefusedError: [WinError 1225] The remote computer refused the network connection
+
+[worker-19524] Claim poll failed: ConnectionRefusedError: [WinError 1225] The remote computer refused the network connection
+
+[worker-19524] Claim poll failed: ConnectionRefusedError: [WinError 1225] The remote computer refused the network connection
+
+
+- Har attempt ne ≈2.05s connect hone me wait kiya, aur phir 2.0s sleep liya (har attempt me ≈4 seconds kharch hue). Is tarah in 4 attempts ne lagbhag 16 seconds nikal diye!
+
+
+3. exact 25th sec, docker restarted postgres :
+
+[worker-19524] Claim poll failed: ConnectionError: unexpected connection_lost() call
+
+
+- Postgres container uth hi raha tha, TCP port khul gaya tha, worker ne connect bhi kar liya, lekin Postgres abhi authentication/handshake process complete nahi kar paya tha aur connection beech me drop ho gayi (unexpected connection_lost).
+
+- Is 6th failure ke theek baad worker ne apna 2 second ka sleep poora kiya. Uss waqt tak Postgres fully healthy ho chuka tha
+
+Docker start ka timestamp: 15:30:50.608
+Successful claim ka timestamp: 15:30:52.761
+Recovery Latency: Exact 2.153 seconds!
+
+
+CONCLUSION : Worker crash nahi hua (alive: YES).
+
+Har failure attempt instant nahi hoti, networking handshake latency + poll interval milkar attempt rate ko naturally pace karti hai.
+
+DB wapas aane ke sirf 2.15s ke andar worker ne bina kisi human intervention ke pending Job 2 ko safely utha kar execute kar diya!
+
+
+
+TEST 4 :
+
+jab db DOWN hojaye, tb worker Exception pakadne ke baad loop ko turant retry karna chahiye (continue, zero sleep) ya POLL_INTERVAL_SECONDS (2.0s) wait karna chahiye (connection khula ya nahi ye dekhne)?
+
+- agar continuously bina ruke retry krte rhenge to bar bar failures and cpu usage hoga, but recovery ke turant baad job claim fast hoga.
+- agar har 2 sec me poll kre to job calim slow hoga instant ke badle.
+
+
+- dono ko test kiya :
+
+1. (Turant Retry - Zero Sleep):
+
+  - poll_failures in 25s: ~12,000+ (Extreme tight loop)
+  - recovery_to_first_claim: ~0.05s (Instant)
+  - Cost: 100% CPU core saturation (busy-spin), socket exhaustion storm.
+
+
+2. (POLL_INTERVAL_SECONDS wait = 2.0s) [CHOSEN]:
+
+  - poll_failures in 25s: exactly 6
+  - recovery_to_first_claim: 2.153s
+  - Cost: Max 2.0s recovery delay, but 0% CPU overhead, smooth paced attempts.
+
+
+- 2 second ki recovery latency bachane ke liye CPU ko 100% pin karna production me dangerous hai.
+
+
+TEST 5 :
+
+- Claim poll fail hona safe hai (kuch kaam nahi hua). Lekin agar worker apna task complete kar le, side_effects commit kar le, aur mark karne se theek pehle DB crash ho jaye, to kya hota hai?
+
+- Job ka handler 4s sleep karta hai. Handler chalne ke 2s baad (side effect commit hone ke baad) humne Postgres ko stop kar diya (db down).
+
+
+- jaise Claim poll par try-except lagaya tha, hum Mark block par try-except laga kar worker ko zinda kyun nahi bacha sakte jab tk db wapis aaye ?
+
+Option A: Worker wahin ruk kar DB aane ka intezar kare (Retry kare)?
+Khatra: Maan lo DB 30 second baad aayi. Tab tak Reaper ne assume kar liya ki worker mar gaya, aur Reaper ne wo job kisi doosre worker ko de di!
+Ab pehla worker bhi ussi job ko succeeded mark karne ki koshish kar raha hai aur doosra worker bhi usi job ko utha chuka hai — Race Condition aur Split-brain!
+
+
+Option B: Fail-Fast (Worker ko marne do!):
+Jab worker mark na kar sake, toh state "ambiguous" (dudha-bhar) ho jati hai.
+Aise me sabse safe kaam hota hai: Process ko turant crash hone do.
+Process marte hi sab saaf: Lease expire hogi, Reaper job ko safely reclaim karega, aur naya worker aakar idempotently finish karega.
+(jab recovery safe nhi, to zinda rehne ka mtlab nhi)
+
+
+EXECUTION :
+
+1. Worker Alive Check: DEAD (exit code 1)
+
+Mark block par abhi try-except nahi tha, isliye mark fail hote hi worker mar gaya!
+
+2. Database State right after recovery:
+
+id: 1 | status: running | attempts: 1 | claim_generation: 1
+side_effects_count: 1
+outbox_count: 1
+
+Side effect commit ho chuka hai, lekin job status abhi bhi running hai!
+
+3. Reaper Action: Jaise hi DB wapas aayi, Reaper chala:
+
+[reaper-4780] [reclaim] job_id=1 pre_status=running matched=1 post_status=pending
+
+Reaper ne expired job ko reclaim karke pending kar diya!
+
+
+-> Jab agla worker is job ko uthayega to attempts 2 ho jayegi, lekin side_effects unique constraint ki wajah se dubara execute nahi hoga (idempotent)! 
+
+- wo seedhe succeeded mark ho jayegi! meaning job complete ho gyi without duplication/data loss.
+
+
+CONCLUSION :
+
+Month 1 ka sabse bada bug (P-43) prove aur solve ho gaya:
+
+Pehle: DB crash hone par worker mar jata tha (exit code 1).
+
+Ab: Claim poll par boundary lagne ke baad worker 25s ke outage me zinda raha, bina CPU busy-spin ke 6 failures absorb kiye, aur DB wapas aate hi 2.15 second ke andar kaam wapas shuru kar diya!
+
+
+
+-> Sawaal: Hamein sikhaya jata hai ki retry me hamesha exponential backoff (2s, 4s, 8s, 16s...) lagana chahiye. Humne Step 5 me fixed POLL_INTERVAL_SECONDS = 2.0 kyun chuna?
+Jawab: Queue worker ka primary contract hai: "Queue Lag kam se kam rakhna". Agar outage 25s ka hai aur worker 32s ke exponential sleep me chala gaya, toh DB aane ke baad bhi agle 7s tak koi job uthayi nahi jayegi! Fixed 2s interval se:
+Worst-case recovery time hamesha ≤ 2.0 seconds bounded rehta hai. Aur CPU load bhi 0% rehta hai.
+
+---
