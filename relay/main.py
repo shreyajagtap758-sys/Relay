@@ -139,6 +139,11 @@ async def get_job_status(
             detail="Job not found."
         )
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.get("/healthz")
 async def healthz(db: AsyncSession = Depends(get_db)):
     try:
@@ -149,6 +154,18 @@ async def healthz(db: AsyncSession = Depends(get_db)):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"database_unreachable: {type(exc).__name__}: {exc}",
         )
+
+
+@app.get("/db-ping")
+async def db_ping(db: AsyncSession = Depends(get_db)):
+    await db.execute(text("SELECT 1"))
+    return {"status": "ok"}
+
+
+@app.get("/slow-hold")
+async def slow_hold(seconds: float = 4.0, db: AsyncSession = Depends(get_db)):
+    await db.execute(text("SELECT pg_sleep(:s)"), {"s": seconds})
+    return {"status": "ok", "held": seconds}
 
 
 # result : {"id":1,"type":"send_email","payload":{"to":"vikas@example.com"},"status":"pending","attempts":0,"created_at":"2026-08-15T19:30:03.022215Z","updated_at":"2026-08-15T19:30:03.022215Z"}
