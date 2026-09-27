@@ -156,10 +156,6 @@ async def healthz(db: AsyncSession = Depends(get_db)):
         )
 
 
-@app.get("/db-ping")
-async def db_ping(db: AsyncSession = Depends(get_db)):
-    await db.execute(text("SELECT 1"))
-    return {"status": "ok"}
 
 
 @app.get("/slow-hold")
