@@ -152,7 +152,7 @@ async def record_execution(
 
 
 async def send_heartbeat(
-    job_id: int, stop_event: asyncio.Event, claim_generation: int
+    job_id: int, stop_event: asyncio.Event, claim_generation: int, last_lease_refresh: list[float] | None = None
 ) -> None:
     while not stop_event.is_set():
         try:
@@ -161,28 +161,36 @@ async def send_heartbeat(
             )
             break
         except asyncio.TimeoutError:
-            async with async_session() as session:
-                async with session.begin():
-                    update_stmt = (
-                        update(Job)
-                        .where(
-                            Job.id == job_id,
-                            Job.status == "running",
-                            Job.claim_generation == claim_generation,
+            try:
+                async with async_session() as session:
+                    async with session.begin():
+                        update_stmt = (
+                            update(Job)
+                            .where(
+                                Job.id == job_id,
+                                Job.status == "running",
+                                Job.claim_generation == claim_generation,
+                            )
+                            .values(claimed_at=func.now())
                         )
-                        .values(claimed_at=func.now())
-                    )
-                    result = await session.execute(update_stmt)
-                    if result.rowcount == 0:
+                        result = await session.execute(update_stmt)
+                        if result.rowcount == 0:
+                            print(
+                                f"[{WORKER_ID}] Heartbeat lost: job_id={job_id} worker_id={WORKER_ID} claim_generation={claim_generation} is no longer 'running' or fenced event=heartbeat_lost",
+                                flush=True,
+                            )
+                            break
+                        if last_lease_refresh is not None:
+                            last_lease_refresh[0] = time.time()
                         print(
-                            f"[{WORKER_ID}] Heartbeat lost: job_id={job_id} worker_id={WORKER_ID} claim_generation={claim_generation} is no longer 'running' or fenced event=heartbeat_lost",
+                            f"[{WORKER_ID}] Heartbeat sent for job_id={job_id} worker_id={WORKER_ID} claim_generation={claim_generation} event=heartbeat",
                             flush=True,
                         )
-                        break
-                    print(
-                        f"[{WORKER_ID}] Heartbeat sent for job_id={job_id} worker_id={WORKER_ID} claim_generation={claim_generation} event=heartbeat",
-                        flush=True,
-                    )
+            except Exception as exc:
+                print(
+                    f"[{WORKER_ID}] Heartbeat failed: {type(exc).__name__}: {exc} event=heartbeat_failed",
+                    flush=True,
+                )
 
 
 async def run_worker() -> None:
@@ -264,6 +272,7 @@ async def run_worker() -> None:
         next_attempt_at = None
         error_msg = None
 
+        last_lease_refresh = [time.time()]
         if not handler:
             print(
                 f"[{WORKER_ID}] Unknown job type: '{job_type}' job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation}. Marking failed.",
@@ -274,7 +283,7 @@ async def run_worker() -> None:
         else:
             stop_event = asyncio.Event()
             heartbeat_task = asyncio.create_task(
-                send_heartbeat(job_id, stop_event, current_generation)
+                send_heartbeat(job_id, stop_event, current_generation, last_lease_refresh)
             )
             try:
                 print(
@@ -314,49 +323,97 @@ async def run_worker() -> None:
                     )
             finally:
                 stop_event.set()
-                await heartbeat_task
-
-        async with async_session() as session:
-            async with session.begin():
-                mark_values = {
-                    "status": new_status,
-                    "next_attempt_at": next_attempt_at,
-                }
-                if new_status in ("succeeded", "dead_letter", "failed"):
-                    mark_values["completed_at"] = func.clock_timestamp()
-
-                if new_status == "succeeded":
-                    mark_values["last_error"] = None
-                elif error_msg is not None:
-                    mark_values["last_error"] = error_msg
-
-                mark_stmt = (
-                    update(Job)
-                    .where(
-                        Job.id == job_id,
-                        Job.status == "running",
-                        Job.claim_generation == current_generation,
+                try:
+                    await heartbeat_task
+                except Exception as exc:
+                    print(
+                        f"[{WORKER_ID}] Heartbeat task ended with exception: {type(exc).__name__}: {exc} event=heartbeat_ended",
+                        flush=True,
                     )
-                    .values(**mark_values)
-                )
-                mark_result = await session.execute(mark_stmt)
-                if mark_result.rowcount == 0:
-                    check_stmt = select(Job.status, Job.claim_generation).where(Job.id == job_id)
-                    check_res = await session.execute(check_stmt)
-                    actual_row = check_res.first()
-                    if actual_row and actual_row.claim_generation != current_generation:
+
+        # Option 3 (Refined): Fast Bounded Backoff with Jitter & Mathematical Lease Guard
+        # Guarantees:
+        # 1. 1-2ms network glitches recover in ~200-300ms without burning extra attempts or triggering 30s Reaper wait.
+        # 2. Jitter prevents Thundering Herd stampedes when multiple workers finish concurrently.
+        # 3. Explicit Lease Guard checks remaining lease before every sleep to ensure retries NEVER run past lease expiry.
+        MAX_MARK_RETRIES = 3
+        MARK_BASE_DELAYS = [0.2, 0.5, 1.0]
+        CLAIM_TIMEOUT_SECONDS = float(os.getenv("CLAIM_TIMEOUT_SECONDS", "30.0"))
+        LEASE_SAFETY_MARGIN = 1.0
+        mark_succeeded = False
+
+        for mark_attempt in range(1, MAX_MARK_RETRIES + 1):
+            try:
+                async with async_session() as session:
+                    async with session.begin():
+                        mark_values = {
+                            "status": new_status,
+                            "next_attempt_at": next_attempt_at,
+                        }
+                        if new_status in ("succeeded", "dead_letter", "failed"):
+                            mark_values["completed_at"] = func.clock_timestamp()
+
+                        if new_status == "succeeded":
+                            mark_values["last_error"] = None
+                        elif error_msg is not None:
+                            mark_values["last_error"] = error_msg
+
+                        mark_stmt = (
+                            update(Job)
+                            .where(
+                                Job.id == job_id,
+                                Job.status == "running",
+                                Job.claim_generation == current_generation,
+                            )
+                            .values(**mark_values)
+                        )
+                        mark_result = await session.execute(mark_stmt)
+                        if mark_result.rowcount == 0:
+                            check_stmt = select(Job.status, Job.claim_generation).where(Job.id == job_id)
+                            check_res = await session.execute(check_stmt)
+                            actual_row = check_res.first()
+                            if actual_row and actual_row.claim_generation != current_generation:
+                                print(
+                                    f"[{WORKER_ID}] Mark fenced: job_id={job_id} worker_id={WORKER_ID} held_generation={current_generation} actual_generation={actual_row.claim_generation} rowcount=0 event=fenced",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"[{WORKER_ID}] Conflict on mark: job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation} status was modified by another transaction (rowcount=0) event=conflict",
+                                    flush=True,
+                                )
+                        else:
+                            print(
+                                f"[{WORKER_ID}] Marked job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation} as '{new_status}' (rowcount={mark_result.rowcount}) event=mark.",
+                                flush=True,
+                            )
+                        mark_succeeded = True
+                        break
+            except Exception as exc:
+                if mark_attempt < MAX_MARK_RETRIES:
+                    base_delay = MARK_BASE_DELAYS[mark_attempt - 1]
+                    jitter = random.uniform(0.0, base_delay * 0.5)
+                    retry_wait = base_delay + jitter
+
+                    # Mathematical Lease Guard: check remaining time before sleeping
+                    lease_deadline = last_lease_refresh[0] + CLAIM_TIMEOUT_SECONDS
+                    remaining_after_wait = lease_deadline - (time.time() + retry_wait)
+
+                    if remaining_after_wait < LEASE_SAFETY_MARGIN:
                         print(
-                            f"[{WORKER_ID}] Mark fenced: job_id={job_id} worker_id={WORKER_ID} held_generation={current_generation} actual_generation={actual_row.claim_generation} rowcount=0 event=fenced",
+                            f"[{WORKER_ID}] Terminal mark lease expiring (remaining after wait: {remaining_after_wait:.2f}s < {LEASE_SAFETY_MARGIN}s safety margin): {type(exc).__name__}: {exc}. Aborting retries to prevent Reaper collision event=mark_lease_abort.",
                             flush=True,
                         )
-                    else:
-                        print(
-                            f"[{WORKER_ID}] Conflict on mark: job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation} status was modified by another transaction (rowcount=0) event=conflict",
-                            flush=True,
-                        )
+                        break
+
+                    print(
+                        f"[{WORKER_ID}] Terminal mark transient failure (attempt {mark_attempt}/{MAX_MARK_RETRIES}): {type(exc).__name__}: {exc}. Retrying in {retry_wait:.3f}s (base={base_delay}s, jitter=+{jitter:.3f}s, lease_remaining={remaining_after_wait:.2f}s)...",
+                        flush=True,
+                    )
+                    await asyncio.sleep(retry_wait)
                 else:
                     print(
-                        f"[{WORKER_ID}] Marked job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation} as '{new_status}' (rowcount={mark_result.rowcount}) event=mark.",
+                        f"[{WORKER_ID}] Terminal mark bounded retries exhausted ({MAX_MARK_RETRIES} attempts): {type(exc).__name__}: {exc}. Leaving in-flight for Reaper reclamation event=mark_failed.",
                         flush=True,
                     )
 

@@ -1641,3 +1641,196 @@ It then ran against `relay`. **`sink_deliveries` went from `10` rows to `7`** `[
 **Owner:** Din 6 records the `-3` explicitly in the reconcile chain's `sink_deliveries` bucket — the chain will not join otherwise, and this is exactly the case Din 6's Q1 asks about. `D-27` carries the cost line (delivery identity, and the fact that the receiver's dedup fix consumed the evidence for the problem it fixed). The migration-hygiene rule is Month 2 and applies to future revisions, **not** a rewrite of `w4d4_sink_unique`, which has already run everywhere it will ever run.
 
 ---
+
+## P-47 — Five `docs/` subtrees are gitignored, so the frozen prediction seals, every BRIEF/KEY, all four handoffs, and `CURRENT_WEEK.md` exist only on one machine — and three tracked files now link to them
+
+**Status: MEASURED on Week 4 Din 6 close, at commit time.** `git status --porcelain` after a full day of documentation edits listed **five** files. The Month 1 handoff and the week pointer were not among them. `git check-ignore -v` names the cause:
+
+```text
+.gitignore:45:docs/daily/     docs/daily/WEEK_04_HANDOFF.md
+.gitignore:47:docs/roadmap/   docs/roadmap/CURRENT_WEEK.md
+```
+
+`.gitignore` excludes `docs/planning/`, `docs/daily/`, `docs/ddia_summaries/`, `docs/roadmap/`, and `docs/design/`. `git ls-files docs/` returns **twelve** files: the five root documents (`DECISIONS`, `PROBLEMS`, `POSTMORTEMS`, `LEARNING_LOG`, `MAP`), five weekly logs, and two DSA files. **Everything else under `docs/` — 90 files by count — is local-only** `[MEASURED 2026-09-11]`.
+
+**What that means for the artefact this month was spent building.** `WEEK_01_HANDOFF.md` through `WEEK_04_HANDOFF.md` are not in the repository. Neither are the twenty-nine `DIN_NN_BRIEF.md`/`DIN_NN_KEY.md` pairs, the twelve `PREDICTIONS_FROZEN.md` files, the six `DIN_NN_DESIGN.md` files, `CURRENT_WEEK.md`, `BACKEND_ROADMAP.md`, `BACKEND_ROADMAP_PART2.md`, or `DDIA_CH8_LINKS.md`. A `git clone` of Relay contains the decisions, the problems, the weekly logs, and the README — and none of the machinery that produced them.
+
+**The frozen seal is the sharpest case, and it is a verification rather than a convenience.** The whole prediction discipline rests on `DIN_NN_PREDICTIONS_FROZEN.md` being immutable, and it is checked by hashing the file at C0 and again at C6 — Din 6's seal is `934764139408B2DAFBEC93CCA2BD8385FFEF2B105F75752F275A0296C82C9D97`, verified unchanged. **That hash is compared against a shell variable from the same session, on a file no commit contains.** The seal is real and it is unauditable by anyone else, including this machine after a `git clean`. The same argument `P-45` makes about three missing log artifacts applies to twelve frozen files, and those twelve are load-bearing for every score in `logs/`.
+
+**Three tracked files now point at untracked ones, which is how the gap became visible.** Din 6 added links to `daily/WEEK_04_HANDOFF.md` from `LEARNING_LOG.md`'s Week 4 row and its open-items table, from `MAP.md`'s Month 1 close section, and from `roadmap/CURRENT_WEEK.md` (itself untracked). Every one of those is a dead link in a clone. Previous weeks have the same defect and it went unnoticed because nothing tracked linked to a handoff until today.
+
+**Why this is `P-47` and not a `.gitignore` typo.** The exclusions are deliberate and three of them have a defensible reason: `docs/daily/` holds **sealed KEY files**, and a KEY in a public repository defeats the seal rule for anyone reading the repo to learn from it. `docs/planning/` and `docs/design/` are working notes. So the honest framing is a **classification** problem rather than a mistake — the directory is the unit of exclusion, and it bundles *"must not be published"* (KEYs) with *"must be published"* (handoffs, frozen seals, the week pointer, the DDIA links). **A rule whose unit is coarser than the distinction it is enforcing will always be wrong in one direction.**
+
+**Options, and each is a real trade.** (1) Split the directory: `docs/daily/**/KEY*` stays ignored, everything else under `docs/daily/` is tracked — cheapest, and it makes the ignore rule express the actual invariant. (2) Track handoffs and frozen files by moving them out of the ignored subtrees (`docs/handoffs/`, `docs/frozen/`) — clearer paths, and it breaks every existing relative link. (3) Force-add the specific files with `git add -f` — works today and drifts tomorrow, because the next handoff will be ignored again. (4) Leave it and delete the three new links instead — honest, and it discards the artifact.
+
+**What must not happen is option (3) performed silently**, or a README that keeps linking to files a clone does not have.
+
+**And there is a forward-looking half that bites in Month 2's first week, measured while staging this commit.** `.gitignore:39` is the bare pattern `logs/`, which matches `docs/logs/` as well as the repository-root `logs/`. `git add docs/logs/WEEK_04.md` succeeded only because that file is **already tracked**, and a tracked path overrides an ignore rule — `git status` even printed *"The following paths are ignored: docs/logs"* while staging the file inside it. The five existing weekly logs are therefore tracked by accident of history, not by rule. Checked directly:
+
+```text
+git check-ignore -v docs/logs/WEEK_05.md   ->  .gitignore:39:logs/   docs/logs/WEEK_05.md
+git check-ignore -v docs/logs/WEEK_04.md   ->  (no output — tracked, so the rule does not apply)
+```
+
+**So Month 2's first new log file will be invisible to `git status` and will be silently absent from every commit** `[MEASURED 2026-09-11]`. Five weeks of daily logs are the one artifact this project has produced continuously, and the rule that would drop the sixth is already in place. The one-character fix is anchoring the pattern (`/logs/`); doing it as part of the same retention decision is what keeps this from being three separate edits.
+
+**Owner:** Month 2, with `P-45` and `P-29` — all three are the same root cause seen from three angles (`logs/` ignored, probe scripts not retained, `docs/` subtrees ignored), and a single retention decision resolves all three. **The anchored-pattern half is the highest priority of the three**, because it is the only one that will destroy evidence that does not exist yet rather than evidence already lost. **Not fixed on Din 6:** changing `.gitignore` is a repository-policy decision about what becomes public, it is not this reviewer's call to make unasked, and Din 6's own gate forbids widening scope at close. Din 6's commit therefore carries the five tracked files and this card, and **records that the handoff it just wrote is not in it.**
+
+---
+
+## P-48 — The Din 1 boundary moved the worker's death from line `185` to line `305`: the terminal mark is still unguarded, and the heartbeat can kill the process from inside a `finally`
+
+**Status: MEASURED-R on Week 5 Din 1 (`2026-09-24`), reviewer's own run in disposable database `relay_w5d1r`.
+Logs retained: `logs/w5d1r_step6_workerA.{stdout,stderr}.log`, `logs/w5d1r_step6_reaper.stdout.log`,
+`logs/w5d1r_step6_workerB.stdout.log`.**
+
+Week 5 Din 1 put an `except Exception` around the claim poll and measured the worker surviving a `26.373 s`
+outage with `5` failed polls (`D-30`). **That is a real improvement and it is narrower than it reads.** The same
+day's Step 6 stopped Postgres **after** the handler's `side_effects` + `outbox` COMMIT and **before** the
+terminal mark. The worker died:
+
+```
+File "D:\PROJECTS\relay\src\worker.py", line 328, in <module>
+File "D:\PROJECTS\relay\src\worker.py", line 305, in run_worker
+sqlalchemy.exc.InterfaceError: (... asyncpg.InterfaceError) ... connection is closed
+```
+
+Line `305` is `mark_result = await session.execute(mark_stmt)`. `stderr` was `9445` bytes. **The crash did not
+go away; it moved to the next unguarded statement.** For an idle worker the boundary covers almost all of its
+time, which is why it was the right first edit — but for a job in flight, a blip is still fatal, and the fatal
+window is exactly the one where the side effect is already committed and the lifecycle write is not.
+
+**What it leaves behind, measured:** `job | 1 | running | attempts = 1 | claim_generation = 1` with a live
+`claimed_at`; `side_effects = 1`; `outbox = 1`; `job_executions = 1`. Nothing restarted the worker
+(`WORKER_A_STATUS_AFTER_RESTART=DEAD`). Recovery required a human launching a reaper and a second worker, after
+which the reaper reclaimed (`matched=1 post_status=pending pre_generation=1 post_generation=1` — the reaper still
+does not advance the generation, `D-26` holds), the second worker claimed at `generation=2, attempt=2`, the
+repeat insert returned `rowcount=0`, `side_effects_id_seq.last_value` advanced to `2` on that no-op (`P-46`'s
+shape, third occurrence), `job_executions` reached `2` rows at generations `1` and `2`, and the job reached
+`succeeded`. **Final: `attempts = 2` for one fault.** That makes `D-26`'s `Cost 6` `[MEASURED]` rather than
+`[NOT TESTED]`: at `MAX_ATTEMPTS = 3`, two such outages dead-letter a healthy job.
+
+**The second half of this entry has no measurement yet and it is the more interesting one.** `send_heartbeat`'s
+`except asyncio.TimeoutError:` branch opens a full session and runs an `UPDATE` with **no `try` around it**, and
+`run_worker`'s `finally: stop_event.set(); await heartbeat_task` re-raises whatever that task raised — **from
+inside a `finally`**, which means it propagates regardless of how the handler block exited. So for any job whose
+handler outlives `HEARTBEAT_INTERVAL_SECONDS = 10`, an outage should kill the worker at a **third** line, before
+it ever reaches the mark at `305`. `[INFERRED from source]` `[NOT TESTED]` — Din 1's Step 6 deliberately used
+`payload {"seconds": 8.0}`, under the heartbeat interval, so the mark could be isolated as the death point. The
+run that would settle it is one job with `seconds > 10` and an outage starting before the first heartbeat.
+
+**Why this is `P-48` and not an amendment to `P-43`.** `P-43` is *"there is no boundary and no supervisor."*
+Half of that is now false. What remains is a different and sharper statement: **a per-iteration boundary's scope
+is its `try`'s scope, and Relay's worker has at least two more unguarded database statements on the path after a
+claim** — the mark (measured) and the heartbeat (inferred). Recording it under `P-43` would let the fix read as
+complete because the headline claim changed.
+
+**Owner:** Week 5 Din 2 for both. The mark is **not** the same decision as the claim, and Din 1's BRIEF said so
+before the measurement existed: a failed claim means nothing happened and a retry is free, while a failed mark
+means the side effect is committed and the lifecycle write is lost. The two live options are *lose the mark and
+let the reaper redispatch* (measured above: `attempts = 2`, and it is the current behaviour once the crash is
+caught) versus *retry the mark until the database returns* (`attempts = 1`, and the worker is pinned to one job
+while its lease keeps running on a heartbeat that is also failing). **Neither is free and Din 1 measured only
+the first.**
+
+---
+
+## P-49 — `docker-compose.yml` was changed outside the day's scope to pin the Postgres data directory to a machine-local `external` volume, and the change is genuinely two-sided
+
+**Status: MEASURED-R on Week 5 Din 1 (`2026-09-24`), `git diff` plus `docker inspect`.** Din 1's summary
+reported *"Git diff: sirf `src/worker.py` me claim boundary modified hai."* `git diff` shows a second modified
+file:
+
+```yaml
+    volumes:
+      - relay_data:/var/lib/postgresql/data
+
+volumes:
+  relay_data:
+    external: true
+    name: fce3921d0991139c305837a9f17a1d2945985c349604915b79e3fe6830bad18c
+```
+
+`docker inspect` on the running container confirms that hash **is** the volume currently mounted at
+`/var/lib/postgresql/data`, and `docker volume ls` confirms it exists. So the change is correct on this machine
+and describes reality rather than altering it.
+
+**And it is not a harmless cleanup in either direction, which is why it needs a decision rather than a note.**
+
+- **In its favour, and this is stronger than it looks:** the evidence database `relay` — four weeks of
+  measurements, the three protected rows, `P-46`'s permanent id gaps — lived on an **anonymous** volume. Anonymous
+  volumes are what `docker compose down -v` and `docker volume prune` remove without naming anything. Naming it
+  makes the project's entire evidence base visible in the compose file instead of implicit in a container's
+  identity.
+- **Against:** `external: true` means Compose will not create it. On any other machine, or after that volume is
+  ever removed, `docker compose up` fails with *volume not found* rather than starting with a fresh database.
+  That is arguably the safer failure, and it also means the repository no longer describes a runnable stack for
+  anyone else — which matters specifically because Din 5 of this week publishes a blog post pointing at this
+  repository.
+- **And the sequencing cost:** `docker-compose.yml` is Din 2's file (`restart:` policies, Step 3), and Din 1's
+  scope guard named it. A silent edit to the file that the next day's supervisor decision lands in is how two
+  changes become one unattributable diff.
+
+**Why it is worth a number.** The pattern is not *"an extra file in the diff"*. It is that the most valuable
+artifact in the project — the only copy of every measurement four weeks of work produced — had its durability
+resting on a Docker implementation detail that nobody had written down, and the fix for that arrived as an
+undeclared line in an unrelated commit. The backup question has never been asked in any decision: there is no
+`pg_dump`, no snapshot, and no second copy of `relay` anywhere.
+
+**Owner:** Week 5 Din 2, Step 3, alongside the `restart:` policy, since both are edits to the same file and both
+are about surviving restarts. The decision has three parts and only the first is done: name the volume (done),
+decide whether `external: true` or a Compose-managed named volume is correct given that the repo becomes public
+on Din 5, and decide whether a periodic `pg_dump` of `relay` belongs in the project at all. Related: `D-32`
+(Din 3) is about what evidence becomes *public*; this is about whether evidence *survives*.
+
+---
+
+## P-50 — Din 1's most valuable measurement was destroyed by its own harness, and both `recovery_to_first_claim` numbers were never written to a file
+
+**Status: MEASURED-R on Week 5 Din 1 (`2026-09-24`).** This is `P-45`'s fourth recurrence, it happened on day
+one of the week whose Din 3 is supposed to close `P-45`, and the mechanism is new enough to need its own entry.
+
+**What was lost.** Din 1's Step 6 — the post-commit / pre-mark crash seam, which produced the day's headline
+result (`attempts = 2` for one fault, closing `D-26`'s `Cost 6`) — has a retained log containing `1` claim,
+**`0` marks**, a `0`-byte stderr, and a total span of `0.24 s` (`15:21:42.873`–`15:21:43.114`). The reported
+chain is not in it. Three independent reasons, and they compound:
+
+1. `scratch/step6_harness.ps1` opens with `Remove-Item $stdoutLog -Force` and `Remove-Item $stderrLog -Force`.
+   **The harness deletes its own evidence before every run**, so a second run silently overwrote the first. The
+   retained log is a mistimed re-run in which Postgres was already down at launch (`3` `[poll_error]` lines
+   before the first successful connection), so the outage never landed between the COMMIT and the mark.
+2. Every wall clock and every verdict the harness produced — `t_stop`, `t_start`,
+   `WORKER_STATUS_PRE_RESTART`, the `jobs` / `side_effects` / `outbox` tables it printed — went to `Write-Host`,
+   i.e. the console only. Nothing was redirected to a file. **The observations existed and were never written
+   down.**
+3. The harness launches **no reaper**, waits `8 s` rather than past the `30 s` lease, and ends with
+   `Stop-Process -Force`. So the reclaim → second claim → dedup → `succeeded` chain that was reported could not
+   have come from it; it came from commands typed afterwards that produced no artifact at all. The disposable
+   database `relay_w5d1` was then dropped, so nothing could be re-derived either.
+
+**The same defect cost two more numbers.** `recovery_to_first_claim` is `1.668 s` (arm 2) and `2.176 s` (arm 1),
+and both are `[REPORTED, NOT VERIFIABLE]`: the `docker compose start` wall clock they are measured against lived
+only in `Write-Host` output, and Step 4's harness is not in `scratch/` at all. What **is** re-derivable from the
+retained worker logs is the outage as the worker saw it — `26.373 s` and `26.082 s`, from the `echo=True` SQL
+timestamps — which is why the arms comparison survived and the recovery latencies did not. **The numbers that
+survived are the ones a long-running process printed with a timestamp; the numbers that died are the ones the
+harness printed to a terminal.**
+
+**Two structural conclusions, and both change Din 3's scope.**
+
+- **`.gitignore` on `logs/` is not the whole problem.** These artifacts were never *in* `logs/`. A retention rule
+  that only decides which files under `logs/` get committed would not have saved a single one of the lost numbers.
+  The rule has to cover **harness console output** — every probe script transcripted to a file, by default.
+- **A harness must not delete its own prior output.** The cheapest fix is a run id or timestamp in the log
+  filename so re-runs append to the set instead of replacing it, which also makes "how many times did this run?"
+  answerable. Din 1 cannot answer that question for Step 6.
+
+**What kept the day recoverable, and it is the argument for the protocol rather than against it.** The reviewer
+re-ran the whole Step 6 seam in a fresh disposable database (`relay_w5d1r`) and every number the user reported
+was confirmed, plus three that were not in his report: the death frame (`worker.py:305`), the sequence advancing
+to `2` under `count(*) = 1`, and `job_executions` holding `2` rows at generations `1` and `2`. **The result was
+right and the evidence was gone** — which is the exact failure mode `P-45` describes, now with the added detail
+that the destroying agent was the measurement script itself.
+
+**Owner:** Week 5 Din 3, and this entry widens that day's Step 3 from *"which log lines get committed"* to
+*"every probe writes a transcript, and no probe truncates a prior one."* `D-32` should carry both.

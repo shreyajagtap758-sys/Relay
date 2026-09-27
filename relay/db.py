@@ -15,7 +15,9 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 POOL_SIZE = int(os.getenv("POOL_SIZE", "5"))
 MAX_OVERFLOW = int(os.getenv("MAX_OVERFLOW", "10"))
 POOL_TIMEOUT = float(os.getenv("POOL_TIMEOUT", "30.0"))
-POOL_PRE_PING = os.getenv("POOL_PRE_PING", "0") == "1"
+# D-31: pool_pre_ping stays False. Measured 0 benefit against outage (pre-ping runs at checkout, not mid-transaction),
+# while protecting API p99 tail latency from a +3.3ms to +33.7ms per-checkout round-trip penalty.
+POOL_PRE_PING = False
 APP_NAME = os.getenv("APPLICATION_NAME", "relay")
 
 engine = create_async_engine(
