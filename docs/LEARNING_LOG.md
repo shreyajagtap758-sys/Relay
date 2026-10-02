@@ -4940,3 +4940,476 @@ Cost (Architectural Mess):
 Verdict: ❌ REJECTED.
 
 ---
+
+WEEK 5 DAY 4
+
+
+aj hum problems.md mese P41, 44, 45 krenge.
+
+
+P45 : Week 4 - Din 5 (load testing) 3 headline numbers claim kiye gaye the :
+
+3.0055 s — Pool Saturation Timeout (Jab pool full ho aur request timeout ho jaye).
+
+3.1618 s — /healthz Starvation Timeout (Jab health check connection na milne par fail ho).
+
+2.8133 s — Receiver Wait (Lock ke piche wait time).
+
+
+Jab audit kiya gaya, toh repository ke logs/ folder me in teeno experiments ka koi log file (.log artifact) ya probe script mila hi nahi! Isliye in teeno ko audit me [REPORTED, NOT VERIFIABLE] mark kar diya gaya (matlab kisi ne claim toh kiya, par repo me koi verifiable proof nahi tha).
+
+
+Ye teeno numbers is assumption par tike the ki database connection pool size 2 tha (pool_size=2, max_overflow=0). Lekin ye pool size sirf Python code (relay/db.py) me SET kiya gaya tha, kabhi Postgres database (pg_stat_activity) ke andar jaakar OBSERVE nahi kiya gaya!
+
+
+Code me likhna ki "maine pool=2 set kiya" is NOT proof ki "Postgres ne sach me 2 hi connections allow kiye aur 3rd connection kabhi nahi bana".
+
+Agar live Postgres ke andar peak load ke dauraan 3 ya 4 connections khul gaye hote, toh poora saturation benchmark fail aur invalid ho jata.
+
+
+P-45 ka mission hai:
+
+Premise Observation: Live Postgres me prove karna ki idle par count 0 aur peak par count strictly ≤2 rehta hai.
+
+3.0055 s Timeout Reproduction: Retained probe script se saturation timeout wapas nikalna aur log file me save karna.
+
+/healthz Starvation (3.16 s) & Discriminator: Live prove karna ki saturated(bhara hua) pool me /healthz fail hota hai jabki bina-DB wala /health 200 OK deta hai (jo prove karta hai ki process zinda hai, sirf pool exhaust hua hai).
+
+
+```
+BASICS :
+
+Maan lo aapko server se error aa raha hai. Problem 3 alag-alag cheezon me ho sakti hai:
+
+Case A (FastAPI / Server mar chuka hai): Server crash ho gaya ya system hang hai.
+
+Case B (Postgres Database mar chuka hai): DB crash ho gaya ya port band hai.
+
+Case C (Pool Saturation / Starvation): FastAPI bhi zinda hai, Postgres bhi zinda hai, lekin saari connections busy hain aur naye request ke liye pool me jagah nahi hai!
+
+
+Agar aap /health ko call karte ho aur wo Fail hota hai → Iska matlab FastAPI process hi mar chuka hai (Case A).
+
+
+Agar /health 200 OK de raha hai (sirf 0.08 second me), lekin /healthz 503 Timeout de raha hai → Iska 100% guarantee proof hai ki FastAPI process bilkul zinda hai aur perfectly respond kar raha hai, sirf DB Connection Pool full ho chuka hai! (Case C).
+
+
+-> Agar hum sirf /healthz rakhte, toh hume pata hi nahi chalta ki server crash hua hai ya DB crash hua hai ya sirf pool full hua hai!
+
+---
+
+Liveness Probe ka rule: Kubernetes poochta hai "Process zinda hai ya mar gaya?"
+
+Agar Liveness probe fail ho gaya → Kubernetes turant us container ko KILL (SIGKILL) kar deta hai aur restart karta hai.
+
+
+Readiness Probe ka rule: Kubernetes poochta hai "Kya ye container naya user traffic lene ke liye tayyar hai?"
+
+Agar Readiness probe fail ho gaya → Kubernetes process ko marte nahi hai! Wo sirf Load Balancer se bolta hai "Abhi is pod par naye users ki requests mat bhejo, isko thoda saans lene do."
+
+
+DISASTER :
+
+Aapki app par achanak bohot saare users aa gaye (Heavy Traffic).
+
+Saare 10 DB connections user requests process karne me busy ho gaye.
+
+Theek usi waqt Kubernetes ne Liveness check ke liye /healthz ko call kiya.
+
+Kyunki saare connections busy the, /healthz queue me khada raha aur 3 second baad timeout hokar fail ho gaya!
+
+Kubernetes ne socha: "Oh! Liveness fail ho gayi! Matlab ye container mar chuka hai! Isko turant jaan se maar do (kill -9)!"
+
+Disaster: Kubernetes ne container ko kill kar diya! Jo bechare 10 users ki transactions process ho rahi thi, wo sab adhe me crash aur rollback ho gayi!
+
+Container restart hua (5-10 second lage). Jab tak ye restart ho raha tha, saara traffic doosre containers par gira, unka pool bhi saturate hua, Kubernetes ne unhe bhi ek-ek karke maar diya!
+
+(Isko industry me kehte hain Restart Storm / Cascade Failure).
+
+
+RIGHT CHOICE FOR THIS :
+
+Liveness Probe me /health lagao (bina DB wala): Taaki jab tak FastAPI zinda hai, Kubernetes use faltu me kill na kare.
+
+Readiness Probe me /healthz lagao (DB wala): Agar pool full ho ya DB thoda slow ho, toh Kubernetes container ko kill na kare, bas naye requests aana thodi der ke liye pause kar de jab tak pool khali na ho jaye!
+```
+
+
+TEST 1 : Premise Observation: Live Postgres me prove karna ki idle par count 0 aur peak par count strictly ≤2 rehta hai.
+
+code me configured pool_size=2 ceiling ko Postgres database live load ke dauraan actually honour karta hai.
+
+Humne FastAPI server ko launch kiya specific environment parameters ke saath:
+
+```
+$env:POOL_SIZE="2"; $env:MAX_OVERFLOW="0"; $env:POOL_TIMEOUT="3.0"; $env:APPLICATION_NAME="api_w5d4"
+python -m uvicorn relay.main:app --port 8000
+```
+
+1. ab humne postgres connection count query chalai at idle(koi connection na ho tb) :
+
+```
+SELECT application_name, count(*), array_agg(distinct state) 
+FROM pg_stat_activity 
+WHERE application_name LIKE 'api_w5d4%' GROUP BY 1;
+```
+
+OUTPUT :
+
+(0 rows/ Empty)
+
+-> Idle par connection count 0 aaya, 2 nahi! Aur ye bilkul sahi hai — ye prove karta hai Lazy Allocation: jab tak koi API request query execute nahi karti, SQLAlchemy Postgres me koi connection nahi banata.
+
+
+
+2. ab hum query chalayege jab connection count PEAK pr ho, mtlab 3 concurrent request bheji /slow-hold?seconds=8 pr, and unke execution ke dauraan postgres me connection count dekha :
+
+OUTPUT :
+
+api_w5d4 | 2 | {active}
+
+-> 3 requests aayi thi, lekin Postgres ke andar sirf 2 connections bane, dono {active} state me the (query execute kar rahe the). Teesra connection Postgres me bana hi nahi! 
+
+Conclusion: Premise PROVEN. Code ka pool_size=2 ceiling Postgres ke level par 100% honour hua.
+
+
+
+TEST 2 : 
+
+- Humne 3 concurrent requests bheji /slow-hold?seconds=8 par against pool 2+0 (pool size + max overflow) aur pool_timeout=3.0 :
+
+OBERVATION :
+
+- CLIENT SIDE LOGS
+
+```
+REQ #1: status=200 elapsed=8.0785s error_class=None body={"status":"ok","held":8.0}
+
+REQ #2: status=200 elapsed=8.1163s error_class=None body={"status":"ok","held":8.0}
+
+REQ #3: status=500 elapsed=5.894s  error_class=HTTPStatusError body=Internal Server Error
+```
+
+- SERVER SIDE ERROR LOGS
+
+```
+sqlalchemy.exc.TimeoutError: QueuePool limit of size 2 overflow 0 reached, connection timed out, timeout 3.00
+```
+
+MEANING :
+
+- Request #1 aur Request #2 ne Pool ke dono connections (2 out of 2) checkout kar liye aur 8 seconds tak hold kiya.
+
+- Request #3 jab aayi, toh pool khali nahi tha. Wo QueuePool ki internal FIFO queue me wait karne lagi.
+
+- Jaise hi uske queue wait time ne 3.00 seconds cross kiye (POOL_TIMEOUT=3.0), SQLAlchemy ne checkout abort karke TimeoutError phenk diya.
+
+- Server ne client ko HTTP 500 return kiya.
+
+- Important finding: Postgres ke logs me is error ka koi zikr nahi hai! Kyunki ye timeout Postgres ka nahi hai, ye client-side checkout queue ka timeout hai. Request 3 kabhi database tak pahunchi hi nahi.
+
+
+-> Conclusion: 3.00s connection pool exhaustion live reproduce ho gaya aur uska artifact logs/ me retain ho gaya.
+
+
+
+TEST 3 : /healthz Starvation (3.1618 s) aur Discriminator Endpoint
+
+Production me agar database pool exhaust ho jata hai, toh /healthz fail hone lagta hai(uski request bhi queue me wait krne lagti he, database dead nhi he bas connections bhar gye he). Kubernetes usko dekh kar samajhta hai ki application crash ho gaya hai aur poore process ko SIGKILL mar deta hai — jisse issue solve hone ke bajaye aur bada disaster ban jata hai (restart storm). Hume check karna tha:
+
+1. Kya /healthz pool exhaustion ke time block hota hai?
+2. Hum kaise distinguish karein ki DB down hai ya sirf pool saturated hai?
+
+
+EXECUTION :
+
+Humne 2 requests se pool ke dono connections ko hold kiya (100% saturation). Aur saturation ke dauraan 3 alag-alag endpoints ko hit kiya:
+
+1. /health — Static check, database ko touch nahi karta.
+
+2. /healthz — Depends(get_db) ke sath SELECT 1 execute karta hai.(db ko touch krega)
+
+3. /db-ping — Depends(get_db) ke sath SELECT 1 execute karta hai.(db ko touch krega)
+
+
+OBSERVATIONS :
+
+```
+HEALTH:  status=200 elapsed=0.0830s body={"status":"ok"}
+
+HEALTHZ: status=503 elapsed=3.1353s body={"detail":"database_unreachable: TimeoutError: QueuePool limit of size 2 overflow 0 reached, connection timed out, timeout 3.00"}
+
+DB_PING: status=500 elapsed=3.1291s body=Internal Server Error
+```
+
+MEANING :
+
+1. /health (The Discriminator): Isne sirf 0.0830 s (83 ms) me 200 OK de diya! Kyunki isko DB connection checkout karne ki zaroorat nahi thi.
+
+2. /healthz & /db-ping: Dono endpoints 3.1353 s (3.0s pool timeout + framework overhead) tak block rahe aur fir 503 Service Unavailable ke saath fail hue. Week 4 ka 3.1618 s number verify ho gaya!
+
+
+The Discriminator Rule:
+
+Agar /health (No DB) aur /healthz (With DB) dono fail ho rahe hain → Process dead hai ya server network unreachable hai.
+
+Agar /health 200 OK de raha hai aur /healthz 503 Timeout de raha hai → Process 100% zinda hai, DB bhi zinda hai, sirf DB Connection Pool exhaust (starve) hua hai!
+
+--
+
+
+P44 : Client Disconnect & /slow-hold Danger
+
+P-44 ka mission hai :
+
+(Live Disconnect Test): Client ne /slow-hold?seconds=20 bhej kar 3rd second par browser/curl band kar diya (disconnect). Check karna ki kya Postgres connection ko turant chhodta hai ya poore 20 second tak bandhe rakhta hai?
+
+(P-44 Ka Architectural Faisla): Production me /slow-hold jaise dangerous endpoint ko kaise secure karein (App Factory ya Environment Gate ya statement_timeout) bina testing ko tode.
+
+
+TEST 1 : 
+
+Ek common assumption hoti hai: "Agar client ka network toot jaye, ya client browser band kar de (TCP disconnect), toh server automatically DB query rok dega aur connection free ho jayegi." 
+
+Hume live dekhna tha: Kya sach me client ke disconnect hone par Postgres query rukti hai, ya connection fas ke reh jaati hai?
+
+
+EXECUTION :
+
+Client ne request bheji: GET /slow-hold?seconds=15 (15 second hold).
+
+Theek 3 seconds baad client ne connection forcibly tod diya (TCP abort / timeout).
+
+Client mar chuka hai. Ab theek t = 4s par humne Postgres se poochha: "Tu kya kar raha hai?" (Snapshot 1).
+
+Phir humne t = 16.5s (15s beetne ke baad) dubara Postgres se poochha: "Ab tu kya kar raha hai?" (Snapshot 2).
+
+
+OBSERVATIONS :
+
+```
+[CLIENT] Sending GET /slow-hold?seconds=15.0...
+[CLIENT] Client timed out / disconnected after 3.0s! Connection closed.
+
+
+[PROBE] Client has disconnected! Querying Postgres pg_stat_activity immediately (t=4s)...
+--- SNAPSHOT 1 (Immediately after disconnect) ---
+api_w5d4 | active | SELECT pg_sleep($1) | 00:00:06.03096
+
+
+[PROBE] Querying Postgres pg_stat_activity after full hold duration (t=16.5s)...
+--- SNAPSHOT 2 (After full hold time elapsed) ---
+api_w5d4 | idle   | ROLLBACK;          | 00:00:05.60675
+```
+
+SERVER SIDE LOG :
+
+```
+17:03:40,725 INFO sqlalchemy.engine.Engine SELECT pg_sleep($1) (15.0,)
+
+... (Client 17:03:43 par mar chuka tha) ...
+
+17:03:55,934 INFO sqlalchemy.engine.Engine ROLLBACK
+```
+
+MEANING :
+
+Snapshot 1 (Client marne ke turant baad): Postgres connection abhi bhi {active} state me tha aur SELECT pg_sleep(15) chala raha tha!
+
+Snapshot 2 (15s poore hone ke baad): Theek 15 seconds poore hone ke baad hi query ruki aur session {idle} hua (ROLLBACK hua).
+
+The Discovery: Client ka HTTP connection tootne se Postgres query bilkul NAHI ruki! Python/FastAPI me by default koi Cancellation Propagation nahi hoti jo Postgres ko bole pg_cancel_backend.
+
+
+Conclusion: Agar koi attacker /slow-hold?seconds=1000 bhej kar turant apna browser close bhi kar de, tab bhi Postgres backend agle 1000 seconds tak us connection ko bandhe rakhega! (conn pool me ek hi request 1000 tk connection pakad kr bethegi)
+
+
+TEST 2 (architectural decision): Production me /slow-hold jaise dangerous endpoint ko kaise secure karein
+
+
+FAISLA 1 : 
+
+
+Faisla 2: Overlapping Health Endpoints ka kya karein?
+
+Repo me 3 endpoints the:
+
+1. /health (Static, no DB)
+
+2. /healthz (SELECT 1, with DB)
+
+3. /db-ping (SELECT 1, with DB)
+
+
+decision :
+
+1. /health BACHEGA (in relay/main.py): Kyunki P-45 ne prove kiya ki ye hamara Discriminator / Liveness probe hai (bina DB ke batata hai ki server process zinda hai ya nahi).
+
+2. /healthz BACHEGA: Kyunki ye hamara Readiness probe hai (DB connection available hai ya nahi batata hai).
+
+3. /db-ping HATEGA (DELETED): Kyunki ye /healthz ka exact 100% duplicate copy hai. Iski koi zaroorat nahi hai.
+
+
+-> Ab API me sirf do clean health checks bache hain :
+
+/health (Static Liveness probe — No DB)
+
+/healthz (Readiness probe — Checks DB via SELECT 1)
+
+--
+
+
+P-41 : Week 4 me P-41 ek aisi theory thi jisko kisi ne document me likha toh tha, par kabhi kisi ne live compose karke test nahi kiya tha. Sabne ise [INFERRED] (matlab "hamara andaza hai") likh kar chhod diya tha.
+
+
+1. Relay ka dispatcher outbox table se ek row uthata hai.
+
+```
+async with session.begin():
+
+    outbox_row = select(Outbox)...with_for_update(skip_locked=True)  
+
+# Relay DB me ROW LOCK & CONNECTION PAKDA
+
+    resp = await client.post("http://sink:8001/deliver", ...)         
+
+# ABHI BHI DB LOCK PAKDE HUE NETWORK CALL KI!
+```
+
+- Matlab Relay ka Dispatcher apna database connection aur row lock dono bandh kar baitha rehta hai jab tak network call poori na ho jaye!
+
+
+2. Receiver/Sink service me jab delivery aati hai, toh wo idempotency ke liye ye chalata hai:
+
+```
+INSERT INTO sink_deliveries (idempotency_key, body) 
+VALUES ('job:999', ...) 
+ON CONFLICT (idempotency_key) DO NOTHING;
+```
+
+Sab log sochte hain: "ON CONFLICT DO NOTHING hai, toh agar conflict hoga toh skip karke turant aage badh jayega na?"
+
+The Brutal Reality: Agar us key 'job:999' par koi dusra writer pehle se transaction khole baitha hai jo abhi tak COMMIT nahi hua, toh Postgres skip NAHI karta! Postgres wahan FREEZE (WAIT) ho jata hai jab tak wo pehla writer commit ya rollback na ho jaye (Lock: transactionid)!
+
+- ON CONFLICT DO NOTHING lock krke bethta he jab tk pehla transaction khula ho, skip nhi krta.
+
+
+3. DUE TO THESE TWO POINT :
+
+- Receiver freeze hua → HTTP call freeze hui.
+
+- HTTP call freeze hui → Relay ka Dispatcher Relay DB ka connection pakad kar khada raha.
+
+- Agar pool size 2 hai aur aisi 2 requests aa gayi, toh Relay ka poora connection pool exhaust ho jayega!
+
+
+IMPORTANT : Relay ke error logs me kya dikhega? [dispatcher] EXCEPTION: ReadTimeout (HTTP 5.0s timeout).
+- On-call engineer Relay ke logs dekh kar sochega: "Relay slow ho gaya hai ya Relay ka network kharab hai ya Relay ka DB pool saturate ho gaya!" Lekin asli root cause Relay me tha hi nahi! Asli root cause Receiver ke database ke andar ek uncommitted row lock tha!
+
+
+TEST 1 : 
+
+EXECUTION :
+
+ek temporary DB banai, and sink receiver service ka port launch kiya.
+
+(Slow Writer start kiya): Ek Python connection ne sink_deliveries me key 'job:999' insert ki aur transaction ko 7.0 seconds tak jaanbujhkar UNCOMMITTED khula chhod diya.
+
+(Dispatcher run kiya): Dispatcher ne Outbox row lock ki aur theek usi key 'job:999' ko Sink par HTTP POST bheja (timeout=5.0s).
+
+(Live Probe Sample at t = 2.5s): Theek freeze ke dauraan humne Postgres pg_stat_activity me dekha ki kaun kahan fasa hua hai.
+
+
+OBSERVATIONS :
+
+```
+[SLOW_WRITER] Starting slow writer on sink_deliveries for key 'job:999', holding for 7.0s...
+
+[SLOW_WRITER] Inserted key 'job:999'. Transaction remains UNCOMMITTED! Sleeping 7.0s...
+
+
+[DISPATCHER] Dispatcher loop starting...
+
+[DISPATCHER] Acquired lock on Outbox row id=1 for job_id=999 effect_key='job:999'
+
+[DISPATCHER] Sending HTTP POST to http://127.0.0.1:8001/deliver (timeout=5.0s)...
+
+
+--- PG_STAT_ACTIVITY SNAPSHOT (During Block) ---
+
+sink_w5d4       | active              | INSERT INTO sink_deliveries (idempotency_key, | Lock   | transactionid
+                | idle in transaction | INSERT INTO sink_deliveries (idempotency_key, | Client | ClientRead
+dispatcher_w5d4 | idle in transaction | SELECT id, job_id, effect_key, payload FROM o | Client | ClientRead
+
+
+[DISPATCHER] EXCEPTION caught after 5.6605s: ReadTimeout: 
+
+[DISPATCHER] Dispatcher transaction finished and outbox lock released.
+
+[SLOW_WRITER] Transaction COMMITTED!
+```
+
+MEANING :
+
+- sink_w5d4 | active | INSERT INTO sink_deliveries | Lock | transactionid
+
+Sink receiver ka ON CONFLICT DO NOTHING skip nahi kar paya! Wo Postgres me transactionid ke lock par khada reh kar wait kar raha tha ki pehla transaction kab commit ya rollback karega!
+
+
+- dispatcher_w5d4 | idle in transaction | SELECT id, job_id FROM outbox | Client | ClientRead
+
+Postgres me idle in transaction ka matlab hota hai: "Maine query chala li hai, transaction khula hai, aur connection ko pool me wapas nahi lautaya hai." Dispatcher ne Relay DB ki outbox row ko poore 5.66 seconds tak lock rakha, sirf isliye kyunki wo network response ka intezaar kar raha tha!
+
+
+5.66 s Par Kya Hua? (The Boundary):
+
+Dispatcher ka client timeout httpx.AsyncClient(timeout=5.0) tha. Theek 5.0s timeout + ~0.66s network cleanup ke baad ReadTimeout exception fire hua. Dispatcher ne except block me jaakar rollback kiya aur Relay DB connection release ho gaya. Aur Slow Writer ne 7.0s par jakar commit kiya.
+
+
+
+-> Agar aap Relay ke production logs dekhoge, toh wahan sirf ye likha hoga: [DISPATCHER] EXCEPTION caught: ReadTimeout
+
+- Kya Relay ke log me kahin bhi pata chala ki Receiver ke DB me lock tha? NAHI.
+
+- Kya Relay ke log me pata chala ki kaunsi table par contention thi? NAHI.
+
+- Isko kehte hain "Observability Gap": Relay ka Dispatcher sirf ye janta hai ki HTTP call timeout ho gayi. Asli cause receiver ke database me dafan rehta hai.
+
+
+MTLAB agar Jab bhi ReadTimeout aaye, iska 99% matlab hota hai ki downstream receiver processing me fasa hua hai, Relay me nahi.
+
+Agar Relay ka database down hota ya connection pool crash hota, toh error client.post() par nahi aati! Error line 44 par aati: sqlalchemy.exc.TimeoutError: QueuePool limit reached ya ConnectionRefusedError.
+
+
+
+-> Print me pool = 2(pool_size) + 0(max_conn) likha hone ke baad bhi, Postgres me 2 se zyada connection kab dikh sakte hain?
+
+Iske 3 real-world scenarios hote hain jahan print hume dhokha de deta hai:
+
+1. Production me log aksar uvicorn aise chalate hain:
+````
+uvicorn relay.main:app --port 8000 --workers 4
+````
+Uvicorn 4 alag-alag Python processes (worker 1, 2, 3, 4) start karta hai.
+Har process code ko start karta hai aur print karta hai: pool=2+0.
+Aap terminal par dekh kar sochoge: "Accha, pool size toh 2 hai."
+Lekin Postgres me kya hua? Chaar alag-alag processes ne 2-2 connection khol liye: 4 workers×2 connections=8 connections!
+Aur kyunki sabka application_name = 'api_w5d4' ek hi tha, jab aap Postgres me query karoge: SELECT count(*) FROM pg_stat_activity WHERE application_name = 'api_w5d4' Toh count 8 aayega! Print 2 bol raha tha, par DB me 8 hain!
+
+2. Ek hi Process me "Do Alag Engines" Ban Jaana
+
+Maan lo aapke relay/db.py ke engine ne pool=2+0 banaya.
+Lekin aapke project me kisi probe script, ya Alembic (alembic/env.py), ya kisi helper file ne apna khud ka ek aur create_async_engine() bana liya.
+Dono ne same APPLICATION_NAME = "api_w5d4" use kar liya.
+Engine A ne 2 connection liye, Engine B ne 2 connection liye 
+→ Total 4 connections ho gaye!
+
+3. Agar kisi ne galti se config me MAX_OVERFLOW = -1 pass kar diya.
+Print kya dikhayega? pool=2+-1.
+Lekin SQLAlchemy me -1 ka matlab hota hai UNLIMITED!
+
+---
+
+WEEK 6 DAY 1 
+
+
