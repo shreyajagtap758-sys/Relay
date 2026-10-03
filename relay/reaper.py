@@ -28,6 +28,7 @@ def request_shutdown(signum: int, frame: Any) -> None:
 
 async def reap_stuck_jobs() -> int:
     reclaimed_count = 0
+    reclaim_events = []
     async with async_session() as session:
         async with session.begin():
             predicate = or_(
@@ -58,10 +59,7 @@ async def reap_stuck_jobs() -> int:
                 matched = 1 if returned_row else 0
                 post_status = returned_row[0] if returned_row else candidate.status
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                print(
-                    f"[{REAPER_ID}] [{ts}] [reclaim] job_id={candidate.id} pre_status={candidate.status} matched={matched} post_status={post_status}",
-                    flush=True,
-                )
+                reclaim_events.append((candidate.id, candidate.status, matched, post_status, ts))
                 if matched > 0:
                     reclaimed_count += matched
 
@@ -70,6 +68,13 @@ async def reap_stuck_jobs() -> int:
                 print(
                     f"[{REAPER_ID}] [{ts}] Pass completed: candidates=0 reclaimed=0"
                 )
+
+        # Print outcome lines only after COMMIT has succeeded
+        for cid, cpre_status, cmatched, cpost_status, cts in reclaim_events:
+            print(
+                f"[{REAPER_ID}] [{cts}] [reclaim] job_id={cid} pre_status={cpre_status} matched={cmatched} post_status={cpost_status}",
+                flush=True,
+            )
 
     return reclaimed_count
 

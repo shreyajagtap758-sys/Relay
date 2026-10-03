@@ -162,6 +162,8 @@ async def send_heartbeat(
             break
         except asyncio.TimeoutError:
             try:
+                hb_sent = False
+                hb_lost = False
                 async with async_session() as session:
                     async with session.begin():
                         update_stmt = (
@@ -175,17 +177,24 @@ async def send_heartbeat(
                         )
                         result = await session.execute(update_stmt)
                         if result.rowcount == 0:
-                            print(
-                                f"[{WORKER_ID}] Heartbeat lost: job_id={job_id} worker_id={WORKER_ID} claim_generation={claim_generation} is no longer 'running' or fenced event=heartbeat_lost",
-                                flush=True,
-                            )
-                            break
-                        if last_lease_refresh is not None:
-                            last_lease_refresh[0] = time.time()
-                        print(
-                            f"[{WORKER_ID}] Heartbeat sent for job_id={job_id} worker_id={WORKER_ID} claim_generation={claim_generation} event=heartbeat",
-                            flush=True,
-                        )
+                            hb_lost = True
+                        else:
+                            hb_sent = True
+
+                # Print outcome lines only after COMMIT has succeeded
+                if hb_lost:
+                    print(
+                        f"[{WORKER_ID}] Heartbeat lost: job_id={job_id} worker_id={WORKER_ID} claim_generation={claim_generation} is no longer 'running' or fenced event=heartbeat_lost",
+                        flush=True,
+                    )
+                    break
+                if hb_sent:
+                    if last_lease_refresh is not None:
+                        last_lease_refresh[0] = time.time()
+                    print(
+                        f"[{WORKER_ID}] Heartbeat sent for job_id={job_id} worker_id={WORKER_ID} claim_generation={claim_generation} event=heartbeat",
+                        flush=True,
+                    )
             except Exception as exc:
                 print(
                     f"[{WORKER_ID}] Heartbeat failed: {type(exc).__name__}: {exc} event=heartbeat_failed",
@@ -204,6 +213,8 @@ async def run_worker() -> None:
     while not SHUTDOWN_REQUESTED:
         claimed_job = None
 
+        conflict_job_id = None
+        claim_print_info = None
         try:
             async with async_session() as session:
                 async with session.begin():
@@ -239,10 +250,7 @@ async def run_worker() -> None:
                         current_generation = update_result.scalar_one_or_none()
 
                         if current_generation is None:
-                            print(
-                                f"[{WORKER_ID}] Conflict: Job {job.id} was claimed by another writer (rowcount=0).",
-                                flush=True,
-                            )
+                            conflict_job_id = job.id
                         else:
                             current_attempts = job.attempts + 1
                             claimed_job = (
@@ -252,10 +260,25 @@ async def run_worker() -> None:
                                 current_attempts,
                                 current_generation,
                             )
-                            print(
-                                f"[{WORKER_ID}] Claimed job_id={job.id} worker_id={WORKER_ID} claim_generation={current_generation} attempt={current_attempts} rowcount=1 event=claim. Status is now 'running'.",
-                                flush=True,
+                            claim_print_info = (
+                                job.id,
+                                WORKER_ID,
+                                current_generation,
+                                current_attempts,
                             )
+
+                # Print outcome lines only after COMMIT has succeeded
+                if conflict_job_id is not None:
+                    print(
+                        f"[{WORKER_ID}] Conflict: Job {conflict_job_id} was claimed by another writer (rowcount=0).",
+                        flush=True,
+                    )
+                elif claim_print_info is not None:
+                    c_jid, c_wid, c_gen, c_att = claim_print_info
+                    print(
+                        f"[{c_wid}] Claimed job_id={c_jid} worker_id={c_wid} claim_generation={c_gen} attempt={c_att} rowcount=1 event=claim. Status is now 'running'.",
+                        flush=True,
+                    )
         except Exception as exc:
             print(
                 f"[{WORKER_ID}] Claim poll failed: {type(exc).__name__}: {exc}",
@@ -343,6 +366,9 @@ async def run_worker() -> None:
         mark_succeeded = False
 
         for mark_attempt in range(1, MAX_MARK_RETRIES + 1):
+            mark_fenced_info = None
+            mark_conflict_info = None
+            mark_success_info = None
             try:
                 async with async_session() as session:
                     async with session.begin():
@@ -373,22 +399,33 @@ async def run_worker() -> None:
                             check_res = await session.execute(check_stmt)
                             actual_row = check_res.first()
                             if actual_row and actual_row.claim_generation != current_generation:
-                                print(
-                                    f"[{WORKER_ID}] Mark fenced: job_id={job_id} worker_id={WORKER_ID} held_generation={current_generation} actual_generation={actual_row.claim_generation} rowcount=0 event=fenced",
-                                    flush=True,
-                                )
+                                mark_fenced_info = (job_id, WORKER_ID, current_generation, actual_row.claim_generation)
                             else:
-                                print(
-                                    f"[{WORKER_ID}] Conflict on mark: job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation} status was modified by another transaction (rowcount=0) event=conflict",
-                                    flush=True,
-                                )
+                                mark_conflict_info = (job_id, WORKER_ID, current_generation)
                         else:
-                            print(
-                                f"[{WORKER_ID}] Marked job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation} as '{new_status}' (rowcount={mark_result.rowcount}) event=mark.",
-                                flush=True,
-                            )
+                            mark_success_info = (job_id, WORKER_ID, current_generation, new_status, mark_result.rowcount)
                         mark_succeeded = True
-                        break
+
+                # Print outcome lines only after COMMIT has succeeded
+                if mark_fenced_info is not None:
+                    m_jid, m_wid, m_cgen, m_agen = mark_fenced_info
+                    print(
+                        f"[{m_wid}] Mark fenced: job_id={m_jid} worker_id={m_wid} held_generation={m_cgen} actual_generation={m_agen} rowcount=0 event=fenced",
+                        flush=True,
+                    )
+                elif mark_conflict_info is not None:
+                    m_jid, m_wid, m_cgen = mark_conflict_info
+                    print(
+                        f"[{m_wid}] Conflict on mark: job_id={m_jid} worker_id={m_wid} claim_generation={m_cgen} status was modified by another transaction (rowcount=0) event=conflict",
+                        flush=True,
+                    )
+                elif mark_success_info is not None:
+                    m_jid, m_wid, m_cgen, m_status, m_rc = mark_success_info
+                    print(
+                        f"[{m_wid}] Marked job_id={m_jid} worker_id={m_wid} claim_generation={m_cgen} as '{m_status}' (rowcount={m_rc}) event=mark.",
+                        flush=True,
+                    )
+                break
             except Exception as exc:
                 if mark_attempt < MAX_MARK_RETRIES:
                     base_delay = MARK_BASE_DELAYS[mark_attempt - 1]

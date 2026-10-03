@@ -5413,3 +5413,324 @@ Lekin SQLAlchemy me -1 ka matlab hota hai UNLIMITED!
 WEEK 6 DAY 1 
 
 
+Week 5 Day 5 me load testing aur database outage ke dauraan ek ajeeb cheez hui thi: Postgres DB ka outage aaya, aur worker ka COMMIT theek usi 5 millisecond ki window me fail ho gaya. Lekin console log me worker ne fir bhi likha:
+
+```
+[mark] Marked job 8 as 'succeeded'
+```
+
+Jab database me jaakar dekha gaya, toh Job 8 succeeded hua hi nahi tha! Wo abhi bhi running/pending tha!
+
+
+HOW? - Code me aisa kyu hua? Kyunki humne print() statement ko session.begin() transaction block ke ANDAR likha tha:
+
+```
+# ❌ CURRENT PATTERN (Lying Log):
+async with session.begin():
+    job.status = "succeeded"
+    print(f"[mark] Marked job {job.id} as 'succeeded'")  # 👈 Yahan print pehle hi bol deta hai!
+    # ... block khatam hone par COMMIT chalta hai ...
+    # Agar COMMIT fail ho gaya ya DB crash ho gaya -> ROLLBACK ho gaya!
+```
+
+-> Print ne bol diya: "Maine succeed kar diya!"
+
+Par database ne transaction ko Rollback kar diya!
+
+Result: Log jhooth bol raha hai! Production me monitoring tools (Datadog/ELK) sochenge job succeed ho gayi, par DB me job crash ho chuki hai.
+
+
+
+WHAT WE GONNA DO TODAY :
+
+P-56 :
+
+1. Pehle to ye bug wapis reproduce krenge dekhne ke liye ki ye 100% guaranteed problem he : 
+
+- Hum Postgres me Deferred Constraint Triggers lagayenge. Ye trigger query ke waqt shant rehte hain, lekin jaise hi transaction COMMIT bolne lagta hai, ye exception raise karke COMMIT ko mana (refuse/abort) kar dete hain! 
+
+- Hum dikhayenge ki un-fixed code me log kahega "Claimed/Marked/Dispatched", jabki DB me transition kabhi hua hi nahi!
+
+
+2. ISI step 1 ko fix krenge : Teeno files me print() ko session.begin(): block ke BAHAR le jayenge, taaki log line sirf aur sirf tabhi chale jab database ka COMMIT actually pass ho chuka ho!
+
+
+3. SAME test 1 chalayege, and dekhenge ki ab kya hota he : Wahi harness dobara chalayenge aur mathematically prove karenge: Fixed Run me Logged Lines == Committed DB Transitions!
+
+
+P-55 :
+
+-> Jab Dispatcher external HTTP sink ko call karta hai aur request fail hoti hai, toh pehle code ye print karta tha:
+
+```
+f"[{DISPATCHER_ID}] [dispatch_error] job_id={outbox_row.job_id} outbox_id={outbox_row.id}: {exc}"
+```
+
+- Python ke httpx library me jab ReadTimeout exception aata hai, toh str(exc) bilkul blank / empty string "" hota hai!
+
+- Iska matlab log me error ka reason gayab ho jata tha aur console me sirf ye print hota tha:
+
+```
+[dispatch_error] job_id=42 outbox_id=1 : (error ke aage bilkul khali!)
+```
+
+-> Log dekh kar pata hi nahi chal sakta tha ki error kya aaya—timeout hua, port band tha, connection refuse hua, ya kya hua.
+
+
+1. toh aj exception class add krnege type(exc).__name__ jisse error empty hoke bhi type(connectionTimeout, ReadTimeout etc) aayega.
+
+2. iss print ko bhi transaction ke baahr rakha jisse db commit/rollback hone ke baad hi print ho.
+
+
+
+TEST 1 :
+
+
+``` 
+BASICS :
+
+
+AST (Abstract Syntax Tree):
+
+- Python jab aapke code ko padhta hai, toh text ko ek tree jaise structure me todta hai.
+
+- Agar hum normal text search (Ctrl+F ya Regex) karte, toh hume ye 100% guarantee se pata nahi chalta ki kaunsa print transaction ke andar hai aur kaunsa bahar.
+
+- Python ke AST module (import ast) se humne code ko parse kiya. AST ne exactly dekha ki kaunse code blocks async with session.begin() hain, aur unke child branches ke andar kitne print() calls baithe hain.
+
+
+Census ka matlab: Poore codebase me har ek print statement ki systematic list aur count nikalna. AST census se pata chala ki Relay me exactly 13 prints transaction ke andar fase the.
+
+
+Transaction ke andar ke 13 prints ek jaise nahi the, isliye unhe classify kiya:
+
+
+1. O = Outcome classes (The Dangerous Lie):
+
+Ye wo prints hain jo claim karte hain ki DB me kuch permanently ho gaya.
+
+Jaise: "Claimed job_id=...", "Marked job_id=... as succeeded", "Reclaimed N jobs".
+
+Agar transaction rollback ho gaya, toh ye prints JHOOTH ban jaate hain. Inhi ko hume har haal me bahar nikalna tha!
+
+
+2. I / B = Intent / Begin Print:
+
+Jo sirf ye batate hain ki koshish shuru ho rahi hai: "Attempting claim...". Rollback hone par bhi ye jhooth nahi bante kyunki koshish toh sach me hui thi.
+
+
+3. Obs = Observation / Read-only Print:
+
+Jo sirf read-only query ka result batate hain bina kisi data change ke: "0 stale candidates found".
+```
+
+
+- P-56 : Aankhon se ya grep se dhoondhenge toh koi na koi print statement chhoot sakta hai. Isliye humne Python ke AST (Abstract Syntax Tree) script labs/w6d1_print_census.py banayi jo syntax level par scan karti hai: "Kaun-kaun sa print() statement lexically async with session.begin(): block ke ANDAR baitha hai?"
+
+Census Logs (logs/w6d1_step1_census.txt):
+
+```
+relay/dispatcher.py: 3 prints inside begin()
+relay/reaper.py:     2 prints inside begin()
+relay/worker.py:     8 prints inside begin()
+Total prints inside begin() = 13
+```
+
+
+
+(logs/w6d1_step1_classified.txt):
+
+Outcome Classes/prints : Jo sirf COMMIT hone par sach hoti hain, jese :
+
+worker.py: Claimed job_id=... (Status is now 'running')
+
+worker.py: Heartbeat sent for job_id=... (Lease extended)
+
+worker.py: Marked job_id=... as 'succeeded' (Terminal status)
+
+reaper.py: [reclaim] matched=1 post_status=pending (Job reclaimed)
+
+dispatcher.py: [dispatch] result=applied (Job dispatched)
+
+dispatcher.py: [dispatch_error] (Attempts recorded)
+
+TOTAL = 6 prints jinko badlna he.
+
+
+EXECUTION :
+
+-> Humne prove karna tha ki purane code me agar database COMMIT fail kar de, toh kya logs jhooth bolte hain?
+
+
+Ek disposable database relay_w6d1 banaya (evidence DB ko bilkul nahi chhua).
+
+Postgres me Deferred Constraint Triggers lagaye (labs/w6d1_commit_refusal.sql). Ye trigger COMMIT ke waqt RAISE EXCEPTION karke transaction ko fail karte hain.
+
+Saath me Audit Trigger lagaya jo usi transaction me w6d1_audit table me row insert karta hai. Agar commit fail hua, toh audit row bhi rollback ho jayegi.
+
+Phir worker, reaper, aur dispatcher chalaye (labs/w6d1_commit_refusal.ps1 -Phase control).
+
+
+OBSERVATION :
+
+```
+LOG LINES PRINTED          ACTUAL COMMITTED IN DB (AUDIT)
+-----------------          ------------------------------
+reclaim_lines  = 41        reclaim_committed  = 2     ❌ (39 False / Lying Log Lines!)
+dispatch_lines = 7         dispatch_committed = 1     ❌ (6 False / Lying Log Lines!)
+mark_lines     = 7         mark_committed     = 4     ❌ (3 False / Lying Log Lines!)
+claim_lines    = 23        claim_committed    = 5     ❌ (18 False / Lying Log Lines!)
+```
+
+- Reaper ne console me 41 baar likha ki "Maine job reclaim kar li!", jabki database me sirf 2 reclaims commit hue the! 
+
+- 39 baar transaction rollback ho chuka tha par log ne success claim kiya! 
+
+- Dispatcher ne 7 baar likha [dispatch], jabki DB me sirf 1 commit hua tha! 
+
+- Total 66 jhoothi log lines print hui! P-56 100% reproduce ho gaya.
+
+
+
+TEST 2 : THE FIX : 
+
+EXECUTION : 
+
+1. relay/dispatcher.py:
+
+- outbox_row.dispatched_at set hone ke baad information ko local tuple (dispatched_info) me save kiya.
+
+- print([dispatch] ...) ko session.begin(): block ke BAHAR shift kiya.
+
+- P-55 Fix: [dispatch_error] me exception ka class name add kiya: error={type(exc).__name__}: {exc}.
+
+
+2. relay/reaper.py:
+
+- Loop ke andar reclaim events ko ek list reclaim_events me accumulate kiya.
+
+- Actual print([reclaim] ...) ko session.begin(): block ke BAHAR shift kiya.
+
+
+3. relay/worker.py:
+
+- Claim: Claimed job_id=... print ko session.begin(): ke bahar shift kiya.
+
+- Heartbeat: Heartbeat sent... print ko session.begin(): ke bahar shift kiya.
+
+- Mark: Marked job_id=... print ko session.begin(): ke bahar shift kiya.
+
+
+
+OBSERVATION : the difference between old code and fixed code :
+
+
+```TAG         CONTROL (PURANA CODE)                  FIXED (NAYA CODE)
+---         ---------------------                  -----------------
+claim:      lines=23  committed=5  (MISMATCH)  |   lines=5  committed=5  (fixed_equal=True) ✅
+mark:       lines=7   committed=4  (MISMATCH)  |   lines=4  committed=4  (fixed_equal=True) ✅
+reclaim:    lines=41  committed=2  (MISMATCH)  |   lines=2  committed=2  (fixed_equal=True) ✅
+dispatch:   lines=7   committed=1  (MISMATCH)  |   lines=1  committed=1  (fixed_equal=True) ✅
+```
+
+-> Ab agar database commit mana karta hai, toh print statement chalta hi nahi! Logs ab sirf wahi bolte hain jo database me sach me commit hua hai. 0 false lines!
+
+
+
+TEST 3 : P-55 :
+
+-> Ye check karna tha ki kya Dispatcher alag-alag network failures me exact exception class name print karta hai after humne exeception type laga diya(fixed)?
+
+
+EXECUTION :
+
+CODE :
+
+```
+except Exception as exc:
+	outbox_row.attempts += 1
+
+	outbox_row.last_error = str(exc)
+
+	await session.flush()
+
+	dispatch_err_info = (
+		outbox_row.job_id,
+		outbox_row.id,
+		type(exc).__name__,
+		str(exc),
+	)
+```
+
+
+- Ek mock server banaya (labs/w6d1_silent_server.py) jo TCP connection accept karta hai par kabhi koi byte reply nahi karta (silent server).
+
+- Port 8098 (jahan koi nahi sun raha — closed port) test kiya.
+
+
+OBSERVATION :
+
+```
+silent server:
+  dispatch_error_lines = 2
+  with_ReadTimeout = 2      # ReadTimeout explicitly caught!Even if error message is not there.
+  first_line: [dispatch_error] job_id=55 outbox_id=1 error=ReadTimeout: 
+
+closed port:
+  dispatch_error_lines = 2
+  with_ConnectError = 2     # ConnectError explicitly caught!
+  first_line: [dispatch_error] job_id=55 outbox_id=1 error=ConnectError: All connection attempts failed
+```
+
+-> Conclusion: P-55 100% verified! Dispatcher ab ReadTimeout aur ConnectError ko bina kisi confusion ke clearly alag-alag log karta hai.
+
+
+
+AJ YE KRNE KE BAAD EK NEW EDGE CASE KHULTA HE :
+
+Agar session.begin(): ne DB me successfully COMMIT kar diya...
+
+Aur theek COMMIT ke baad, par print() chalne se 1 microsecond Pehle, server power cut ya process SIGKILL se crash ho gaya...
+
+Toh kya hoga? DB me change commit ho chuka hoga, par log line miss ho jayegi! (Committed without log).
+
+Lekin ye purani situation (Lying Log) se hazaar guna behtar hai, kyunki DB me state safe hai aur idempotency hume duplicate processing se bacha legi.
+
+
+
+-> also TWO sessions hote he :
+
+async with async_session() as session :
+async with session.begin() :
+
+session.begin() over, while outer session is still not done, this is where we shifted our print statements.
+
+MEANING :
+
+-> jab rollback ka case hota h toh session.begin() ke thik baad wala jo print ke wo skip hoke exception block me jayega jisse print tb nhi hoga.
+
+Inner block sirf Transaction (BEGIN / COMMIT / ROLLBACK) ko control karta hai.
+
+Outer block Physical Connection ko control karta hai. Chahe commit ho, rollback ho ya process me error aaye, outer block ka kaam bas itna hai ki wo DB connection ko smoothly pool me wapas submit kar de (session.close()).
+
+
+
+-> DML (Data Manipulation Language): 
+
+- Data badalne wali commands — SELECT, INSERT, UPDATE, DELETE.
+
+- Ye database me rows badalte hain, lekin permanent nahi banate! Ye sirf kachha kaam (uncommitted state) hota hai.
+
+
+-> TCL (Transaction Control Language): 
+
+- Transaction boundary control karne wali commands — BEGIN, COMMIT, ROLLBACK.
+
+- Ye faisla karte hain ki DML ka kiya gaya kaam permanent save hoga (COMMIT) ya poora raddh hoga (ROLLBACK).
+
+
+-> P-56 me ye kyun sabse bada mudda tha?
+
+- Purane code me developer ne DML chalaya (UPDATE jobs SET status = 'succeeded') aur agli hi line par likh diya print("Marked job succeeded").
+
+- Developer bhool gaya ki abhi sirf DML chala hai, TCL ka COMMIT abhi chala hi nahi hai! Agar Postgres ne commit reject kar diya, toh DML ka kaam cancel ho jayega par console pe print reh jayega.

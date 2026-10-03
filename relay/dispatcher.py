@@ -39,6 +39,8 @@ async def run_dispatcher() -> None:
     async with httpx.AsyncClient(timeout=5.0) as client:
         while not SHUTDOWN_REQUESTED:
             dispatched_any = False
+            dispatched_info = None
+            dispatch_err_info = None
 
             try:
                 async with async_session() as session:
@@ -91,19 +93,36 @@ async def run_dispatcher() -> None:
                                 outbox_row.dispatched_at = func.clock_timestamp()
                                 outbox_row.attempts += 1
                                 await session.flush()
-
-                                print(
-                                    f"[{DISPATCHER_ID}] [dispatch] job_id={outbox_row.job_id} outbox_id={outbox_row.id} effect_key={outbox_row.effect_key} result={res_text}",
-                                    flush=True,
+                                dispatched_info = (
+                                    outbox_row.job_id,
+                                    outbox_row.id,
+                                    outbox_row.effect_key,
+                                    res_text,
                                 )
                             except Exception as exc:
                                 outbox_row.attempts += 1
                                 outbox_row.last_error = str(exc)
                                 await session.flush()
-                                print(
-                                    f"[{DISPATCHER_ID}] [dispatch_error] job_id={outbox_row.job_id} outbox_id={outbox_row.id}: {exc}",
-                                    flush=True,
+                                dispatch_err_info = (
+                                    outbox_row.job_id,
+                                    outbox_row.id,
+                                    type(exc).__name__,
+                                    str(exc),
                                 )
+
+                # Outcome prints only after COMMIT has succeeded
+                if dispatched_info:
+                    d_job_id, d_outbox_id, d_effect_key, d_res_text = dispatched_info
+                    print(
+                        f"[{DISPATCHER_ID}] [dispatch] job_id={d_job_id} outbox_id={d_outbox_id} effect_key={d_effect_key} result={d_res_text}",
+                        flush=True,
+                    )
+                elif dispatch_err_info:
+                    d_job_id, d_outbox_id, d_exc_cls, d_exc_msg = dispatch_err_info
+                    print(
+                        f"[{DISPATCHER_ID}] [dispatch_error] job_id={d_job_id} outbox_id={d_outbox_id} error={d_exc_cls}: {d_exc_msg}",
+                        flush=True,
+                    )
             except Exception as exc:
                 print(
                     f"[{DISPATCHER_ID}] Poll failed: {type(exc).__name__}: {exc} event=dispatcher_poll_failed",
