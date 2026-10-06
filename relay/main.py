@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
@@ -10,6 +11,9 @@ from relay.schema import JobCreateRequest, JobCreateResponse, JobStatusResponse
 
 
 app = FastAPI(title="Relay API")
+
+ENABLE_TEST_ROUTES = os.getenv("ENABLE_TEST_ROUTES")
+print(f"test_routes={ENABLE_TEST_ROUTES!r}", flush=True)
 
 #register ingress middleware
 app.middleware("http")(limit_payload_size)
@@ -158,27 +162,8 @@ async def healthz(db: AsyncSession = Depends(get_db)):
 
 
 
-@app.get("/slow-hold")
-async def slow_hold(seconds: float = 4.0, db: AsyncSession = Depends(get_db)):
-    await db.execute(text("SELECT pg_sleep(:s)"), {"s": seconds})
-    return {"status": "ok", "held": seconds}
-
-
-# result : {"id":1,"type":"send_email","payload":{"to":"vikas@example.com"},"status":"pending","attempts":0,"created_at":"2026-08-15T19:30:03.022215Z","updated_at":"2026-08-15T19:30:03.022215Z"}
-# status : 200 ok
-
-#entered random job id : {"detail":"Job not found."} status : 404 not found
-#empty 'type' inputted : {
-  #"detail": [
-   # {
-     # "type": "string_too_short",
-    #  "loc": ["body", "type"],
-    #  "msg": "String should have at least 1 character",
-    #  "input": ""
-    #}
-  #]
-#} status : 422 unprocessable entity
-
-# make new job, job_id : 2, close the serve(API KILL), architecture : fastapi -> db commit job first -> server restart -> same job id query again (get job/2)(job not lost) -> it returned valid 200 ok -> durability pass.
-
-
+if ENABLE_TEST_ROUTES == "1":
+    @app.get("/slow-hold")
+    async def slow_hold(seconds: float = 4.0, db: AsyncSession = Depends(get_db)):
+        await db.execute(text("SELECT pg_sleep(:s)"), {"s": seconds})
+        return {"status": "ok", "held": seconds}

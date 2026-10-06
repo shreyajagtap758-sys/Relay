@@ -5734,3 +5734,464 @@ Outer block Physical Connection ko control karta hai. Chahe commit ho, rollback 
 - Purane code me developer ne DML chalaya (UPDATE jobs SET status = 'succeeded') aur agli hi line par likh diya print("Marked job succeeded").
 
 - Developer bhool gaya ki abhi sirf DML chala hai, TCL ka COMMIT abhi chala hi nahi hai! Agar Postgres ne commit reject kar diya, toh DML ka kaam cancel ho jayega par console pe print reh jayega.
+
+
+---
+
+
+WEEK 6 - DAY 2
+
+
+
+Aaj ke do main pillars hain:
+
+
+1. P-44 Security Fix: 
+
+- Production API me /slow-hold ek unauthenticated route tha jo database connection ko user ke mann-chahe time (seconds=1000) tak lock karke poora pool choke kar sakta tha. 
+
+- Aaj ise ENABLE_TEST_ROUTES=1 environment flag ke peeche gate karna hai aur /db-ping ko permanently delete karna hai.
+
+
+2. Fake Provider Test Lab (relay/fake_provider.py):
+
+- Ek independent FastAPI service (port 8002 par) jo LLM provider ki tarah behave karegi, lekin hum use keh sakenge: "Tu 429 return kar", "Tu 500 return kar", "Tu 7 second tak hang ho ja", "Tu dheere-dheere 1-1 byte trickle kar". 
+
+- Saath hi wo apna ek Ledger (Ginti) rakhegi ki uske paas kitni calls aayi.
+
+- (Real LLM ko hit karke test karenge toh paise lagenge aur failures randomly aayengi. Hume ek aisa Fake Provider chahiye jo hamare ishare par deterministic fail ho).
+
+
+
+TEST 1 : 
+
+-> Problem (P-44): Humare API me /slow-hold naam ka ek test route bana hua tha jo SQL query SELECT pg_sleep(seconds) chalata hai. Agar koi bahar ka user request bhej de: GET /slow-hold?seconds=1000, toh Postgres ka ek connection pool connection 16 minute tak block ho jayega! Agar aisi 2-3 requests aa gayi, toh poora Relay API choke ho jayega (Denial of Service - DoS attack).
+
+-> Mission: Production me /slow-hold jaise dangerous endpoint ko bilkul gayab (404) karna jab tak developer jaanbujhkar use environment flag se enable na kare. Saath hi redundant /db-ping route ko poori tarah delete karna.
+
+
+/slow-hold ko ek environmental flag de diya jisse agar wo enable hoga tbhi ye physically production me exist krega warna hacker ya bahar koi bhi user slow-hold nhi use kr sakta.
+
+
+DECISIONS :
+
+1. Maan lo kisi ne environment me likha: ENABLE_TEST_ROUTES=banana ya ENABLE_TEST_ROUTES=true. Server ko kya karna chahiye?
+
+
+a => Truthy set allow karna (1, true, yes sab ko ON maano)
+
+COST = Kal ko koi typo karega ya galat value dega aur pata nahi chalega ki konsi value valid hai.
+
+
+b => fail-fast (Agar koi banana likhe toh server start hi na ho, crash ho jaye)
+
+COST = Agar kisi ne galti se koi anjaani value set kar di, toh poori API crash ho jayegi aur genuine users ke liye service down ho jayegi.
+
+
+c => Sirf aur sirf exact "1" = ON, baaki sab kuch = OFF (CHOSEN ✅)
+
+- Jab tak exact character "1" nahi milega, test routes kisi bhi keemat par nahi khulenge.
+Chahe koi ENABLE_TEST_ROUTES=true likhe, 0 likhe, ya banana likhe — server bina kisi risk ke chalega, lekin test route band rahega. Production me koi galti se bhi ise open nahi chhod sakta.
+
+
+
+2. Gate Kahan Lagayein? (Handler ke andar ya Registration ke waqt?)
+
+
+a => (Handler Level - Galat tareeka):
+
+COST = Route ko FastAPI me register rehne do, aur function ke andar check karo: Agar koi hacker Swagger documentation dekhega, toh use /slow-hold dikh jayega. Aur agar wo POST /slow-hold bhejega, toh FastAPI bolega: 405 Method Not Allowed — isse hacker samajh jayega ki route exist karta hai!
+
+
+b => Registration Level - Sahi tareeka):
+
+- Decorator ko hi if ke andar daal do:
+
+```
+if ENABLE_TEST_ROUTES == "1":
+    @app.get("/slow-hold")
+    async def slow_hold(...): ...
+```
+
+- Kyun chuna: Jab flag "1" NAHI hai, toh FastAPI ko sapne me bhi pata nahi hota ki /slow-hold kya hai. Route app me create hi nahi hota. Documentation me 0 mention, aur chahe GET karo ya POST, seedha 404 Not Found milta hai. Route physically exist hi nahi karta!
+
+
+-> we wrote "ENABLE_TEST_ROUTES = os.getenv("ENABLE_TEST_ROUTES")" in code, so agar .env ya system me agar ENABLE_TEST_ROUTES koi variable nahi he to wo NONE manta he, fir agar if statement chalaaye, toh NONE == '1' false de dega jisse /slow-hold not found aa jayega.
+
+
+EXECUTION :
+
+1. hum dekhenge ki agar flag ko '1' ke bina kuch b likhe jese unset, banana. zero, true, garbage etc, to kya ayega, agar purana code hota toh deta : 
+
+```
+arm=unset   listening=True health=200 healthz=200 slow_hold_get=200 openapi_slow_hold=1 ❌ (Dangerous!)
+arm=banana  listening=True health=200 healthz=200 slow_hold_get=200 openapi_slow_hold=1 ❌
+arm=zero    listening=True health=200 healthz=200 slow_hold_get=200 openapi_slow_hold=1 ❌
+```
+
+LEKIN ab jab tk 'one' na ho tb tk not found(404) de dega jisse slow hold koi use na kr paaye :
+
+```
+arm=empty   listening=True health=200 healthz=200 slow_hold_get=404 openapi_slow_hold=0 ✅
+arm=zero    listening=True health=200 healthz=200 slow_hold_get=404 openapi_slow_hold=0 ✅
+arm=true    listening=True health=200 healthz=200 slow_hold_get=404 openapi_slow_hold=0 ✅
+arm=garbage listening=True health=200 healthz=200 slow_hold_get=404 openapi_slow_hold=0 ✅
+arm=one     listening=True health=200 healthz=200 slow_hold_get=200 openapi_slow_hold=1 ✅ (Sirf yahan khula!)
+```
+
+
+-> /db-ping kyu hataya?
+
+- Hamare paas pehle se do healthy endpoints the:
+
+
+1. /health (Static check, fast, zero DB).
+
+2. /healthz (Deep check with SELECT 1)
+
+
+- /db-ping bilkul wahi kaam karta tha jo /healthz karta tha. Do alag endpoints rakhne se confusion badhta tha, isliye ise delete kar diya gaya.
+
+
+
+
+TEST 2 :
+
+-> Hum Week 6 me LLM tasks chala rahe hain. Agar hum seedhe OpenAI ya Anthropic ko hit karenge toh:
+
+- Har test run par paise lagenge.
+
+- Hum real provider ko bol nahi sakte: "Abhi mere liye 429 Rate Limit error de" ya "5 second ke liye hang ho ja". 
+
+- Isliye hume ek Fake Mock Provider banana hai (jo port 8002 par chalta hai aur LLM jaisa natak karta hai)
+
+
+DECISIONS :
+
+1. Failure Trigger (Request kaise bataye ki kaunsa error chahiye?):
+
+```
+-> Ab Fake Provider ek robot hai. Us bechare ko kaise pata chalega ki:
+
+Is wali request par usko normal 200 OK dena hai?
+
+Ya is wali request par usko 429 Rate Limit ka natak karna hai?
+
+Ya is wali request par usko chupchap 12 second tak hang ho jana hai?
+```
+
+Option A: 
+
+Hum request ke JSON me likh kar bhejte, eg : {"prompt": "the quick brown fox", "mode": "429"}
+
+Fayda: Aasan hai.
+
+Nuksan: Asli OpenAI ya Gemini ki API me "mode" naam ka koi field hota hi nahi hai! Agar hum Relay ke code me aisi fields dalenge, toh Relay ka code kharab ho jayega.
+
+
+Option B: (CHOSEN ✅)
+
+Hum JSON body ko bilkul real OpenAI jaisa saaf rakhte hain: {"prompt": "the quick brown fox"} Aur HTTP Header me ek secret tag laga dete hain: X-Fake-Mode: 429 ya X-Fake-Mode: hang
+
+Fayda: Body bilkul real provider jaisi rehti hai! Fake Provider header dekhta hai:
+
+- Header me mila X-Fake-Mode: 429? Toh wo 429 phenk deta hai.
+
+- Header me mila X-Fake-Mode: hang? Toh wo 12 second ke liye so jaata hai.
+
+
+
+2. Real LLM providers har request ka paisa kaat-te hain. Toh hamara Fake Provider apni ginti (ki uske paas ab tak kitni calls aayi hain) kahan store kare?
+
+
+Option (i): In-memory Python variable + Ek reading route (CHOSEN ✅)
+
+- Provider ke Python code me ek simple variable hai: call_count = 0.
+
+- Har request aane par call_count += 1 ho jata hai.
+
+- Aur hum GET /v1/ledger call karke poochh sakte hain: "Bata abhi tak kitni calls hui?"
+
+(Sabse sasta, sabse tez, zero setup).
+
+
+Option (ii): Database table banana
+
+Nuksan: Aaj hum database ko touch hi nahi karna chahte the.
+
+
+
+3. Provider call_count += 1 kis moment par kare?
+
+
+Option A: Middleware me (Server ke darwaze par)
+
+Jaise hi koi request server ke darwaze par aayi, bina dekhe +1 kar do.
+
+- Nuksaan : Har request aate hi count badhega, chahe JSON valid ho ya garbage.
+
+
+Option B: Handler ke andar (CHOSEN ✅)
+
+Counter tab badhega jab request /v1/complete ke handler me ghusegi.
+
+- agar koi completely malformed JSON bhejta hai jo parse hi nahi hota, toh handler usko alag track kar sakta hai.
+
+
+```
+BASICS:
+
+TOKENS : Real LLM APIs (OpenAI etc.) words ko tokens me tod kar charge karti hain (e.g. 1000 tokens = $0.002). 
+
+- Fake provider me hum deterministic math use karte hain:
+
+- tokens_in = len(prompt.split()) (Prompt ke words gin liye. Same prompt -> same tokens; lamba prompt -> zyada tokens).
+
+- tokens_out = 8 (Fixed response tokens).
+
+
+HTTP STATUS CODES : 
+
+- 200 OK(successful response with JSON body)
+
+- 429 Too Many Requests: rate limit hit, retry after : seconds header sent by provider.
+
+- 400 bad request & 401 Unauthorized : Client ka fault.
+
+
+Bind Address (127.0.0.1 vs 0.0.0.0) :
+
+- Fake provider ko sirf aur sirf 127.0.0.1 par bind karna zaroori hai.
+
+- Kyunki isme hang mode hai, agar ise 0.0.0.0 (Public IP) par khol diya toh bahar ka koi bhi user machine ke connection sockets block kar sakta hai.
+
+
+Fake provider me relay.db import nahi hona chahiye, taaki Relay ke database engine aur connection pool se iska koi lena-dena na ho.
+```
+
+EXECUTION : 
+
+Humne Fake Provider ko test karne ke liye 11 alag-alag scenarios (test cases) banaye the:
+
+ok (Normal request)
+
+ok_repeat (Wahi same normal request dubara, check krne ki dono ke exact same token aane chahiye)
+
+ok_longer (Lamba prompt)
+
+429 (Rate limit test)
+
+500 (Server error test)
+
+400 (Bad request test)
+
+401 (Unauthorized test)
+
+slow_below (3 second wait)
+
+slow_above (7 second wait)
+
+hang (Silence sleep)
+
+trickle (Dheere-dheere 1-1 byte aana)
+
+
+-> isko bas test krna tha ki fake provider sahi se kaam kra he ya nahi.
+
+
+OBSERVATION :
+
+ye sb 11 tests run kiya ki provider sahi se chalra, 
+
+- Kya code bina syntax error ke chala?
+
+- Kya status codes (429, 500, 400, 401) sahi aa rahe hain?
+
+- Kya Retry-After: 2 header aa raha hai? Isliye Step 3 me sirf wo requests bheji gayi jo turant (millisecond me ya 3s me) jawab de deti hain.
+
+
+(ok, ok_repeat, longer) :
+
+```
+listen=127.0.0.1
+
+label=ok        status=200 elapsed=0.008 tokens=(4, 8)  ledger_delta=1
+
+label=ok_repeat status=200 elapsed=0.005 tokens=(4, 8)  ledger_delta=1
+
+label=ok_longer status=200 elapsed=0.006 tokens=(12, 8) ledger_delta=1
+
+tokens_same_for_same_prompt=True 
+
+tokens_in_differs_for_longer_prompt=True
+
+imports_database=0 resolved_db_lines=0
+```
+
+(429, 500, 400, 401, slow_below) :
+
+```
+label=429 status=429 retry_after='2' ledger_delta=1
+
+label=500 status=500 retry_after=None ledger_delta=1
+
+label=400 status=400 retry_after=None ledger_delta=1
+
+label=401 status=401 retry_after=None ledger_delta=1
+
+label=slow_below status=200 elapsed=3.035s ledger_delta=1
+```
+
+
+
+TEST 3 : 
+
+-> Ab hum caller (jo httpx.AsyncClient(timeout=5.0) use kar raha hai) ki taraf khade hokar provider ko hit karte hain aur dekhte hain :
+
+- Caller ko alag-alag failures kaisi dikhti hain?
+
+- hang ki dono shaklon me kya hota hai?
+
+- Provider ke Ledger aur Caller ke records me kya fark aata hai?
+
+
+```
+BASICS :
+
+httpx.Timeout(5.0) ka Asli Sach:
+
+- Log sochte hain timeout 5.0s ka matlab hai request 5 second me khatam ho jani chahiye. Ye galat hai!
+
+- httpx me timeout=5.0 ka matlab hota hai Read Timeout : yaani network socket se agla packet aane ke beech ka maximum gap 5.0 second ho sakta hai.
+
+
+Hang Ki Do Shaklein (Silence vs Trickle) :
+
+- Silence Hang: Provider chupchap baith gaya (sleep 12s). Caller ka socket 5.0 second tak khali raha. Theek 5.0s par caller ne phenka : exc=ReadTimeout!
+
+- Trickle Hang (The Critical Leak!): Provider ne headers turant bheje (status 200), aur fir har 1.2 second me 1-1 byte bheja. 
+
+- Har byte ke beech ka gap 1.2s hai, jo 5.0s se kam hai! 
+
+- Nateeja? Poori request 8.438 seconds chali, fir bhi koi timeout nahi aaya (200 OK)!
+
+- Isse pata chalta hai ki agar koi malicious provider dheere-dheere data trickle kare, toh caller ka standard timeout use rok nahi sakta!
+
+
+Call Ledger Counting Gap: 
+
+- Jab hang mode me client ko 5.0s par ReadTimeout mila, toh client ne socha "Request fail ho gayi". Lekin Provider ke ledger me ledger_delta = 1 increment ho chuka tha!
+
+- Iska matlab: Provider ne call count kar li (paise kaat liye), par Client ke paas error aaya. Ye Month 2 ka sabse bada cost risk hai.
+```
+
+
+OBSERVATIONS :
+
+-> test 2 me humne halki obsrvations ki(ok, ok_repeat, slow_below tak), ab krenge slow_above, hang, trickle.
+
+- ye teeno lambi requests (5 se 8+ second wait karne wali) hain. Inka asil maqsad client ke timeout=5.0 ko test karna tha, isliye in teeno ko test 3 me chalaya gaya!
+
+
+slow_above (Provider 7 second wait karta hai):
+
+- Client ka timeout tha 5.0 second.
+
+- Theek 5.018 second par client ne give-up kar diya aur phenka:
+
+- exc=ReadTimeout (Kyunki 5s tak koi jawab nahi aaya).
+
+
+
+hang (Silence - Provider 12 second tak chup baith gaya):
+
+- Client ka timeout tha 5.0 second.
+
+- Theek 5.022 second par client ne give-up kar diya aur phenka:
+
+- exc=ReadTimeout!
+  
+
+-> Asli Learning: Client ko slow_above (jo jawab dene hi wala tha) aur hang (jo bilkul mar chuka tha) me koi fark nahi dikhta! Dono me client ko theek 5.0s par ReadTimeout milta hai.
+
+
+
+trickle (Dheere-dheere 1-1 byte aana - Sabse Bada Twist):
+
+- Poori request ko khatam hone me lage 8.438 seconds!
+
+- Lekin client ka timeout toh 5.0 second tha! Toh kya error aaya?
+
+- NAHI! Status aaya 200 OK (exc=none)!
+
+  
+-> Asli Learning: httpx ka 5.0s timeout Total Request Time par nahi lagta, wo Read-Gap (do bytes ke beech ke time) par lagta hai!
+
+-> Kyunki provider har 1.2 second me agla byte bhej raha tha (aur 1.2s < 5.0s tha), isliye client ne kabhi timeout raise hi nahi kiya, aur 8.4 second tak fas kar baitha raha!
+
+
+-> Aj ka maqsad sirf is problem ko expose aur naapna (measure) karna tha, solution lagana aaj ka kaam nahi.
+
+
+
+```
+SUMMARY :
+
+
+Part 1: Production Security Fix (P-44) in relay/main.py
+
+Kyun kiya?
+
+Hamare API me /slow-hold ek test route tha jo database connection ko lock karta tha. Production me bina kisi password/auth ke koi bhi ise hit karke hamare DB ke saare connections block kar sakta tha (Denial of Service - DoS attack). Saath hi duplicate /db-ping route faltu pada tha.
+
+Kya kiya?
+
+/db-ping ko code se permanently delete kar diya.
+
+/slow-hold ko Registration-Level par band kiya:
+
+if ENABLE_TEST_ROUTES == "1":
+    @app.get("/slow-hold")
+
+Default me ye variable unset (None) rehta hai, isliye production me ye route FastAPI ke router table me add hi nahi hota.
+
+
+Result (Test Se Kya Pata Chala):
+
+Automated script ne 6 alag cases (unset, 0, true, banana, 1) test kiye:
+
+Sirf exact "1" par route khula (200 OK).
+
+Baaki sabhi cases me route bilkul gayab raha (404 Not Found, documentation me 0 mention).
+
+Normal health checks (/health aur /healthz) bilkul safe aur 200 OK rahe.
+
+
+
+Part 2: Fake LLM Provider Test Lab (relay/fake_provider.py)
+
+Kyun kiya?
+
+Agle dino me hume Relay ko LLM (AI) ke sath connect karna hai. Real OpenAI ya Gemini ko bar-bar hit karenge toh paise lagenge aur errors randomly aayenge. Hume apne computer par ek aisa Mock Provider chahiye tha jo hamare ishare par deterministic fail ho sake aur apna alag hisaab (Call Ledger) rakhe.
+
+Kya kiya?
+
+Port 8002 par local mock provider banaya (zero database dependency, strictly 127.0.0.1).
+
+Request header X-Fake-Mode se humne 11 modes inject kiye: ok, 429 (Rate limit + Retry-After: 2), 500, 400, 401, slow_below, slow_above, hang, trickle.
+
+Deterministic token calculator banaya (prompt ke words gin kar tokens_in aur fixed tokens_out).
+
+In-memory Call Ledger banaya jo provider-side total calls ginta hai.
+
+
+Result (Test Se 3 Badi Learnings Nikli):
+
+Token Determinism: Ek hi prompt do baar bhejne par dono baar exact same tokens nikle.
+
+Caller Blindness: Caller ko slow_above (jo 7s baad jawab deta) aur hang (jo bilkul mar chuka tha) dono me theek 5.0s par ReadTimeout mila — caller dono me fark nahi bata sakta.
+
+Trickle Leak: httpx ka 5.0s timeout do bytes ke beech ka gap dekhta hai, total time nahi. Isliye provider ne jab dheere-dheere 8.4 second tak data bheja, toh koi timeout nahi aaya aur 200 OK pass ho gaya!
+
+The Counting Gap: Client ko ReadTimeout milne par client ne socha "call fail ho gayi", lekin provider ke ledger me call count ho chuki thi (paisa kat gaya, par client ke paas result nahi aaya).
+```
