@@ -2136,14 +2136,550 @@ recovery slower, not faster.** Direction `[MEASURED]`; magnitude `[REPORTED, NOT
   reaper `[MEASURED-R]`. That is Week 4 Din 5's `7.9 s` trap reproduced exactly. So the honest reading is:
   **the boundary is a prerequisite for a supervisor, not a substitute for one.**
 
-### Supervisor — `[NOT WRITTEN]`
+## Supervisor — `[NOTES — Week 5 Din 2, still OPEN, closes Din 6]`
 
-Owner: **Week 5 Din 2, Step 3.** Needs `docker-compose.yml` `restart:` on all five processes, a
-restart-to-first-claim measurement, and the run Month 1 never did — worker and reaper killed in the **same**
-outage. Until then README row 9 stays `[NO EVIDENCE]` and promise #4's process half stays open.
+> **This section is notes, not the decision.** `WEEK_05.md` publishes `D-30` on Din 6, and Din 2's own scope
+> guard says today produces notes for this section and nothing more. **Do not read the `Chose` below as
+> published** — it is a measured candidate with two gates unsatisfied.
+
+**The scope defect this section opened on, and it was real.** The plan said *"`restart:` policy, **on all five
+processes**"*. `docker compose ps` lists only `db`; Relay's five processes run on the host, so `restart:` could
+not reach them without first moving them into Compose. Three options, priced:
+
+| Option | Cost |
+|---|---|
+| (a) five processes into Compose + `restart: unless-stopped` | The production answer. Needs an image or source mount, a network rename, and `DATABASE_URL` moving from `localhost:5433` to `db:5432` — **which invalidates every retained Week 5 log as a comparison baseline.** Out of Din 2's budget |
+| (b) a host supervisor script in `scripts/`, relaunching on exit | Measurable today. Windows-specific, and **not a deployable artifact** |
+| (c) `restart:` on `db` only | One line, and restarts **no** Relay process. Does not answer the question |
+
+**Chose (b)** — `scripts/supervisor.py`, supervising worker and reaper. **Rejected (a) on budget and on
+baseline-invalidation, not on merit**, and it remains the production answer; **rejected (c)** because it
+satisfies the plan's wording while measuring nothing, which is the `P-31` shape.
+
+**What Din 2 measured `[MEASURED 2026-09-25]`:**
+
+| Number | Value | Reading |
+|---|---|---|
+| `restarts` | `4` (2 worker, 2 reaper) | **Not evidence of a missing boundary.** Three came from deliberate `SIGKILL`; the first was `exit 1` at `2.04 s` uptime — `os._exit(1)` from the `crash_at` hook on the poison-pill job. **That is `P-36` firing, and the supervisor restarting it is the first direct evidence for the one failure class no boundary can catch** |
+| `restart_to_first_claim` | `2.790 s`, of which `~0.99 s` is interpreter start + `src.database` import and `~1.8 s` is handshake + poll tick | The launch/poll split this entry asked for. **Start clock is console-only — `P-53(c)`** |
+| lease-anchor → reclaim | `35.191 s` = `30 s` lease + `5.19 s` restart and poll latency | **Finite, which is the whole point.** Reported as `fault_to_reclaim` and that label overstates it — `P-53(a)` |
+| crash-loop backoff | observed `2.00 s` then `1.00 s` | Uptime-gated with a **reset**, not a ramp. **`[NOT A BOUND]` — `P-53(d)`** |
+
+**Two gates still unsatisfied, and both block closing this entry:**
+
+1. **The `~30 s` DB-down run was not performed** — the supervisor log spans `12.1 s`. So *"restarts stay bounded
+   against a permanently-down dependency"* is `[NOT SATISFIED BY EVIDENCE]`, and the measured reset behaviour
+   suggests the honest answer is *no*.
+2. **`n = 1`, and never under load.** Promise #4's claim is that all three processes survive *together*. Din 2
+   ran one worker, one reaper, one dispatcher, one outage each.
+
+**Therefore README rows 7 and 9 and promise #4's process half were deliberately not updated on Din 2.** Row 9's
+verdict stays `[NO EVIDENCE]`. Owner: **Din 6.**
+
+**And the prerequisite claim from Din 1 now has its second number.** Recovery through the boundary costs
+`POLL_INTERVAL + failure_cost ≈ 5.27 s` with the job's state intact; recovery through a restart costs the
+in-flight lifecycle write plus `lease_remainder + reaper poll`, measured at `35.191 s`. **Two orders of
+magnitude apart, in the direction Din 1 predicted** — the boundary is the prerequisite, the supervisor is what
+covers `P-36`, and neither substitutes for the other.
 
 **Revisit when:** Din 2 adds the reaper and dispatcher boundaries and the supervisor (which fills the empty
 section above and is what closes this entry on Din 6); when the third backoff arm is run; when the terminal-mark
 and heartbeat paths are guarded (`P-48`, which turns `Cost 7` and `Cost 8` into settled behaviour rather than
 open defects); and when a multi-process outage produces a real connection-storm number, which is the one place
 `Cost 4` stops being an inference.
+
+### Supervisor — Week 5 Din 6, decided
+
+Closed on Week 5 Din 6 based on Din 2 baselines and Din 5 Step 6 measurements.
+
+#### Chosen: Option (b) host supervisor (`scripts/supervisor.py`) with process prefixes
+
+Supervises worker, reaper, and dispatcher simultaneously on the host. Instrument evolution on Din 5:
+- Dispatcher added to supervisor process tree under `RUN_DISPATCHER=1` (`scripts/supervisor.py`).
+- Distinct stdout/stderr line prefixes (`[worker]`, `[reaper]`, `[dispatcher]`) added to cleanly isolate stream outputs across concurrent processes.
+
+#### Evidence
+
+Din 2 established baseline mechanics (`w5d2_step5_supervisor.txt`): 4 restarts (2 worker, 2 reaper), launch latency `2.790 s`, and lease-anchor to reclaim `35.191 s`. Din 5 Step 6 ran both previously unsatisfied gates:
+
+1. **Gate 1 (`w5d5_step6_fault.txt`, `w5d5_step6_summary.txt`) — Restarts bounded over a `~30 s` DB-down: satisfied as written.**
+   A `35.006 s` outage (`16:03:57.355` stop_returned to `16:04:32.361` start_begin) resulted in `EXITED lines = 0` across all three supervised processes (`w5d5_step6_summary.txt`). All child processes survived intact. The resilience bound derived entirely from the poll-loop exception boundaries (`D-30` Part A), not from the supervisor's restart logic: zero process exits meant the supervisor's backoff code was exercised zero times.
+2. **Gate 2 (`w5d5_step6_final_jobs.txt`, `w5d5_step6_summary.txt`) — Fleet resilience under backlog load: satisfied for worker/reaper, half-satisfied for dispatcher.**
+   Under a 30-job backlog, worker and reaper drained all work to completion (`succeeded|1|29`, `succeeded|2|1`, `pending_or_running=0` in `w5d5_step6_final_jobs.txt`). In-flight Job 8 was reclaimed by the reaper at lease expiry and succeeded on attempt 2. Dispatcher survived the outage (recording 7 `poll_error` lines), but processed 0 outbox rows because the backlog consisted of sleep jobs that produce no outbox side effects. Total runs: `n = 2` (Din 2 + Din 5).
+
+#### Cost
+
+1. **Bound comes from poll-loop exception boundaries, not the supervisor backoff.** With 0 child process exits during the 35 s outage, the supervisor's restart/backoff logic (`scripts/supervisor.py`) ran 0 times. The uptime-reset defect (`P-53(d)`) remains unexercised and unpriced for non-boundary crashes (`os._exit`, `P-36`).
+2. **Dispatcher was not under message load during Gate 2.** Backlog consisted of sleep jobs that produce no outbox records; dispatcher survived database unavailability but processed 0 events.
+3. **Host script is Windows-specific and non-deployable.** Uses `subprocess.Popen` on Windows host rather than container orchestration (`systemd`, Kubernetes, Docker Compose restart policies).
+
+#### Rejected
+
+**Rejected:** Option (a) — Moving all five processes into Docker Compose with `restart: unless-stopped` — rejected because altering host network ports (`localhost:5433` -> `db:5432`) would invalidate all retained baseline measurements and exceeded the development budget; remains the production target.
+**Rejected:** Option (c) — `restart:` policy on PostgreSQL container (`db`) only — rejected because restarting Postgres alone does nothing to restart crashed Python host processes, satisfying the plan's wording without providing process resilience.
+
+#### Owner / Revisit
+
+Crash-loop backoff pricing under rapid `os._exit` loops (`P-36`, `P-53(d)`), child PID logging, and containerized deployment are owned by **Week 6**.
+
+---
+
+## D-31 — `pool_pre_ping` stays `False`, and this time the premise is true and the benefit was measured at zero
+
+**Status: decided on Week 5 Din 2 (`2026-09-25`). Same verdict as Week 4 Din 5, different reason — and the old
+reason must not be quoted, because when it was written it was false.**
+
+**Why this decision was re-taken rather than inherited.** Week 4 Din 5 rejected `pool_pre_ping=True` on the
+stated ground that the worker and reaper are *"polling loops with built-in exception handling"*. `P-43`
+established that **no such handling existed** — the loops had no `try` at all, and a database restart ended the
+process. So Din 5's reject was a correct conclusion resting on a false premise, which is not a decision, it is a
+coincidence. Week 5 Din 1 built the worker's claim-poll boundary and Din 2 built the heartbeat, mark, reaper and
+dispatcher boundaries. **The premise is now true, so the decision is now answerable**, and it was allowed to
+flip.
+
+**Options:**
+- (a) `pool_pre_ping=True` on the single `create_async_engine` in `src/database.py`
+- (b) `pool_pre_ping=False`, relying on the code-level boundaries plus SQLAlchemy's pool-generation invalidation
+- (c) `True`, but only for the polling processes — a second engine or an env-gated flag
+
+**Chose: (b) — `pool_pre_ping` stays `False`.**
+
+### The benefit, measured against a real outage rather than asserted
+
+The day's own harness printed both arms' `poll_failures` without running the `True` arm (`P-52`). The reviewer
+ran it: one variable, both arms on the same disposable database, `echo=False`, `POLL_INTERVAL = 2.0 s`, outage
+`25 s` injected with `docker compose stop db`:
+
+| | `pre_ping=False` | `pre_ping=True` |
+|---|---|---|
+| `poll_failures` during the outage | `5` | `5` |
+| first error class | `DBAPIError` | `ConnectionError` |
+| failed polls after `docker compose start db` | `1` | `1` |
+| recovery error classes | `ConnectionError` | `CannotConnectNowError` |
+| first success after start | `2.191 s` | `2.156 s` |
+
+`[MEASURED-R 2026-09-25]`
+
+**Mechanism for the identical count.** `pre_ping` issues a lightweight ping at **checkout**; on failure
+SQLAlchemy invalidates that connection and tries to make a new one. **A new connection to a stopped server also
+fails.** The flag cannot manufacture a reachable database, so the count is governed by
+`outage / (POLL_INTERVAL + failure_cost)` — Din 1's term — in both arms.
+
+**The flag is nevertheless *effective*, and that distinction is the reason this table has an error-class row.**
+`P-45`'s `pool_size=2` defect was a setting that was configured and never observed. Here the differential is
+visible: without `pre_ping` the first failure happens on the **stale pooled handle** (`DBAPIError`); with it, the
+handle is discarded during checkout and the first failure happens on the **connect path** (`ConnectionError`).
+**So the flag does what it claims. What it does not do is change any outcome that matters.**
+
+**And its one theoretical benefit did not materialise.** `pre_ping`'s only real win is the narrow case where the
+server is back and the pooled handle is dead: it replaces the handle inside the checkout and saves exactly **one**
+failed poll. Measured, failed polls after recovery were `1` in **both** arms. Din 1 had already retired
+README's *"possibly one failed poll"* for the worker by measuring `17` clean cycles with a successful first poll
+after recovery; this measures that `pre_ping` is paying for a saving that is already `0`.
+
+### The cost, with `echo` isolated because the KEY required it
+
+Per-checkout, checkout-and-return only, no statement. `n = 100` (user's run) and `n = 200` (reviewer's,
+nearest-rank percentiles):
+
+| `echo` | `pre_ping` | mean | p50 | p99 | source |
+|---|---|---|---|---|---|
+| not recorded | `False` | `0.1095 ms` | `0.0958 ms` | `0.2892 ms` (= max, `P-52`) | user, `n = 100` |
+| not recorded | `True` | `3.1355 ms` | `2.7906 ms` | `4.5898 ms` (= max, `P-52`) | user, `n = 100` |
+| `False` | `False` | `0.1085 ms` | `0.0928 ms` | `0.2726 ms` | reviewer, `n = 200` |
+| `False` | `True` | `6.7723 ms` | `4.8446 ms` | **`33.7458 ms`** | reviewer, `n = 200` |
+| `True` | `False` | `0.1624 ms` | `0.1512 ms` | `0.6812 ms` | reviewer, `n = 200` |
+| `True` | `True` | `3.6695 ms` | `3.0064 ms` | `8.3245 ms` | reviewer, `n = 200` |
+
+**The honest cost is a range, not a point: `p50` `+2.70 ms` to `+4.75 ms`, roughly `20×`–`50×` the un-pinged
+checkout, with a `p99` tail measured between `8.3 ms` and `33.7 ms`.** `echo` was isolated as a fourth arm
+because `src/database.py` hardcodes `echo=True` and the day's log did not say which it used — **and `echo` turned
+out not to be the dominant term; run-to-run variance is.** The cost is a real network round trip over the Docker
+Desktop port mapping, and it is the tail rather than the median that decides this.
+
+### `Cost` — and the field has to be written per process, because one flag serves five
+
+`src/database.py` has a single `create_async_engine` and all five processes import it. There is no
+`pool_pre_ping` that applies to the worker only:
+
+| Process | Checkout rate | What `+2.7`–`4.8 ms` per checkout means |
+|---|---|---|
+| worker | `~0.5`/s | Round-off. Irrelevant |
+| reaper | `~0.5`/s | Round-off. Irrelevant |
+| dispatcher | `~0.5`/s idle, higher when draining | Round-off |
+| **API (`src/main.py`)** | **one per request, per dependency** | **Added directly to `p50` request latency**, and the `33.7 ms` tail lands on tail latency — which is the number `D-28`'s metrics report |
+| sink | one per delivery | Adds to the receiver's response time, inside the dispatcher's `timeout=5.0` |
+
+**The decision is single and the cost is not shared evenly. The processes that would benefit pay nothing; the
+process that pays the most benefits least** — an API request against a stopped database is rejected, not
+retried (Month 1 promise #1's scope), so `pre_ping` buys the API no availability at all. **That asymmetry is the
+reason, not the `3 ms`.**
+
+### Killing the strongest alternative
+
+**(c) — `True` for polling processes only** is the genuinely attractive option, because it puts the cost exactly
+where the benefit is. **It fails on two counts.** First, the benefit it would buy is the `1` saved poll that was
+just measured at `0`, so it optimises a quantity that does not exist. Second, it requires either a second engine
+or an env-gated flag in `src/database.py`, which means **the five processes stop sharing one connection
+configuration** — and `application_name` attribution, the `pool_size`/`max_overflow` budget from Week 4 Din 5
+(`5 + 10`, fleet ceiling `75`, headroom `~3–5`), and `D-28`'s metrics all currently read that single engine.
+Forking it to gain zero measured polls is the wrong trade. **Rejected on measurement, not on effort.**
+
+### What this decision does **not** claim
+
+- **It does not claim `pre_ping` is useless in general.** Its real use case is long-idle pools behind a
+  connection killer — a load balancer or firewall with an idle timeout, or `idle_in_transaction_session_timeout`
+  — where the server is **up** and the handle is dead. Relay's measured failure mode is the server being
+  **down**, and those are different. If Relay later sits behind a proxy with an idle cutoff, this decision is
+  invalidated and must be re-taken, not quoted.
+- **It does not claim the boundaries make `pre_ping` unnecessary for the paths that killed the worker.**
+  `pre_ping` runs at **checkout**. Both of Din 1's deaths were mid-transaction — the terminal mark's `UPDATE`
+  and the heartbeat's `UPDATE`, on already-checked-out connections. **`pre_ping` never runs mid-transaction, so
+  it was structurally incapable of preventing either**, and this is worth stating because reading `pre_ping` as
+  the answer to those deaths is an easy mistake. `[INFERRED from SQLAlchemy's checkout-time contract]`
+- **It does not make the pool safe.** `P-45`'s unobserved `pool_size=2` is still unobserved, and pool exhaustion
+  numbers are owed to Din 4.
+
+**Environment co-dependency:** this decision assumes the DBAPI surfaces a broken connection as an exception on
+first use, which asyncpg does. It says nothing about a connection that is alive at the TCP level and
+unresponsive at the protocol level — a hung server rather than a stopped one. **Nothing in Relay currently
+detects that case**, and no `connect_timeout` or `command_timeout` is configured on the engine. `[NOT MEASURED]`
+
+**Revisit when:** Relay runs behind any proxy or firewall with an idle-connection timeout; when `statement_timeout`
+or `command_timeout` gets set (a different mechanism for the same class of problem, and the one that covers the
+hung-server case `pre_ping` does not); when Din 4's pool-exhaustion numbers exist, since checkout latency and
+checkout *availability* interact under saturation; or when the API's `p99` is measured under load, because that
+is the number this decision is actually protecting.
+
+---
+
+## D-32 — the publishing surface is a per-file classification with a directory-level fallback, defaulting to ignore inside daily/
+
+**Written Week 5 Din 3 (`2026-09-26`). Status `DRAFT` — final text closes on Din 6.** The draft the user wrote
+is `scratch/d32_classification_rule.md`; the `.gitignore` implementing it is committed; **the part that keeps
+this `DRAFT` rather than `OPEN` is `P-54`.**
+
+### The problem this decision is actually about
+
+`P-47`'s sentence: *"this is a classification problem, not a typo."* Two separate questions were being answered
+by one mechanism:
+
+| Question | What decides it |
+|---|---|
+| *"what does someone cloning this repository see?"* | `.gitignore` + `HEAD` |
+| *"is this evidence alive **anywhere**?"* | commit history, which `.gitignore` does not control |
+
+`P-45`, `P-29` and `P-50` are about the second. `P-47` is about the first. **This decision answers the first
+and names the second as out of scope** — and the proof that the second was never answered is that
+`git log --all --name-only -- "logs/"` returns **`0` unique paths across the entire history**
+`[MEASURED 2026-09-26]`. Not one runtime log has ever been committed.
+
+### Chosen: a file-level ignore inside `docs/daily/`, plus root-anchored runtime patterns
+
+Three `.gitignore` changes, measured in place `[MEASURED 2026-09-26]`:
+
+| Line | Was | Is | Why |
+|---|---|---|---|
+| `39` | `logs/` | `/logs/` | unanchored globs match at any depth, which is how `docs/logs/WEEK_05.md` — the file every day's work is written into — ended up in no commit. `*.log` on line `38` still covers runtime output everywhere, so anchoring costs nothing |
+| `47` | `**/daily/` | `**/daily/**/*KEY*.md` | a directory ignore cannot be punched through: **git does not descend into an ignored directory, so a negation inside it never runs.** Not an ordering problem — a traversal one. The only shapes that work are a file-level ignore (this) or re-including the directories first (`!**/daily/**/` before the file negation), and the second is harder to read |
+| `72` | `scripts/` | *removed* | `scripts/supervisor.py` is Din 2's measurement instrument. An instrument outside version control cannot be re-run against its own results |
+
+### Policy table as decided — and the `—` rows are the reason this is `DRAFT`
+
+| Class | Count on disk | State | Reason |
+|---|---|---|---|
+| root `/logs/*.log` | `147` | `Local` | high-volume volatile stdout/stderr and `echo=True` SQL traces. Permanent packfile growth, no structured value |
+| `docs/logs/*.md` | `6` | **`Public`** | curated weekly synthesis. Same artifact class as the five Month 1 logs that were already tracked; the exclusion was collateral from an unanchored glob |
+| `scripts/` | `2` | **`Public`** | reproducible instruments, not throwaway |
+| `scratch/` | `11` | `Local` | disposable one-off harnesses |
+| `docs/daily/**/*KEY*.md` | `26` | `Local` | sealed answers. Publishing defeats the seal for every future reader |
+| `docs/daily/**/*BRIEF*.md` | `26` | **`Public`** | the day's specification, gates, and expected outputs |
+| `docs/daily/**/*PREDICTIONS_FROZEN*.md` | `13` | **`Public`** | the hashed pre-measurement record. **This class is the one that makes the whole process auditable by a third party, and it was the class most completely absent from the repository** |
+| `docs/daily/**/*HANDOFF*.md` | `6` | **`Public`** | cross-week state, referenced from `DECISIONS.md` and `MAP.md` |
+| `docs/blog/`, `docs/career/`, `docs/dsa/` | — | `Local` | reconciles with `f6a85c2`, `2582b37`, `15d82d9` (`2026-09-24`): drafts and personal tracking are outside the engine's surface. **Note the asymmetry honestly — those three commits removed them from `HEAD` and the blobs remain readable in history** |
+| **`*_ANSWERS.md`** | **`13`** | `Local` | `### After KEY` blocks paraphrase sealed outcomes (`P-54`); publishing breaks seal for future readers |
+| **`*_DESIGN.md` / `*_PROBLEM.md` / `*_PROPERTY.md`** | **`7`** | `Local` | intermediate working artifacts and scratch hypotheses outside public surface (`P-54`) |
+
+### Cost, and the first item is the one that keeps the status at `DRAFT`
+
+1. **The rule is an allow-list of *ignores*, so its default is publish.** Four classes are enumerated; nine
+   exist. **Twenty files in four unenumerated classes became publishable with no decision**, and `C1` could not
+   see it because `C1` asks only about `BRIEF` and `KEY` (`P-54`). Any class invented on a future day publishes
+   unless someone remembers. **The alternative shape — ignore `docs/daily/**` and enumerate the publishes — was
+   considered and is harder to write (it needs `!**/daily/**/` to restore traversal) but fails safe.**
+   **Owner: Din 6.**
+2. **The pattern is extension- and token-bound.** `DIN_04_KEY.txt` and `DIN_04_SEALED.md` both publish
+   `[MEASURED 2026-09-26]`. The seal depends on a naming convention holding, not on the rule.
+3. **Case-sensitivity is supplied by the filesystem, not the pattern.** `DIN_04_key.md` is ignored here only
+   because `core.ignorecase = true` on this Windows checkout. `gitignore(5)` globs are case-sensitive, so a
+   lowercase-named KEY would publish on a Linux clone or CI runner. `[MEASURED 2026-09-26]` locally;
+   `[INFERRED]` for Linux, not run.
+4. **Widening is reversible; publishing is not.** `git rm --cached` + commit removes a path from `HEAD` and
+   leaves the blob readable in the commit that added it — measured. If that commit was pushed, it exists on
+   machines `filter-repo` does not reach. **Every `Public` row above is a one-way door.**
+5. **History is untouched and out of scope.** `docs/blog/`'s nine files, `scratch/`'s harnesses, `docs/career/`,
+   `docs/dsa/` are all readable from history today. `git show 997f5cd:scratch/step6_harness.ps1` returns
+   `3068` bytes `[MEASURED 2026-09-26]` — the harness `P-50` blames is auditable verbatim even though it is not
+   in `HEAD`.
+6. **`.gitignore` narrows accidental publication; it does not close it.** `git add -f`, an editor's "stage all",
+   and any filename outside the pattern all remain. **Narrowed, not eliminated.**
+7. **`Local` status leaves scratch answers unbacked.** The 13 `*_ANSWERS.md` and 7 `_DESIGN/_PROBLEM/_PROPERTY` files exist solely on the author's local workstation; a catastrophic disk loss loses those writeups. Accepted deliberately: losing private scratch notes is reversible; leaking sealed answer keys to public git history is irreversible (`D-04`, `D-32` Cost #4).
+8. **Flip rule requires explicit directory traversal un-ignore.** Because Git does not descend into ignored directories, ignoring `**/daily/**` requires un-ignoring directories (`!**/daily/**/`) before leaf file re-inclusions (`!**/daily/**/*_BRIEF.md`, etc.) can match.
+9. **Dual hash increases verification ceremony.** Maintaining `.gitattributes` (`eol=lf`) and recording both `sha256` and `git hash-object` blob IDs requires multi-step seal verification scripts (`P-57`).
+
+### Transcript and retention rule (the `P-50` half)
+
+Every measurement harness writes stdout and stderr to a file whose name contains a run id; no harness deletes an
+existing log. **`Write-Host` or bare `print` is not a transcript.** Required granularity is **microseconds**
+(`%Y%m%d_%H%M%S_%f`) — second granularity collides on two runs inside the same second, measured, and
+`scratch/step5_preping_bench.py` still has the second-granular form (`P-50` amendment).
+
+**What this rule does *not* say:** how long `logs/`' `147` files are retained, or which are pruned. That half is
+deliberately unwritten — **Din 3 was the day to write the rule, not the day to apply it**, which is the exact
+error `P-50` describes. **Owner: after Din 6.**
+
+**Revisit when:** a new artifact class appears under `docs/daily/` · the repository is cloned onto a
+case-sensitive filesystem or built in CI · `logs/` growth makes retention a real cost · or anything in `HEAD`
+needs to become private, at which point item 4 applies and the answer is *"you cannot, only going forward"*.
+
+### Week 5 Din 6 — final
+
+Four decisions closed per user choice on Week 5 Din 6:
+
+1. **`*_ANSWERS.md` (13 files) -> `Local`**
+   - **Chose:** `Local`. Contains `### After KEY` blocks paraphrasing sealed outcomes; keeping them local preserves the verification seal for all readers cloning the repository.
+**Rejected:** `Public` — would permanently leak sealed outcomes into git history (`P-54`), violating one-way door heuristic (`D-04`, `D-32` Cost #4).
+
+2. **`*_DESIGN.md` / `*_PROBLEM.md` / `*_PROPERTY.md` (7 files) -> `Local`
+   - **Chose:** `Local`. Scratch notes, problem sketches, and intermediate property drafts remain outside the repository's public contract.
+**Rejected:** `Public` — exposes raw, unverified working hypotheses in the public tree without architectural or empirical gates.
+
+3. **Rule shape -> Flip to default-ignore inside `daily/`**
+   - **Chose:** Flip rule (`**/daily/**` ignored by default, with directory traversal `!**/daily/**/` and explicit re-inclusions for `_BRIEF.md`, `_PREDICTIONS_FROZEN.md`, `*HANDOFF*.md`). Fail-safe design guarantees that any future unenumerated class is ignored by default.
+**Rejected:** Allow-list of ignores (default-publish, Din 3 shape) — fail-open; 20 unenumerated files became publishable without decision (`P-54`).
+
+4. **Seal hash (`P-57`) -> Both (`.gitattributes` + dual-hash)**
+   - **Chose:** Both. `.gitattributes` enforces `eol=lf` on `*_PREDICTIONS_FROZEN.md` to prevent Windows CRLF mutation on fresh clones, alongside recording both working-copy SHA-256 and immutable `git hash-object` blob IDs in seal audit files.
+**Rejected:** Single working-copy SHA-256 alone (`P-57` CRLF mutation fails fresh clone audit); `.gitattributes` alone without canonical blob verification.
+
+5. **Tracked `.pyc` handling (`day1_async.cpython-313.pyc`) -> Untrack (`git rm --cached`)**
+   - **Chose:** Untrack from Git index. Compiled bytecode is build output, not source code.
+   - **Cost:** Historical blob (`868` bytes in `01f42c6`) remains in commit history; new positive control for non-empty tracking is `*_BRIEF.md` instead of `pyc_control`.
+**Rejected:** Leaving tracked `.pyc` in HEAD — permanently keeps platform-specific bytecode in repository tree.
+
+With the Flip rule ignoring `**/daily/**` by default and all 20 `_ANSWERS.md`, `_DESIGN.md`, `_PROBLEM.md`, `_PROPERTY.md` files classified as `Local`, the untracked sensitive surface is `p54 = 0`.
+
+### Week 5 Din 6 review — two lines above do not match the repository `[MEASURED-R 2026-09-29]`
+
+1. **Item 4 and Cost 9 say `eol=lf`; `.gitattributes` line 2 says `-text`.** They are different mechanisms, and the
+   difference is measurable on this machine: on a CRLF working copy of `DIN_04_PREDICTIONS_FROZEN.md`, `-text` gives
+   `git hash-object` `81584003…` against the `HEAD` blob `90f6da79…`; `eol=lf` gives `90f6da79…`. Fourteen of the
+   sixteen tracked seals are CRLF in the author's working copy since a `git pull --rebase` on `2026-09-28 17:28:51`, so
+   under the committed `-text` both halves of the dual hash fail for them today. Detail and the restore procedure:
+   `P-57` amendment (Week 5 Din 6 review). **Decision owed, Week 6 Din 1 Step 0:** change line 2 to what this entry
+   says, or keep `-text` and amend item 4 with this cost.
+   - **Week 6 Din 1 Step 0 decision:** Kept `-text` on `.gitattributes`. Cost: working copy SHA-256 diverges on CRLF checkout until restored via `scripts/seal_audit.ps1 -Restore`; immutable Git blob ID (`git hash-object`) remains canonical and byte-auditable across all clones.
+   - **Week 6 Din 1 review note `[MEASURED-R 2026-10-02]` — the pick stands; one clause of its Cost does not.**
+     `git hash-object <file>` hashes the **working-copy** bytes after the attribute's clean filter, and under `-text`
+     there is no filter: on a CRLF copy it gives `81584003…` against the committed blob `90f6da79…` (`P-57` amendment,
+     replica). The number every clone agrees on is the committed blob, read as `git rev-parse <commit>:<path>` (or
+     `git cat-file blob`), not `git hash-object`. Today `hash-object` matches `HEAD` for `17/17` seals only because
+     the working copies are LF again after the restore. Two costs of `-text` that the sub-bullet does not name:
+     (a) the next tool that rewrites a seal as CRLF makes `hash-object` diverge too, where `eol=lf` would not; (b) a
+     `git add` of such a file stores the CRLF bytes as a **new blob** (`P-57` Consequence 2) — named `git add` narrows
+     that, it does not close it. Item 4 above still reads `eol=lf`; read it as `-text` with these costs.
+     `scripts/seal_audit.ps1` detects drift on every run; it does not prevent it.
+2. **Item 3 says the flip *"guarantees that any future unenumerated class is ignored by default."*** Cost 6 of this
+   same entry says `.gitignore` *"narrows accidental publication; it does not close it"* (`git add -f`, editor
+   stage-all). The flip changes the **default**; *guarantees* overstates it. Read item 3 as *"defaults to ignored"*.
+
+---
+
+## D-33 — `requirements.txt` pins direct dependencies with `==`, derived from the declared set, and neither `pip freeze` nor `pip list --not-required` can produce it
+
+**Written Week 5 Din 3 (`2026-09-26`).** Week 4's DoD carried this as `slipped`; the file had eleven lines and
+zero constraints.
+
+### Chosen: eleven `==` pins, the extra preserved, `pip` excluded
+
+```
+fastapi==0.141.1        uvicorn==0.52.1          sqlalchemy==2.0.51
+asyncpg==0.31.0         psycopg[binary]==3.3.4   python-dotenv==1.2.2
+alembic==1.19.0         pytest==9.1.1            pytest-asyncio==1.4.0
+hypothesis==6.165.2     httpx==0.28.1
+```
+
+Verified `[MEASURED 2026-09-26]`: `==` lines `11` · `psycopg\[binary\]==` present `1` · `^pip==` absent `0` ·
+`sqlalchemy` and `pytest` both present · `pip install --dry-run --ignore-installed --report -r requirements.txt`
+exits `0` and resolves **`35`** distinct packages from PyPI.
+
+### Why both shortcuts produce a wrong file, and one of them produces a wrong file with the right line count
+
+| Command | Lines | Defect |
+|---|---|---|
+| `pip freeze` | **`35`** | `24` transitive packages. Pins the resolver's output as if it were the input |
+| `pip list --not-required --format=freeze` | **`11`** | **same count, different set** |
+
+The `11 == 11` collision is a coincidence and the set is wrong in three places `[MEASURED 2026-09-26]`:
+
+```
+alembic==1.19.0 | asyncpg==0.31.0 | fastapi==0.141.1 | httpx==0.28.1 | hypothesis==6.165.2 |
+pip==26.0.1 | psycopg==3.3.4 | psycopg-binary==3.3.4 | pytest-asyncio==1.4.0 |
+python-dotenv==1.2.2 | uvicorn==0.52.1
+```
+
+1. **`pip` itself is included.** Not a Relay dependency.
+2. **`sqlalchemy` and `pytest` are both missing**, and both are direct dependencies —
+   `SQLAlchemy Required-by: alembic`, `pytest Required-by: pytest-asyncio`. **`--not-required` means "no
+   installed package depends on this", not "you did not declare this".** `sqlalchemy` is a core `src/` import
+   and the flag classifies it as transitive because `alembic` happens to need it. **A reverse-dependency graph
+   does not know what you import.**
+3. **`psycopg[binary]` splits into two lines** — `psycopg==3.3.4` and `psycopg-binary==3.3.4` — and the `[binary]`
+   extra declaration is lost. On a fresh machine pip may then try to build from source.
+
+**So the count check alone is not a check.** `C4` verifies count **and** the extra **and** the two omissions
+**and** `pip`'s absence, because a wrong file passes the count.
+
+### Cost
+
+- **`==` requires manual bumps.** No patch-level security fix arrives without an edit. Accepted deliberately:
+  Relay has no CI, so an automatic minor bump would first be observed as a failing run on the user's machine.
+  **`~=` was rejected for the same reason** — it permits an unreviewed patch change between two runs, which is
+  the one thing that makes *"the same commit produced a different result"* possible.
+- **This is a pin file, not a lock file.** It constrains eleven direct dependencies; the other `24` resolve
+  freely. **Reproducibility is narrowed, not achieved** — `pip install -r requirements.txt` on a fresh machine
+  can still pick a different `starlette` or `greenlet`. A hash-pinned lock (`pip-compile`, `uv lock`) is the
+  shape that closes it and is **not** being adopted now.
+- **`pip install --dry-run` without `--ignore-installed` is decorative.** It prints
+  `Requirement already satisfied` for every line and exits `0` without touching the network
+  `[MEASURED 2026-09-26]` — it would pass a pin file that cannot resolve at all. `--ignore-installed` plus
+  `--report` is what makes it a real check.
+- **`psycopg[binary]==3.3.4` pins the extra's version through the base package.** It does not pin the wheel's
+  build. `[INFERRED]`
+
+**Revisit when:** CI exists, at which point the lock-file question re-opens with a real forcing function · or a
+fresh-machine resolve conflicts on these eleven, which is the measurement that would falsify the "pins are
+enough" position.
+
+---
+
+## D-34 — an LLM call's result and tokens live in a per-attempt `llm_calls` table keyed by `(job_id, claim_generation)`, written in its own transaction before the mark; not as columns on `jobs`
+
+**Decided by the user on Week 6 Din 3 (`2026-10-04`), Step 3a. Implemented in `79b8519` for the success path only.**
+Migration `w6d3_llm_calls` (`down_revision = w4d4_sink_unique`), applied on disposable `relay_w6d3` only (dropped).
+**The evidence DB `relay` is still at `w4d4_sink_unique` and has no `llm_calls`** `[MEASURED 2026-10-04]`. Text below
+separates the user's stated reasons (quoted from `DIN_03_ANSWERS.md`) from the reviewer's audit.
+
+### Problem
+
+`llm_completion` returns `(text, tokens_in, tokens_out)`. Before Din 3 the return value was discarded
+(`worker.py:266` at `ddb5e8a`: `await handler(payload, job_id)`), so the only record of a token count was a worker
+stdout line in gitignored `logs/` `[MEASURED]`. Two facts have to land in different places: **the job's result** (one
+per job, and a fenced worker's result must not become it) and **the provider's bill** (one per call, including calls whose
+result is discarded).
+
+### Options (BRIEF Step 3a)
+
+| Option | Shape |
+|---|---|
+| (a) columns on `jobs` (`result_text`, `tokens_in`, `tokens_out`) | written by the mark `UPDATE`, atomic with `status` |
+| **(b) per-attempt table** | one row per provider call, `job_id` + `claim_generation` |
+| (c) both | job result on `jobs`, bill per attempt in the table |
+
+### Chosen: (b)
+
+`llm_calls(id bigserial, job_id bigint NOT NULL, claim_generation int, prompt text NOT NULL, response_text text,
+tokens_in int, tokens_out int, created_at timestamptz DEFAULT now())`, index on `job_id`. Written by
+`record_llm_call` (`worker.py:187–206`) in its **own** transaction, after the handler returns and **before** the mark.
+
+User's stated reason: *"CAS guard (claim_generation == generation) agar zombie worker ke status mark ko reject karta hai,
+to bhi provider ka actual token bill persist hona chahiye; jobs columns me failed attempts ka bill gayab ho jata aur heavy
+text TOAST I/O add karta."*
+
+### Rejected: (a), the strongest alternative — and why it fails the contract
+
+(a)'s real attraction is atomicity: result and `status='succeeded'` in one `UPDATE`, so a reader never sees one without
+the other. **That atomicity is exactly the defect.** The mark is a compare-and-set:
+`WHERE id = :id AND status = 'running' AND claim_generation = :generation` (`worker.py:364–378`). A fenced worker's mark
+matches `0` rows, so under (a) its tokens are discarded together with its status — but the provider billed that call.
+And a retried job overwrites the columns, so attempts 1 and 2 leave no bill at all. (a) can record *the job's answer*; it
+cannot record *what Relay spent*, which is the number Week 8's `job_costs` needs. The user's fencing reason is the
+load-bearing one and it holds.
+
+### Rejected: (c)
+
+User: *"sync drift aur redundant updates."* Reviewer's version of the same point: two writes with two meanings, and the
+`jobs` half re-introduces (a)'s heap cost below. (c) adds nothing (b) cannot answer with one join: the job's result is
+the `llm_calls` row with `claim_generation = jobs.claim_generation` for a `succeeded` job `[INFERRED from source]`.
+
+### Reviewer's audit of the stated reasons
+
+1. **Fencing — holds, by write order.** `record_llm_call` commits before the mark, so a fenced worker's row survives with
+   its own `claim_generation` `[INFERRED from source — no fencing run on Din 3; owner Din 5 Arm C]`.
+2. **"Failed attempts ka bill" — not implemented.** `record_llm_call` runs only after `handler` returns (`:308–319`). A
+   provider error raises past it, so a failed attempt writes **no** row. Today (b) and (a) are equally blind to failed
+   attempts. Whether a failure should write a row, and what it would contain, is open — see Cost.
+3. **"Heavy text TOAST I/O" — reversed.** `[MEASURED-R 2026-10-04]`, `10,000` rows, `EXPLAIN (ANALYZE, BUFFERS)` of a seq
+   scan selecting two narrow columns:
+
+   | `result` column | heap pages | TOAST pages | scan buffers |
+   |---|---|---|---|
+   | `NULL` | `64` | `0` | `64` |
+   | `1,500 B` inline | `2,000` | `0` | **`2,000`** |
+   | `6,000 B` (TOASTed) | `84` | `7,500` | **`84`** |
+
+   Values above the TOAST threshold (`~2 KB`) leave an `18`-byte pointer in the heap and are never read by a query that
+   does not select them. **Mid-size values stay inline and widen every heap page.** `jobs` has no index on `status`
+   (`jobs_pkey`, `uq_jobs_idempotency_key` only `[MEASURED-R]`), so the claim poll (`WHERE status='pending' … ORDER BY
+   created_at, id … FOR UPDATE SKIP LOCKED`) reads the heap — and under (a) it would read a `31×` wider one in the
+   `1,500 B` case `[INFERRED for jobs — the probe was a synthetic table]`. **The real I/O argument against (a) is inline
+   width on the polled table, not TOAST.** Rule 34: two inline columns vs five from the same row cost the same page I/O;
+   only the out-of-line case is free.
+
+### Cost
+
+- **Every read of a job's result is a join**, and "which row is the result" needs `claim_generation` — two rows can exist
+  for one job (fenced + current).
+- **Failed attempts leave no row** (audit 2). Two shapes to choose from, neither chosen: write a row on failure with
+  `NULL` tokens and an outcome (needs an `outcome` column — additive, `D-04`), or leave failures to `job_executions`. A
+  `ReadTimeout` row cannot carry tokens at all: the caller has no information about whether the provider billed (AGENTS
+  rule 29). The table can record *that* a call was attempted, never *what it cost*.
+- **`record_llm_call` sits inside the handler's `try`** → a DB fault after a billed `200` becomes a job failure and a new
+  provider call: `P-60`, `[MEASURED-R]` three `200`s, zero rows.
+- **Crash window** (rule 31): provider answered → worker killed before `record_llm_call` commits → the bill exists, the row
+  does not, the reaper reclaims after `30 s` and a second call is billed. `[INFERRED]` — Din 5 Arm C measures it.
+- **Usage fields are the provider's statement.** `tokens_out` is `candidatesTokenCount` only; thinking tokens are not read
+  (`providers.py:172–174`) `[NOT RECORDED]`.
+- **No FK on `job_id`.** Orphan rows are possible. Adding one later is backward-compatible (`ADD CONSTRAINT … NOT VALID`,
+  then `VALIDATE`), so it was correctly left out of the first migration (`D-04`).
+- **Downgrade is a data-loss operation.** `downgrade -1` dropped the table and its sequence; the next row after
+  `upgrade head` got `id=1` again `[MEASURED]`. "Reversible" holds for the schema only.
+
+**Revisit when:** Din 4 decides whether failures write a row (`D-11`'s except path) · Din 5 Arm C measures the crash
+window · Week 8 `job_costs` reads this table · or the evidence DB is migrated (user's call, not before Din 6).
+
+### Week 6 Din 4 amendment — D-34 (`2026-10-05`)
+
+**The record write's failure no longer fails the job — and the answer goes with it.** Commit `d04d8eb` wraps
+`record_llm_call` in its own `try` (`worker.py:327–339`); a failure prints `[instrument_error]` and the job is marked
+`succeeded`.
+
+Measured (`s5_p60`, `llm_calls` renamed away before the run) `[MEASURED]`: `status=succeeded`, `attempts=1`,
+`ledger_delta=1`, `200`: `1`, worker line `[instrument_error] Failed to record llm call for job_id=16: ProgrammingError:
+… relation "llm_calls" does not exist`. **`llm_calls` rows for job `16`: not counted** — the run had no `--table
+llm_calls` — so *"zero rows"* is `[INFERRED from the UndefinedTableError line]`.
+
+What this changes in the entry above:
+
+- **"The job's result is the `llm_calls` row with `claim_generation = jobs.claim_generation`"** now has a case with no
+  such row: a `succeeded` job whose text exists nowhere in Relay (the `[llm]` stdout line carries tokens only). A reader
+  cannot tell *"answer stored"* from *"answer received and dropped"* by `status`.
+- **Cost line *"`record_llm_call` sits inside the handler's `try`"* is resolved for one fault shape** (one table
+  unavailable, the rest of the DB healthy). If the whole database is unavailable the mark fails too, its `10 s`
+  deadline (`:384`) expires, `[mark_abandoned]`, the reaper reclaims after the lease, and the provider is called again
+  `[INFERRED from source, not run]`. `P-60` is **narrowed**.
+- **Failed attempts still write no row** — unchanged, still open.
+- The crash window (provider answered, worker killed before the write) is unchanged by this edit and is Din 5 Arm C.
+
+**Revisit when:** Din 6 `D-11` decides what the guard does with the answer (keep it in memory and retry only the write,
+or fall back to another store, or accept the loss and say so in the job's state).

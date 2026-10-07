@@ -10,7 +10,7 @@ from sqlalchemy import func, insert, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from relay.db import async_session
-from relay.models import Job, JobExecution, Outbox, SideEffect
+from relay.models import Job, JobExecution, Outbox, SideEffect, LlmCall
 
 
 POLL_INTERVAL_SECONDS = 2.0
@@ -128,12 +128,86 @@ async def handle_slow(payload: dict) -> None:
     print(f"[{WORKER_ID}] [SLOW HANDLER] Work completed.")
 
 
-REGISTRY: dict[str, Callable[[dict], Coroutine[Any, Any, None]]] = {
+from relay.providers import (
+    FakeProvider,
+    GeminiProvider,
+    ProviderError,
+    ProviderBadRequestError,
+    ProviderAuthError,
+    ProviderServerError,
+    ProviderRateLimitedError,
+)
+
+
+async def record_llm_call(
+    job_id: int,
+    claim_generation: int | None,
+    result_text: str,
+    tokens_in: int,
+    tokens_out: int,
+    status: str = "succeeded",
+) -> None:
+    async with async_session() as session:
+        async with session.begin():
+            await session.execute(
+                insert(LlmCall).values(
+                    job_id=job_id,
+                    claim_generation=claim_generation,
+                    result_text=result_text,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    status=status,
+                )
+            )
+
+
+async def handle_llm_completion(payload: dict) -> tuple[str, int, int]:
+    prompt = payload.get("prompt", "")
+    provider_name = os.getenv("RELAY_LLM_PROVIDER", "fake")
+    if provider_name == "gemini":
+        provider = GeminiProvider()
+    else:
+        provider = FakeProvider()
+
+    params = {}
+    if "fake_mode" in payload:
+        params["fake_mode"] = payload["fake_mode"]
+    if "delay" in payload:
+        params["delay"] = payload["delay"]
+    if "fake_retry_after" in payload:
+        params["fake_retry_after"] = payload["fake_retry_after"]
+    if "fail_pct" in payload:
+        params["fail_pct"] = payload["fail_pct"]
+
+    text, tokens_in, tokens_out = await provider.complete(prompt, **params)
+    job_id = payload.get("job_id", 0)
+    claim_gen = payload.get("claim_generation")
+    print(f"[{WORKER_ID}] [llm] job_id={job_id} tokens_in={tokens_in} tokens_out={tokens_out}", flush=True)
+
+    try:
+        await record_llm_call(
+            job_id=job_id,
+            claim_generation=claim_gen,
+            result_text=text,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            status="succeeded",
+        )
+    except Exception as llm_db_exc:
+        print(
+            f"[{WORKER_ID}] [P-60] record_llm_call failed: {type(llm_db_exc).__name__}: {llm_db_exc}. LLM call succeeded, suppressing retry to prevent duplicate billing.",
+            flush=True,
+        )
+    return text, tokens_in, tokens_out
+
+
+REGISTRY: dict[str, Callable[[dict], Coroutine[Any, Any, Any]]] = {
     "sleep": handle_sleep,
     "boom": handle_boom,
     "slow": handle_slow,
     "email": handle_email,
     "effect": handle_email,
+    "llm_completion": handle_llm_completion,
 }
 
 
@@ -304,6 +378,17 @@ async def run_worker() -> None:
             new_status = "failed"
             error_msg = f"Unknown job type: '{job_type}'"
         else:
+            # P-51: record_execution is an instrument write, outside handler try block and before heartbeat
+            try:
+                await record_execution(job_id, WORKER_ID, current_generation)
+            except Exception as inst_exc:
+                print(
+                    f"[{WORKER_ID}] [P-51] record_execution failed: {type(inst_exc).__name__}: {inst_exc}. Abandoning iteration, leaving for reaper reclaim.",
+                    flush=True,
+                )
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
             stop_event = asyncio.Event()
             heartbeat_task = asyncio.create_task(
                 send_heartbeat(job_id, stop_event, current_generation, last_lease_refresh)
@@ -313,15 +398,23 @@ async def run_worker() -> None:
                     f"[{WORKER_ID}] Executing job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation} type={job_type} attempt={current_attempts}/{MAX_ATTEMPTS} event=execute...",
                     flush=True,
                 )
-                await record_execution(job_id, WORKER_ID, current_generation)
 
                 payload["job_id"] = job_id
+                payload["claim_generation"] = current_generation
                 await handler(payload)
                 print(f"[{WORKER_ID}] Finished execution for job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation}.", flush=True)
                 new_status = "succeeded"
             except Exception as exc:
-                error_msg = str(exc)
-                if current_attempts < MAX_ATTEMPTS:
+                error_msg = f"{type(exc).__name__}: {exc}"
+                is_non_retryable = isinstance(exc, (ProviderBadRequestError, ProviderAuthError))
+                if is_non_retryable:
+                    new_status = "dead_letter"
+                    next_attempt_at = None
+                    print(
+                        f"[{WORKER_ID}] Job_id={job_id} non-retryable {type(exc).__name__}: {exc}. Marking terminal 'dead_letter' immediately event=non_retryable.",
+                        flush=True,
+                    )
+                elif current_attempts < MAX_ATTEMPTS:
                     delay = min(
                         BASE_BACKOFF_SECONDS
                         * (BACKOFF_MULTIPLIER ** (current_attempts - 1)),
@@ -335,13 +428,13 @@ async def run_worker() -> None:
                         f"interval '{actual_delay} seconds'"
                     )
                     print(
-                        f"[{WORKER_ID}] Job failed job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation} attempt={current_attempts}/{MAX_ATTEMPTS}: {exc}. Scheduling retry in {actual_delay:.2f}s (new_status='pending') event=retry.",
+                        f"[{WORKER_ID}] Job_id={job_id} failed attempt {current_attempts}/{MAX_ATTEMPTS}: {exc}. Scheduling retry in {actual_delay:.2f}s (new_status='pending') event=retry.",
                         flush=True,
                     )
                 else:
                     new_status = "dead_letter"
                     print(
-                        f"[{WORKER_ID}] Job reached max_attempts job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation} ({MAX_ATTEMPTS}): {exc}. Marking terminal 'dead_letter' event=dead_letter.",
+                        f"[{WORKER_ID}] Job_id={job_id} reached max_attempts ({MAX_ATTEMPTS}): {exc}. Marking terminal 'dead_letter' event=dead_letter.",
                         flush=True,
                     )
             finally:

@@ -138,5 +138,39 @@ Inspecting `pg_stat_activity` revealed the following multi-session lock contenti
 
 ---
 
+## Incident 04 — GitHub: Database Failover and Unhandled Stale Connection Cascades (October 21, 2018)
 
+**Source:** [GitHub Incident Postmortem: October 21, 2018](https://github.blog/news-insights/company-news/postmortem-of-october-21s-incident/)
+*Summary paraphrased; see source for the full writeup.*
+
+**What broke:** A brief 43-second network partition between GitHub's primary data center and its backup facility triggered an automated database topology failover. Although the database cluster recovered quickly, internal application services and background job execution workers remained degraded for hours because applications failed to reconnect to the database and required widespread manual restarts.
+
+**Root cause:** When the database network partition occurred, active connections in application connection pools were severed or left in half-closed socket states. As worker processes polled or executed queries, they encountered unhandled connection exceptions (`MySQL::Error: Lost connection to MySQL server`). Because the core application worker loops lacked comprehensive connection retry and recovery boundaries, worker processes crashed or entered unrecoverable error loops. Even after MySQL was fully healthy and ready to accept queries, the applications were dead or stuck in poisoned pool states, requiring manual intervention to restart fleets and restore service.
+
+**What I learned (Protection vs Coverage):**
+- **What they believed was protecting them:** Highly available clustered databases and automated failover primitives (orchestrator promoting a replica to primary within seconds). The assumption was: *"if the database is self-healing, the system is self-healing"*.
+- **What was actually covering them (and what failed):**
+  1. **A healthy database is useless if the client process dies:** Database availability is only half the equation; client-side processes must survive the outage window. If a temporary outage kills client processes outright through unhandled exceptions, the system remains completely down even after the database is 100% healthy.
+  2. **Stale pool connections raise before queries execute:** Pooled connections severed during an outage raise connection errors on first use (e.g. `InterfaceError` / `Lost connection`). If the outer loop treats connection loss as a fatal crash rather than a retryable transient failure, the process cannot benefit from the database's recovery.
+  3. **Recovery latency depends on client-side boundaries:** If processes survive transient disconnects and back off cleanly, recovery time equals `outage_duration + retry_poll`. If processes crash without supervision, recovery time becomes `outage_duration + human_reaction_time`.
+
+**Relay connection — `P-43`, `D-30`, and `P-56`:**
+1. **`P-43` in Relay:** In Week 4 Din 5 experiments, Relay reproduced GitHub's exact failure mode: PostgreSQL was stopped for a routine 26.8 s restart. The worker was idle-polling; its in-flight `SELECT ... FOR UPDATE SKIP LOCKED` encountered `sqlalchemy.exc.InterfaceError: connection is closed`. Because `run_worker()` only wrapped handler execution and left the claim poll unguarded, the exception escaped to `asyncio.run()`, terminating the Python process immediately. When Postgres resumed, the worker was dead. Recovery required human intervention to start a new worker.
+2. **`D-30` (The Poll-Loop Exception Boundary):** Week 5 Din 1 & Din 2 resolved `P-43` by wrapping the polling loop (`worker.py`, `reaper.py`, `dispatcher.py`) in an exception boundary. When Postgres went down for `35.006 s` in Week 5 Din 5, the worker caught `InterfaceError` on its stale connection, logged `[poll_error]`, waited `POLL_INTERVAL = 2.0 s`, and retried with `0` process exits (`EXITED = 0`). When Postgres completed startup, the worker cleanly established a new connection and resumed draining jobs within `1.61 s`.
+3. **`P-56` (DML vs TCL / Print Before Commit):** Din 5 also demonstrated that if the database drops mid-transaction, an application that prints `Marked succeeded` prior to `COMMIT` misrepresents reality. In GitHub's incident and Relay's Job 8, the DML executed in session memory, but the `COMMIT` failed; Postgres rolled back uncommitted work. Durability requires verifying the TCL commit, not statement execution.
+
+**Still to verify:** Relay's current supervisor (`scripts/supervisor.py`) operates as a host-level Python monitor. Verifying process resilience under container orchestration (e.g. Docker Compose `restart: unless-stopped` with health checks) remains deferred to Week 6.
+
+> **Review note (`2026-09-29`) — this entry does not yet match its source; rewrite owed, Week 6 Din 6.** The linked URL
+> returns `404`; the post lives at [GitHub's October 21 post-incident analysis](https://github.blog/news-insights/company-news/oct21-post-incident-analysis/).
+> That analysis describes a different mechanism from the *Root cause* above: after the `43 s` connectivity loss,
+> Orchestrator failed clusters over to the West Coast, both sites then held writes the other lacked, a safe fail-back
+> was no longer possible, and the `24 h 11 min` degradation came from restoring from backups and waiting for
+> replication to catch up, plus a queued webhook backlog. Worker processes dying on unhandled lost-connection errors,
+> poisoned pools, and fleet restarts are not in the source, and neither is the quoted `MySQL::Error` message. The
+> *Relay connection* section may still hold as Relay's own record (`P-43`, `D-30`, `P-56`), but it is not what this
+> incident teaches. *(Source summary rephrased for compliance with licensing restrictions.)*
+
+
+---
 

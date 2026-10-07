@@ -238,3 +238,26 @@ class SinkDelivery(Base):
         UniqueConstraint("idempotency_key", name="uq_sink_deliveries_idempotency_key"),
     )
 
+
+class LlmCall(Base):
+    __tablename__ = "llm_calls"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    job_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    claim_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    result_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'succeeded'"))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+

@@ -1,7 +1,10 @@
 import asyncio
 import json
+import random
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+
+flaky_rng = random.Random(42)
 
 app = FastAPI(title="Fake LLM Provider")
 
@@ -41,11 +44,30 @@ async def complete(request: Request):
         }
 
     elif mode == "429":
+        raw_ra = request.headers.get("X-Fake-Retry-After") or request.headers.get("Retry-After") or "2"
+        try:
+            ra_int = min(int(raw_ra), 60)
+        except Exception:
+            ra_int = 2
         return JSONResponse(
             status_code=429,
-            headers={"Retry-After": "2"},
+            headers={"Retry-After": str(ra_int)},
             content={"error": "rate_limit_exceeded"},
         )
+
+    elif mode == "flaky":
+        raw_pct = request.headers.get("X-Fake-Fail-Pct", "30")
+        try:
+            fail_pct = float(raw_pct)
+        except Exception:
+            fail_pct = 30.0
+        if flaky_rng.uniform(0, 100) < fail_pct:
+            return JSONResponse(status_code=500, content={"error": "flaky_internal_server_error"})
+        return {
+            "text": "simulated flaky response",
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+        }
 
     elif mode == "500":
         return JSONResponse(status_code=500, content={"error": "internal_server_error"})
@@ -56,17 +78,12 @@ async def complete(request: Request):
     elif mode == "401":
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
 
-    elif mode == "slow_below":
-        seconds = float(request.headers.get("X-Slow-Seconds", 3.0))
-        await asyncio.sleep(seconds)
-        return {
-            "text": "simulated slow response",
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
-        }
-
-    elif mode == "slow_above":
-        seconds = float(request.headers.get("X-Slow-Seconds", 7.0))
+    elif mode in ("slow", "slow_below", "slow_above"):
+        raw_sec = request.headers.get("X-Slow-Seconds", "3.0")
+        try:
+            seconds = min(float(raw_sec), 30.0)
+        except Exception:
+            seconds = 3.0
         await asyncio.sleep(seconds)
         return {
             "text": "simulated slow response",
@@ -97,4 +114,4 @@ async def complete(request: Request):
 
         return StreamingResponse(trickle_stream(), media_type="application/json")
 
-    return {"text": "unknown_mode", "tokens_in": tokens_in, "tokens_out": tokens_out}
+    return JSONResponse(status_code=400, content={"error": f"unknown_mode_{mode}"})

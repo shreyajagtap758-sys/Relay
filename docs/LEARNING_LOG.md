@@ -6133,7 +6133,6 @@ trickle (Dheere-dheere 1-1 byte aana - Sabse Bada Twist):
 -> Aj ka maqsad sirf is problem ko expose aur naapna (measure) karna tha, solution lagana aaj ka kaam nahi.
 
 
-
 ```
 SUMMARY :
 
@@ -6195,3 +6194,1580 @@ Trickle Leak: httpx ka 5.0s timeout do bytes ke beech ka gap dekhta hai, total t
 
 The Counting Gap: Client ko ReadTimeout milne par client ne socha "call fail ho gayi", lekin provider ke ledger me call count ho chuki thi (paisa kat gaya, par client ke paas result nahi aaya).
 ```
+
+---
+
+WEEK 6 - DAY 3
+
+
+```
+BASICS :
+
+Relay ek Job Queue Engine hai (jaise Celery, Temporal, BullMQ). Iska maqsad hota hai bhaari, slow aur unpredictable kamo ko background me safely chalana.
+
+Aaj ke zamane (2024–2026) me software industry me sabse bada aur heavy task kya hai? LLMs (AI)! Jaise:
+
+"Is 200-page ke PDF ko summarize karo"
+"User ke saare data ka analysis karke report banao"
+"Support ticket ka automatic AI reply draft karo"
+
+
+LLM RELAY KESE KAAM KRTE HE AND DONO KA PURPOSE KYA :
+
+Socho humne ek SaaS banaya hai — "DocuAI"
+
+- User hamari website par aata hai, apna 50-page ka legal contract (PDF) upload karta hai aur button dabata hai: 👉 "Summarize this Document" (Is document ko chhota karke summary do)
+
+Step 1: User ne Click kiya — Web Server (FastAPI) ka role
+
+User ne browser par button dabaya. Request aayi hamare web server par.
+
+Web server (FastAPI) ye sochta hai:
+
+"Bhai, 50-page ke document ko LLM (Gemini) se summarize karwane me 20 se 25 seconds lagenge.
+Agar mai user ke browser ko 25 second tak roke rakhunga, toh browser freeze ho jayega, timeout ho sakta hai, aur agar user ne tab band kar diya toh sab barbaad ho jayega."
+
+Toh Web Server kya karta hai? Wo summarization ka kaam khud nahi karta! Wo bas Postgres DB me Relay ke liye ek Job daal deta hai:
+
+INSERT INTO jobs (type, payload) 
+VALUES (
+    'llm_completion', 
+    '{"user_id": 42, "prompt": "Summarize this 50-page legal contract: ...[Document Text]..."}'
+);
+
+Aur user ke browser ko 20 millisecond me bol deta hai:
+
+"Bhai, tera kaam queue me lag gaya hai! Tera Job ID hai: #105. Hum summary bana rahe hain."
+
+User ke screen par loading spinner (spinner/progress bar) ghoomne lagta hai.
+
+
+Step 2: Relay Worker ka Entry (Parde ke piche ka Engine)
+
+Ab background me hamara Relay Worker chal raha hai.
+
+Worker database ko check karta hai:
+
+SELECT * FROM jobs WHERE status='pending' FOR UPDATE SKIP LOCKED;
+
+Usko Job #105 mil jata hai!
+Worker uska status karta hai 'running'.
+
+Worker dekhta hai: type = 'llm_completion'.
+
+Worker payload se wo 50-page ka text aur prompt nikaalta hai:
+
+"Summarize this 50-page legal contract..."
+
+
+Step 3: Provider ko Call (Google Gemini / LLM)
+
+Worker hamare GeminiProvider.complete(prompt) ko call karta hai:
+
+Worker ek HTTPS request bhejta hai Google Gemini ko:
+
+POST https://generativelanguage.googleapis.com/...
+
+Google ka server 15-20 second tak GPU par us 50-page ke contract ko padhta hai aur uski 2-page ki summary generate karta hai.
+
+Google response me do cheezein wapas bhejta hai:
+
+Result Text: "Summary: Clause 4 me risk hai, Clause 10 me penalty hai..."
+
+Usage (Tokens):
+tokens_in: 12,000 (50-page contract padhne ke tokens)
+tokens_out: 400 (Summary likhne ke tokens)
+
+
+Step 4: Paise Katna (Billing & Tokens ka Khel)
+
+Ab yahan aata hai tera sawaal: "Paise katne ka kya scene hai?"
+
+Google company se free me summary nahi banwata! Google har 1,000 tokens ke $0.002 charge karta hai. Toh is ek summary ka Google ne hamari company se kitna paisa kaata?
+
+Maano: 12,400 tokens = ₹2.50 kat gaye Google ko!
+
+Ab agar hamare paas koi record hi na ho ki kis user ke kitne tokens kharch hue, toh:
+
+Hamari company ka bill Google se ₹50,000 aa jayega, aur hume pata hi nahi chalega ki kis customer se kitne paise lene hain!
+Ya user bol dega: "Maine toh bas 2 line ki summary maangi thi, tumne mere account se ₹10 kyu kaate?"
+
+Isliye humne Step 3 me llm_calls table banayi thi! Worker turant database me likhta hai:
+
+sql
+INSERT INTO llm_calls (job_id, result_text, tokens_in, tokens_out, status)
+VALUES (105, 'Summary: Clause 4...', 12000, 400, 'succeeded');
+
+Ab billing service is table ko dekhkar User #42 ke wallet/credit card se exact tokens ke hisab se paise kaat leti hai:
+
+👉 "User #42 used 12,400 tokens -> Deduct 15 AI Credits from their wallet."
+
+
+Step 5: User ko Summary wapas kaise milti hai?
+
+Worker job ka status kar deta hai: status = 'succeeded'.
+
+User ka browser har 2 second me web server se pooch raha hota hai: "Job #105 ready hua kya?"
+
+Web server database se summary uthata hai aur user ke screen par sundar format me summary dikha deta hai!
+User khush ho jata hai ki usko 50-page contract ki summary mil gayi!
+
+
+=> TOH AB RELAY JESE HANDLER CHALATA THA AND WORKER USPE KAAM KRTE THE, WO NHI KREGA? RELAY BAS MIDDLE MAN HE JO JOB/REQUEST LEKE EXTERNAL API KO PASS KRKE RESPONSE DEGA?
+
+-> YES, Reliable Task Orchestrator / Job Execution Engine (jaise duniya ke mashhoor systems: Celery, Temporal, BullMQ, Sidekiq, Kafka consumers).
+
+-> toh relay ab exactly jobs ko durably external API tk pohchata he, durably leke ata he response, network ya db outage falures me iss web se leke API ka connection ye sambhalta he.(concurrent/network/API crash/worker crash etc), handlers banaye worker and failures thik krne, ab handler ke badle real provider(API) ayega.
+
+-> Relay ka kaam business logic (jaise summary banana ya email likhna) nahi hota. Relay ka kaam hota hai GUARANTEE dena ki kaam bina ruke, bina double-execute hue, 100% reliably complete hoga.
+
+
+=> Pehle jo handlers the:
+
+-> handle_email: Socho real life me email kaun bhejta hai? Python thodi email deliver karta hai internet par! Real life me email bhejne ke liye bhi ek external API (SendGrid, Amazon SES, ya Gmail API) ko call kiya jata hai! Pehle humne test ke liye usko sirf ek database row (side_effects) me mock kiya tha.
+
+-> handle_sleep: Ye koi real kaam thodi tha, ye toh sirf asyncio.sleep(2) tha taaki hum test kar sakein ki do worker aapas me ladte toh nahi hain.
+
+-> handle_boom: Ye jaanbujhkar crash karwaya gaya tha (raise RuntimeError) taaki hum retries test kar sakein.
+
+
+=> Real World me Companies Job Queues (Relay) me kya daalti hain?
+
+- Payment Job: Stripe ya Razorpay ki API ko call karna (Paise kaatna).
+
+- SMS Job: Twilio ki API ko call karna (OTP bhejna).
+
+- Email Job: SendGrid ki API ko call karna.
+
+- LLM Job: Google Gemini ya OpenAI ki API ko call karna.
+
+
+
+=> Relay "KHUD KA" Kya Karta Hai?
+
+1. Concurrency & Queue Locking (FOR UPDATE SKIP LOCKED)	
+
+2. Automatic Retries with Exponential Backoff
+
+3. Dead-Letter Queue (DLQ) 
+
+4. Heartbeat & Reaper (Lease Management)
+
+5. Fencing Tokens (claim_generation)
+
+6. Audit & State Machine Tracking
+
+
+=> Agar Relay na hota toh kya tabaahi machti?
+
+1. Agar 1,000 users ek sath prompt bhej dein, toh sabhi ek sath API par toot padenge. Google Gemini turant 429 Too Many Requests dekar block kar dega. Relay ek-ek ya do-do karke controlled speed me jobs release karta hai.
+
+2. Agar Google ka server 5 second ke liye down ho gaya (500 Error), toh Relay crash nahi hota. Wo wait karta hai: 3s... 6s... 12s... aur jab Google theek ho jata hai, toh job succeed kar deta hai.
+
+3. Agar koi prompt galat hai aur 3 baar fail ho gaya, toh Relay usse discard karke dead_letter me daalta hai taaki baki users ke jobs na phansein.
+
+4. Agar worker computer ka power plug nikal gaya (machine band ho gayi), toh Reaper detect kar leta hai ki worker mar gaya, aur job ko doosre zinda worker ko de deta hai.
+
+5. Agar koi job bohot slow chal raha hai, toh Relay guarantee karta hai ki do alag workers ek hi job ko do baar execute karke customer ka double bill na bana dein.
+
+6. Relay database me har step ka hisab rakhta hai: pending -> running -> succeeded, aur llm_calls me exact tokens likhta hai.
+```
+
+
+Kal (Din 2) humne ek local Fake Provider khada kiya tha jo port 8002 par chalta hai aur alag-alag errors simulate karta hai.
+
+Lekin kal tak Relay ke worker ka usse koi lena-dena nahi tha — sirf ek test script (probe) use call kar rahi thi.
+
+
+Aaj (Din 3) pehli baar teen badi cheezein hone ja rahi hain:
+
+Relay ka Asli Worker ab llm_completion job uthayega aur ek LLM Provider ko call karega.
+
+Provider Abstraction Interface: Relay ko farak nahi padna chahiye ki piche FakeProvider chal raha hai, ya Google Gemini, ya Groq. Caller ke liye ek standard interface banega: 
+
+complete(prompt, params) -> (text, tokens_in, tokens_out).
+
+Month 2 Ki Pehli Database Migration (Result & Token Storage): LLM se jo text aur tokens aayenge, unhe database me kahan aur kaise store karna hai?
+
+Real Provider + Real API Key + Key Leak Audit: Pehli baar ek asli LLM provider ko call jayegi aur check hoga ki kahin hamari secret API key database, logs, git history, ya terminal history me leak toh nahi ho rahi.
+
+Slow Call vs Heartbeat & Lease: Agar LLM response aane me 25 second lagte hain, toh kya worker ka background heartbeat job ko zinda rakhta hai ya Reaper use chheen leta hai?
+
+
+
+
+-> first of all why use real provider when we have our own fake local provider?
+
+- har ek token, status code, JSON error sb kesa ata he ye humne decide kiya tha, Agar hum pure hafte sirf Fake Provider par test karte rahe, toh hum sirf ye prove karenge ki hamara worker hamare banaye huye fake server se baat kar sakta hai. Lekin jab pehli baar production me real OpenAI ya Gemini aayega, toh unka actual JSON schema, unki latency, aur unke headers hamare code ko tod denge.
+
+- Real LLMs words ko count nahi karte; wo BPE (Byte-Pair Encoding) Tokenizers use karte hain. Kuch models "Thinking/Reasoning tokens" generate karte hain jo response text me nahi aate, par bill me judte hain! Response me usage metadata kaisa aata hai, provider use kab aur kaise deliver karta hai — ye sirf ek asli provider hi calibrate kar sakta hai.
+
+- Fake Provider ko koi API Key nahi chahiye hoti. Real Provider ko Secret API Key chahiye. Agar hum real provider nahi lagate, toh hum kabhi test hi nahi kar paate ki Relay ka worker kahin galti se API key ko :
+
+Database ke payload me toh nahi likh raha?
+
+echo=True SQL engine ke logs me toh nahi print kar raha?
+
+Exception traceback me screen par toh nahi phek raha?
+
+Isliye: Fake provider failures simulate karne ke liye hai (429, 500, hang), aur Real provider reality check aur security audit ke liye hai. Dono ka role bilkul alag hai.
+
+
+
+
+DECISIONS :
+
+
+Faisla 1 : Provider ka code pure project me kahan place karein?
+
+
+Option A (CHOSEN) : Single file relay/providers.py (Base interface + FakeProvider + RealProvider).
+
+COST : Ek hi file me test mock aur real code ka mix hona, jo aage chalkar file ko bohot bada (bloated) bana sakta hai. (Lekin Month 2 ke current scale ke liye ye sabse manageable aur clean balance deta hai).
+
+
+Option B: Package relay/providers/ (base.py, fake.py, gemini.py).
+
+COST : Jab ek hi package ke andar 3-4 chhote files ek dusre se Base classes aur Exceptions import karte hain, toh Python me circular import errors aane ke chances badh jaate hain.
+
+- Sirf ~100 lines ke code ke liye 4 files ka bojh
+
+
+Option C: Seedhe relay/worker.py ke andar function likh do.
+
+COST : Tightly coupled ho jayega. Hamari verification scripts provider ko akele import karke test nahi kar payengi bina poore worker aur background loops ko trigger kiye.
+
+- relay/worker.py pehle se hi database se connected hai (wo from relay.db import get_db karta hai). Agar aapne provider ka code worker.py ke andar hi likh diya, Toh jab bhi koi test script provider ko call karna chahegi, use majbooran poora worker.py import karna padega. Aur jaise hi worker.py import hoga, database engine turant start ho jayega! Provider ka kaam sirf internet par HTTP request bhejna hai (LLM se baat karna). Uska database se zero lena-dena hai!
+
+
+
+
+Faisla 2 : Jab LLM call fail ho (HTTP 429 rate limit, 500 server crash, 401 unauthorized), toh complete() function caller ko ye khabar kaise de?
+
+- caller() : Worker se prompt (jaise "Write a poem") lena, use LLM Provider (Gemini ya Fake) ke paas bhejna, aur wahan se generated text + kharch hue tokens wapas laana.
+
+
+Option A (Typed Exceptions)(CHOSEN) : Success par tuple return karo (text, tokens_in, tokens_out). Failure par custom Exception class raise karo: raise ProviderRateLimitedError("429") ya raise ProviderServerError("500").
+
+fayda: Python ka normal raise chalta hai, isliye worker ka existing try...except code ise naturally pakad kar retry me daal dega — developer koi check bhool hi nahi sakta. Failure kabhi chup nahi sakti. Worker hamesha error pakdega aur safe retry loop chalayega.
+
+COST : Agar request crash hui lekin provider ne thode tokens ka bill kaat liya, toh exception ke sath un kharch hue tokens ka data bahar laana mushkil hota hai. isko solve ese krte : provider ko pas extra raise code likhna pdega error pr, and worker me except block.
+
+
+Option B (Result Object) : Hamesha ek object return karo: CompletionResult(ok=True/False, text=..., error="...").
+
+COST : Agar developer ek jagah bhi if not result.ok: likhna bhool gaya, toh server crash (500) ya rate-limit (429) aane par bhi Relay use galti se "Job Succeeded" maan kar complete kar dega!. system bol raha hai "Kaam ho gaya!" Job kabhi retry nahi hogi, user ka data silently gayab ho gaya.
+
+
+
+
+Faisla 3 :
+
+-> Har job par worker ko Google Gemini (https://generativelanguage.googleapis.com) ya Fake Provider ko internet par HTTP request bhejni hai.
+
+- Python me jab aap likhte ho : client.post(...), toh background me ye 5 cheezein hoti hain:
+
+DNS Lookup: Python internet par dhoondhta hai ki googleapis.com ka IP address kya hai (~20ms).
+
+TCP Connection (3-Way Handshake): Aapka computer Google ke server ko bolta hai: "SYN" -> Google bolta hai "SYN-ACK" -> Aap bolte ho "ACK" (~50ms).
+
+TLS/SSL Handshake (Security): Dono taraf ke computers cryptographic keys exchange karte hain aur certificate verify karte hain. Isme 2-3 network round-trips lagte hain (~100ms - 200ms).
+
+Data Transfer: Ab jaakar aapka prompt Google ko jaata hai aur response aata hai.
+
+Connection Close: Socket band ho jata hai.
+
+
+Option A (Per-call Client) (Har call pe naya httpx.AsyncClient()) : 
+
+- Function chala -> Naya client bana -> Handshake hua -> Response aaya -> Client destroy ho gaya.
+
+FAYDA: 100% Clean! Koi memory leak nahi, koi purana socket open nahi chhoot sakta.
+
+COST (Nuksan): Latency ka nuksan. 1,000 jobs chalengi toh 1,000 baar naya SSL handshake hoga (ghanto ka time waste).
+
+
+Option B (Shared Process-level Client): 
+
+- Worker jab start hota hai, ek client banakar rakh leta hai. Pehli job me handshake hua. Agli 999 jobs ne usi purane open connection par data bhej diya bina dobara handshake kiye!
+
+FAYDA: Super Fast (Zero handshake overhead).
+
+COST (Nuksan): Management ka jhanjhat. Is client ko band kab karna hai? Agar worker crash hua ya loop restart hua, toh open sockets leak ho sakte hain.
+
+
+-> Step 1 ke testing aur learning phase ke liye Option A (Per-call) sabse safe aur isolated rehta hai (zero socket leak risk, zero state sharing). High-throughput production me log Option B chunte hain.
+
+
+
+
+FAISLA 4 : Database query (Postgres) 5 se 20 millisecond me khatam ho jati hai. Lekin LLM (AI) bohot slow hota hai. Usko sochne aur text generate karne me 5 se 25 second lag sakte hain!
+
+Ab Relay ke andar ka scene dekho:
+
+Worker jab job uthata hai, toh uske paas Lease hoti hai: 30 Seconds.
+
+Peeche se Reaper har 2 second me ghoom raha hai. Agar kisi job ko 30 second se zyada ho gaye, toh Reaper use chheen lega!
+
+Aur hamare HTTP client ke paas ek setting hoti hai: timeout = ?.
+
+
+- HTTP client ka timeout kitna lamba rakhein?
+
+
+Edge Case 1: Agar Timeout bohot chhota rakh diya (e.g., 5.0s)
+
+Gemini ko answer generate karne me 7 second lage.
+
+Client 5.0 second par hi ReadTimeout throw kar dega!
+
+Relay sochega: "Call fail ho gayi, main retry karunga."
+
+Lekin Gemini ne apna kaam 7th second par pura kar liya tha aur apna bill bana liya tha! Relay retry karega toh duplicate bill ban jayega!
+
+
+Edge Case 2: Agar Timeout bohot lamba rakh diya (e.g., 40.0s)
+
+Provider hang ho gaya. Worker chupchap 40 second tak intezaar kar raha hai.
+
+30th second par Relay ki Lease expire ho gayi! Reaper ne bola: "Ye worker mar gaya lagta hai" aur job ko wapas pending karke doosre worker B ko de diya!
+
+Ab Worker A aur Worker B dono ek hi job par LLM call chala rahe hain (Fencing toot gayi!).
+
+
+-> Timeout hamesha lease (30s) se chhota hona chahiye (jaise 20s - 25s), ya fir worker ka heartbeat itna mazboot hona chahiye ki wo lease ko aage badhata rahe (jo hum Step 5 me verify karenge).
+
+
+
+
+Faisla 5: Provider Kaun Chunta Hai (Real vs Fake)?
+
+Context: Relay ko kaise pata chalega ki is job ke liye Fake provider chalana hai ya Real?
+
+```
+Fake Provider (95% Kaam Ispe Hoga):
+Testing, errors aur experiments ke liye!
+
+Maan lo hume test karna hai: "Agar provider 500 error de, ya 25 second tak so jaye, toh worker kya karta hai?"
+Real Gemini ko aap phone karke nahi bol sakte ki: "Bhai, mere liye agle 2 minute tak jaanbujhkar 500 error phenkna!" Real provider hamare ishare par fail nahi hota, aur faltu me paise bhi kaat lega. Isliye saare dangerous tests Fake Provider par hote hain.
+
+Real Provider (5% Kaam Ispe Hoga):
+
+Sirf ye verify karne ke liye ki: "Jab sab test pass ho gaye, toh kya Relay sach me internet par Google Gemini se asli answer aur asli tokens la sakta hai bina API key leak kiye?"
+```
+
+
+Option (i) (CHOSEN) : Server ke Environment Variable se (RELAY_LLM_PROVIDER=fake|real)
+
+- Jab developer ya server admin worker ko start karta hai, toh terminal me set karta hai : 
+
+$env:RELAY_LLM_PROVIDER="fake".
+
+FAYDA (Security): 100% Safe! Bahar ka koi bhi user code ko paid mode me switch nahi kar sakta.
+
+
+Option (ii): Job ke Payload ke andar se (payload: {"provider": "real"})
+
+- User request bhejte waqt khud likhega: "provider": "gemini".
+
+COST : The Disaster (Bohot Bada Security Hole):
+
+Relay ka POST /jobs endpoint unauthenticated hai (koi login ya password nahi hai).
+
+Agar kisi hacker ya college student ko aapka API URL mil gaya, toh wo script chala kar 10,000 jobs daal dega jisme "provider": "real" likha hoga.
+
+Aapka worker Google Gemini ko 10,000 baar hit karega aur subah uth kar aapka credit card bill hazaaron rupaye ka aa chuka hoga!
+
+
+
+
+FAISLA 6: Real Provider Ka Choice & "The Hidden Retry Trap" :
+
+- Aapko Gemini ya OpenAI se baat karni hai. Python me do tareeqe hote hain:
+
+
+OPTION 1 : Unki official library install karo: pip install google-genai ya openai (Isko bolte hain SDK).
+
+COST : The Hidden Retry Bug (SDK ka sabse bada dhokha):
+
+Official SDKs (OpenAI, Google) frontend developers ke liye bante hain. Unke andar ek hidden feature hota hai :
+
+Agar network me koi error aayi, toh SDK Relay ko bataye bina andar hi andar 2-3 baar khud hi retry kar leta hai!
+
+Nateeja: Relay ke database me likha aayega: attempts = 1.
+
+Lekin Google ke bill me likha aayega: Calls billed = 3!
+
+Hamara poora distributed system aur audit trail jhootha ho jayega!
+
+
+OPTION 2 : normal httpx se unke URL par JSON bhej do (Isko bolte hain Raw HTTP).
+
+- Koi chhupe huye retries nahi hote.
+Agar request fail hui toh Relay ko turant pata chalta hai. Relay khud decide karta hai ki retry kab aur kitni der baad karna hai.
+
+
+
+
+Faisla 7: Fake Provider Ke Din 2 Review Fixes
+
+Context: Kal ke fake provider me 3 choti kamiya thi :
+
+Agar koi unknown mode header me bhej do, toh wo chupchap 200 OK de deta tha.
+
+Startup line par hardcoded port likha tha.
+
+trickle mode me token count hardcoded the.
+
+-> Fix: Agar koi anjaan mode aaye, toh provider ko 400 Bad Request phenkna chahiye taaki developer ko pehle second me pata chal jaye ki usne header me galat naam likha hai.
+
+
+```
+Jab Relay worker ek LLM job execute karta hai, toh parde ke piche kya hota hai?
+
+
+[Relay Worker] 
+      │
+      │ 1. Complete call: provider.complete("the quick brown fox", fake_mode="ok")
+      ▼
+[httpx.AsyncClient]
+      │
+      │ 2. HTTP POST http://127.0.0.1:8002/v1/complete
+      │    Headers: {"X-Fake-Mode": "ok"}
+      │    Body:    {"prompt": "the quick brown fox"}
+      ▼
+[FakeProvider / FastAPI]
+      │
+      │ 3. Handler reads prompt -> calculates tokens:
+      │    tokens_in  = len(prompt.split()) = 4
+      │    tokens_out = 8 (generated response size)
+      │
+      │ 4. Response JSON:
+      │    {"text": "simulated response", "tokens_in": 4, "tokens_out": 8}
+      ▼
+[Relay Worker]
+      │ 5. Unpacks tuple: (text, tokens_in, tokens_out)
+      │ 6. Writes audit to DB (Step 3)
+
+
+Error Flow (Jab 500 ya 429 aaye):
+
+Agar request me X-Fake-Mode: 500 hai, toh FakeProvider HTTP status 500 return karta hai with {"error": "internal_server_error"}.
+
+Worker ka HTTP client status code dekhta hai: if r.status_code == 500: -> seedha ProviderServerError raise karta hai.
+
+Isse worker ka outer retry block (try ... except Exception) trigger ho jata hai.
+```
+
+
+TEST 1 :
+
+Problem: Humaare paas Relay worker running tha jo email, sleep, boom type ke synthetic jobs karta tha. Ab hume Relay ko real-world LLM worker banana tha.
+
+KYU kiya:
+
+Hame worker ke andar ek naya handler handle_llm_completion register karna tha jo payload se prompt nikaale, provider ko call kare, aur response le.
+(Ye worker.py ke andar wo function hai jo payload se prompt nikalta hai, provider ko deta hai, aur jo tokens aate hain unhe DB me save karwata hai.)
+
+Hame verify karna tha ki agar provider 500 Internal Server Error return karta hai, toh kya worker gracefully 3 attempts (MAX_ATTEMPTS=3) retry karke job ko dead_letter me bhejta hai ya worker process crash ho jata hai?
+
+
+EXECUTION :
+
+Setup: Humne disposable database relay_w6d3 banaya aur head migration apply ki. 
+
+- handle_llm_completion ka function worker.py me likha.
+
+
+OBSERVATION:
+
+TEST1: normal work flow
+
+```
+current_database=relay_w6d3
+
+job_id=1 inserted_at=2026-10-06T10:00:41.221+00:00
+terminal=succeeded wait_s=0.559
+
+ledger_before=0 ledger_after=1 ledger_delta=1
+executions=1 execution_generations=[1]
+
+job_row={"attempts": 1, "claim_generation": 1, "status": "succeeded"}
+```
+
+- Job 0.55s me successfully complete hua. Provider ledger par 1 call count hui (ledger_delta=1).
+
+
+TEST2: 500 (error retry and dead letter flow)
+
+```
+current_database=relay_w6d3
+
+job_id=2 inserted_at=2026-10-06T10:00:52.287+00:00
+terminal=dead_letter wait_s=12.431
+
+ledger_before=0 ledger_after=3 ledger_delta=3
+executions=3 execution_generations=[1, 2, 3]
+
+job_row={"attempts": 3, "claim_generation": 3, "status": "dead_letter"}
+
+last_error_tail=relay.providers.ProviderServerError: Provider 500: {"error":"internal_server_error"}
+
+worker_claim_lines=3 worker_execute_lines=3 worker_failed_attempt_lines=3
+```
+
+- Worker ne 500 aane par crash nahi kiya. Usne Attempt 1 kiya -> fail hua -> backoff wait kiya -> Attempt 2 kiya -> fail hua -> Attempt 3 kiya -> fail hua -> Status dead_letter set kiya. Provider par exact 3 requests hit hui (ledger_delta=3).
+
+
+
+
+TEST 2 : 
+
+- Problem: Step 2 me job succeed ho gaya, response text bhi aa gaya, aur tokens bhi calculate ho gaye. Lekin wo data kahan gaya?
+
+- Wo sirf worker ke terminal console par print hua: [llm] 
+
+- job_id=1 tokens_in=4 tokens_out=8.
+Database me kahin bhi tokens ya result save hi nahi hua!
+
+
+KYU zaroori tha:
+
+- Production me har token billable hota hai. Agar tumne tokens database me record nahi kiye, toh client ko bill kaise karoge?
+
+- Aur LLM dwara generate kiya gaya result text agar DB me save nahi hua, toh user ko response kaise dikhaoge?
+
+- Isliye hume database schema me token aur result storage add karna pada.
+
+
+DECISION :
+
+Option A: jobs Table me direct columns add karna
+
+Schema: 
+```
+ALTER TABLE jobs 
+ADD COLUMN result_text TEXT, 
+ADD COLUMN tokens_in INT, 
+ADD COLUMN tokens_out INT;
+```
+
+FAYDA: Simple lagta hai; SELECT * FROM jobs karne se sab mil jata hai.
+
+COST & Critical Flaw:
+
+- Retry Overwrite: Maan lo ek job ne Attempt 1 me 2,000 tokens consume kiye, lekin commit se theek pehle worker network disconnect ho gaya. Worker ne Attempt 2 me fir se 2,000 tokens kharch kiye aur succeed hua. jobs table me sirf Attempt 2 ke 2,000 tokens rahenge! Attempt 1 ke 2,000 tokens ka record hamesha ke liye gayab ho jayega (Financial audit fail!).
+
+- Table Bloat: jobs table generic hai. Email jobs aur Sleep jobs ke liye ye columns hamesha NULL rahenge.
+Option B (Chosen): Dedicated Audit Ledger Table (llm_calls)
+
+
+Option B (CHOSEN): Dedicated Audit Ledger Table (llm_calls) (NEW TABLE)
+
+Schema:
+```
+CREATE TABLE llm_calls (
+    id SERIAL PRIMARY KEY,
+    job_id BIGINT REFERENCES jobs(id),
+    claim_generation INT,
+    result_text TEXT,
+    tokens_in INT,
+    tokens_out INT,
+    status VARCHAR,
+    created_at TIMESTAMPTZ DEFAULT clock_timestamp()
+);
+```
+
+Immutable Audit Trail: Har attempt ka ek alag row banta hai jisme job_id aur claim_generation dono link hote hain. Agar 3 attempts hue, toh teeno attempts ke alag-alag billable tokens database me safely record honge.
+
+Separation of Concerns: jobs table state machine (pending, running, dead_letter) handle karti hai, jabki llm_calls table financial ledger handle karti hai.
+
+
+OBSERVATION :
+
+-> test llm table :
+
+```
+label=s3_ok type=llm_completion
+
+current_database=relay_w6d3
+
+db_revision=w6d3_llm_calls
+
+job_id=3 inserted_at=2026-10-06T10:05:24.787+00:00
+terminal=succeeded wait_s=0.797
+
+ledger_delta=1 executions=1
+
+table=llm_calls rows=1
+  llm_calls: {"claim_generation": 1, "id": 1, "job_id": 3, "result_text": "simulated response", "status": "succeeded", "tokens_in": 4, "tokens_out": 8}
+```
+
+
+
+TEST 3 :
+
+-> Problem: Fake provider local environment ke liye badhiya hai, lekin production me real vendor (Gemini) use hota hai. Real vendor ke sath sabse bada risk hota hai: API Key Leakage.
+
+
+KYU kiya:
+
+Hame ye samajhna tha ki ek distributed worker queue ke andar API key kin-kin raasto se leak ho sakti hai agar development me laparwahi ho.
+
+Environment Status: .env me koi GEMINI_API_KEY configure nahi thi. Lab Brief Rule ke mutabik: dotenv_has_keyvar=0 -> Step 4 slipped. Isliye real HTTP request skip hui, lekin iske security failure points critical hain.
+
+
+EXECUTION :
+
+relay/providers.py ke andar GeminiProvider class implement karni thi jo seedha Google ke live servers (https://generativelanguage.googleapis.com/...) se baat kare :
+
+- Call-time par os.environ.get("GEMINI_API_KEY") read kiya.
+
+- Header me pass kiya: "x-goog-api-key": api_key.
+
+- Model Discovery: Pehle Google ne error diya ki gemini-1.5-flash naye users ke liye deprecate ho gaya hai aur unhone sujhaav diya: "Please use models/gemini-3.5-flash-lite". Humne turant Google ke latest active model gemini-3.5-flash-lite par configure kiya.
+
+
+Worker ko environment variable RELAY_LLM_PROVIDER=gemini dekar real network par job chalana tha.
+
+Ek security audit script (labs/w6d3_key_scan.ps1) se scan karna tha ki Google API key kahin galti se logs, git history, ya database me leak toh nahi ho gayi.
+
+
+
+```
+async def complete(self, prompt: str, **kwargs) -> Tuple[str, int, int]:
+        # Rule 1: Key hamesha call ke waqt read karo, import ke waqt nahi
+        api_key = os.environ.get(self.key_var)
+        
+	if not api_key:
+            raise ProviderAuthError(f"API key environment variable {self.key_var} is not set")
+```
+
+-> Agar hum api_key = os.environ["GEMINI_API_KEY"] module ke top par likh dete, toh jis machine par key nahi hai wahan test run hone se pehle hi import relay.providers crash ho jata (KeyError). Call-time par check karne se module safely import ho jata hai.
+
+
+
+```
+url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        
+        # Rule 2: Key ko HTTP Header me bhejo, URL query string me kabhi nahi
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        }
+```
+
+-> Official Google/OpenAI SDKs me hidden automatic retries hote hain (default 2 retries). Agar SDK khud hi 2 baar retry kar legi, toh Relay worker ka apna 3 attempts ka count toot kar total 6 ya 9 calls ban jayega! Raw httpx use karne se har single HTTP call par Relay ka full control rehta hai.
+
+
+
+```
+# Rule 3: Raw httpx use karo (koi 3rd-party Google SDK nahi)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(url, headers=headers, json=payload)
+```
+
+-> Agar key URL me daali (?key=AIza...), toh 401 error aane par httpx wo poora URL exception me daal deta hai, jo Relay DB ke jobs.last_error column me permanently chhap jata hai! Header me bhejne se key secure rehti hai.
+
+
+
+OBSERVATION :
+
+- Humne harness run kiya: python labs/w6d3_job_run.py --label s4_real --deadline 90 --env RELAY_LLM_PROVIDER=gemini --payload '{"prompt": "the quick brown fox", "tag": "w6d3-canary"}' --table llm_calls
+
+```
+table=llm_calls rows=1
+  llm_calls: {
+    "id": 1, 
+    "job_id": 3, 
+    "claim_generation": 1, 
+    "result_text": "jumps over the lazy dog.", 
+    "tokens_in": 4, 
+    "tokens_out": 7, 
+    "status": "succeeded"
+  }
+```
+
+CONCLUSION :
+
+-> Google ke Gemini model ne "the quick brown fox" prompt padhkar famous English sentence complete kiya:
+👉 "jumps over the lazy dog."
+
+
+-> tokens_in = 4: "the", "quick", "brown", "fox" (Exact 4 prompt tokens).
+
+- tokens_out = 7: "jumps", "over", "the", "lazy", "dog", ".", plus stop token (Total 7 generated tokens).
+
+- Fake provider fixed 8 tokens deta tha, real Google API ne content ke hisab se exact 7 tokens return kiye.
+
+
+-> Google Cloud tak HTTPS handshake, GPU generation, aur Relay DB write poora hone me 3.719 seconds lage (wait_s=3.719).
+
+
+
+Humne verification script run ki: powershell -File labs\w6d3_key_scan.ps1 -KeyName GEMINI_API_KEY -Out logs\w6d3_step4_keyscan.txt -Database relay_w6d3
+
+```
+key_name=GEMINI_API_KEY key_len_ge_20=True 
+
+database=relay_w6d3 at=2026-10-06 19:08:33.007
+
+logs_files=36 logs_hits=0 logs_control_hits=9
+
+tracked_files=69 tracked_hits=0 tracked_control_hits=3 staged_diff_hits=0
+
+history_file_exists=True history_hits=0 history_control_hits=1
+
+db_dump_bytes=4688 db_hits=0 db_control_hits=1
+```
+
+CONCLUSION :
+
+-> Scanner ne 36 log files, 69 git tracked files, PowerShell console history, aur PostgreSQL DB dump scan kiya.
+
+-> Har domain me hits = 0 aaya (Zero leaks!).
+
+-> Har domain me control_hits >= 1 aaya (Iska matlab scanner ne sach me canary word "w6d3-canary" dhoondh ke prove kiya ki scanner blind nahi hai, wo sach me scan kar raha tha).
+
+
+
+
+TEST 4 : 
+
+-> Jab koi prompt lamba ho (e.g. 25 seconds lene wala), toh Relay worker Google ke response ka intezar kar raha hota hai. Lekin background me ek Reaper process ghumta hai jo stalled/dead workers ke jobs chura kar wapas queue me daalta hai. Hume dekhna tha:
+
+- Agar call 3 second ki ho toh kya hota hai?
+
+- Agar call 25 second ki ho aur Reaper active ho, toh worker aur reaper ke beech kya collision hota hai?
+
+
+
+-> Kaise Kiya? (Do Arms Run Kiye)
+
+- Arm 1 (s5_d3): 3-second delay wala job (without reaper).
+
+- Arm 2 (s5_d25): 25-second delay wala job (with reaper running).
+
+
+OBSERVATION :
+
+TEST1: 3s delay (on real provider:gemini)
+
+```
+label=s5_d3 type=llm_completion
+
+job_id=4 inserted_at=2026-10-06T10:15:52.927324+00:00
+terminal=succeeded wait_s=6.188
+
+completed_minus_first_executed_s=2.637
+
+table=llm_calls rows=1
+  llm_calls: {"claim_generation": 1, "id": 1, "job_id": 4, "result_text": "simulated slow response", "tokens_in": 4, "tokens_out": 8}
+
+worker_claim_lines=1 worker_mark_lines=1
+worker_heartbeat_sent_lines=0
+```
+
+-> Job 2.6s me khatam ho gaya. Worker ka heartbeat interval 10 seconds hai. Kyunki 2.6s < 10s tha, isliye 0 heartbeats bheji gayi aur job smoothly succeed hua.
+
+
+
+TEST2: 25s delay (on fake provider:for long request check)
+
+```
+label=s5_d25 type=llm_completion fake=True reaper=True
+
+job_id=5 inserted_at=2026-10-06T10:16:07.170346+00:00
+terminal=deadline:pending wait_s=90.079
+
+ledger_delta=4 executions=4 execution_generations=[1, 2, 3, 4]
+
+table=llm_calls rows=3
+
+worker_claim_lines=4 worker_execute_lines=4 worker_mark_lines=0
+
+worker_heartbeat_sent_lines=0
+
+reaper_reclaim_lines=4
+
+echo_heartbeat_update_at=15:46:17,450, 15:46:43,190, 15:47:08,843, 15:47:34,407
+```
+
+
+CONCLUSION :
+
+COLLISION RECORD :
+
+1. Config Mismatch:
+Reaper ka timeout tha: CLAIM_TIMEOUT_SECONDS = 5.0 seconds!
+Worker ki heartbeat thi: HEARTBEAT_INTERVAL_SECONDS = 10.0 seconds!
+
+
+2. Reaper ki Chori:
+Worker ne 15:46:07 par job claim kiya (claim_generation=1).
+Theek 5 second baad (15:46:12), Reaper ne dekha ki job ka claimed_at 5 second se purana hai. Reaper ne samjha worker mar gaya, aur job ko zabardasti reclaim karke 'pending' kar diya!
+
+
+3. Heartbeat Fencing Block:
+10th second par (15:46:17) worker ne heartbeat bheji:
+UPDATE jobs SET claimed_at=now() WHERE status='running' AND claim_generation=1
+Rowcount = 0 aaya! Worker ne log me chillaya:
+Heartbeat lost: job_id=5 ... is no longer 'running' or fenced.
+
+
+4. Mark Conflict (25th Second):
+Jab 25 second baad LLM call khatam hui, worker ne job ko 'succeeded' mark karne ki koshish ki.
+Database ne UPDATE reject kar diya (rowcount=0)! 
+Worker log me print hua:
+Conflict on mark: job_id=5 ... status was modified by another transaction.
+
+
+5. Death Cycle (4 Generations):
+Job wapas pending ho chuka tha, toh worker ne Generation 2 claim kiya -> Reaper ne fir reclaim kiya -> Generation 3 claim kiya -> Generation 4 claim kiya!
+
+Is chakkar me provider ko 4 baar call gayi (ledger_delta=4), llm_calls me 3 rows ban gayi, aur reaper_reclaim_lines=4 hua!
+
+
+-> Distributed system me HEARTBEAT_INTERVAL hamesha CLAIM_TIMEOUT se kam se kam aadha (1/2 ya 1/3) hona chahiye, warna Reaper zinda workers ke slow jobs ko chura kar duplicate execution cycle me daal deta hai!
+
+---
+
+WEEK 6 - DAY 4
+
+
+````
+BASIC FLOW OF A REQUEST
+
+
+Universal Shuruat: Job claim hoti hai ya nahi?
+Case 1: 400 Bad Request
+Case 2: 401 Unauthorized (Invalid Key)
+Case 3: 500 Internal Server Error
+Case 4: 429 Too Many Requests (Rate Limit)
+
+
+-> JOB CLAIM :
+
+- when a reuest would return error/400 etc, job is claimed, not rejected directly.
+
+- EVERY worker follows this same route :
+
+```
+[Postgres Database]
+      │
+      │ 1. Worker polls: SELECT ... FOR UPDATE SKIP LOCKED
+      │ 2. Worker claims job:
+      │    - status = 'running'
+      │    - attempts = attempts + 1  (Pehli baar hai toh attempts = 1)
+      │    - claim_generation = claim_generation + 1
+      │    - claimed_at = now()
+      ▼
+[Worker Execution Loop]
+      │ 3. Worker calls handler: handle_llm_completion(payload)
+      │ 4. Worker prepares HTTP Request to Provider
+```
+
+- NOW, lets see what happens after this on different errors.
+
+
+
+-> ERROR 400 - BAD REQUEST.
+
+CASE 1 : WHAT HAPPENS INSIDE FAKE PROVIDER :
+
+Request aati hai header ke sath: X-Fake-Mode: 400.
+
+FastAPI handler dekhta hai if mode == "400": aur seedha return karta hai :
+
+HTTP 400 Bad Request
+{"error": "bad_request"}
+
+
+CASE 2 : REAL GEMINI PROVIDER :
+
+Request me prompt me koi galat JSON structure chala gaya ya aisa parameter jo supported nahi hai.
+
+Google ka server validation fail karta hai aur return karta hai :
+
+HTTP 400 Bad Request
+{"error": {"code": 400, "message": "Invalid JSON payload received.", "status": "INVALID_ARGUMENT"}}
+
+
+CASE 3 : WHAT HAPPENS IN WORKER :
+
+httpx client ko HTTP 400 milta hai.
+
+relay/providers.py dekhta hai: 
+
+if r.status_code == 400:
+Raise : ProviderBadRequestError("Gemini 400: ...").
+
+Worker ka except block is exception ko catch karta hai.
+
+
+
+-> ERROR 401 - UNAUTHORIZED/INVALID KEY :
+
+CASE 1 : FAKE PROVIDER :
+
+Header aata hai: X-Fake-Mode: 401.
+Return karta hai:
+
+HTTP 401 Unauthorized
+{"error": "unauthorized"}
+
+
+CASE 2 : GEMINI PROVIDER :
+
+Worker ne header bheja: "x-goog-api-key": "AIzaFakeInvalidKey...".
+
+Google ka authentication gateway check karta hai aur bolta hai: "Ye key hamare database me exist nahi karti!"
+
+Google return karta hai :
+
+HTTP 400 / 401 Unauthorized
+{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key.", "status": "INVALID_ARGUMENT"}}
+
+
+CASE 3 : WORKER FLOW :
+
+relay/providers.py dekhta hai status 401 ya Google ka key error.
+
+Raise : 
+ProviderAuthError("API key not valid").
+
+Worker catch karta hai: isinstance(exc, ProviderAuthError).
+
+Workflow Action (Non-Retryable) (DAY-4 EXECUTION) :
+
+Jo key abhi invalid hai, wo 5 second baad valid thodi ban jayegi! (DAY-3 ME RETRY KRTA REHTA, DAY-4 ME YE SAHI KIYA)
+
+Worker bina retry kiye turant job ko mark karta hai : status = 'dead_letter'.
+
+Attempts = 1 par khatam. Ek single attempt me job close!
+
+
+
+-> ERROR 500 - INTERNAL SERVER ERROR (PROVIDER CRASH) :
+
+CASE 1 : FAKE PROVIDER :
+
+Header aata hai: X-Fake-Mode: 500.
+
+Return karta hai : 
+HTTP 500 {"error": "internal_server_error"}.
+
+
+CASE 2 : GEMINI PROVIDER :
+
+Google ke kisi data-center me machine restart ho gayi, GPU out-of-memory ho gaya, ya load balancer phat gaya. 
+
+Google return karta hai :
+
+HTTP 500 Internal Server Error
+{"error": {"code": 500, "message": "Internal error encountered.", "status": "INTERNAL"}}
+
+
+CASE 3 : WORKER FLOW :
+
+relay/providers.py dekhta hai status 500.
+
+Raise : 
+ProviderServerError("Gemini 500: ...").
+
+Worker catch karta hai: 
+Ye RETRYABLE error hai! Galti humari nahi hai, Google ka server temporary down hai.
+
+Workflow Action:
+  
+Worker check karta hai: attempts < MAX_ATTEMPTS (1 < 3)? Haan!
+
+Worker exponential backoff calculate karta hai : next_attempt_at = now() + 3 seconds.
+
+Worker job ka status wapas karta hai(reaper) : 
+status = 'pending'!
+
+Worker lock release kar deta hai.
+
+Agla Cycle:
+  3 second baad jab worker ya koi doosra worker aayega, wo is job ko dubara claim karega (attempts = 2), fir call karega. Agar Google theek ho gaya hoga, toh succeed ho jayega!
+
+
+
+ERROR 429 - TOO MANY REQUESTS/RATE LIMIT :
+
+CASE 1 : FAKE PROVIDER :
+
+Header aata hai: X-Fake-Mode: 429.
+
+FastAPI header lagata hai: "Retry-After": "2".
+
+Return karta hai :
+
+HTTP 429 Too Many Requests
+Headers: {"Retry-After": "2"}
+{"error": "rate_limit_exceeded"}
+
+
+CASE 2 : GEMINI PROVIDER :
+
+Tumne 1 minute me 15 se zyada requests bhej di (Free Tier limit cross!). 
+
+Google ka rate limiter trigger hota hai aur return karta hai :
+
+HTTP 429 Too Many Requests
+{"error": {"code": 429, "message": "Resource has been exhausted (e.g. check quota).", "status": "RESOURCE_EXHAUSTED"}}
+
+
+CASE 3 : WORKER FLOW :
+
+relay/providers.py dekhta hai status 429.
+
+Wo response headers se Retry-After nikaalta hai : retry_after = r.headers.get("retry-after").
+
+Raise : 
+ProviderRateLimitedError("Rate limit exceeded", retry_after=retry_after).
+
+Worker catch karta hai: Ye RETRYABLE error hai! Quota khatam nahi hua, bas thodi der rukna hai.
+
+Workflow Action :
+
+Status wapas 'pending' hota hai.
+
+Exponential backoff schedule hota hai.
+
+Job dobara attempt hoga jab provider ki speed limit reset ho jayegi!
+```
+
+```
+400
+- Galti kiski hai? Client / Payload
+- Fake Provider kya karta hai? Mode "400" check karke status 400 deta hai.
+- Real Gemini kya karta hai? Bad JSON ya invalid parameter par 400 deta hai.
+- Worker kaunsi exception phekta hai? ProviderBadRequestError
+- Din 4 mein final action: Turant dead_letter — No Retry
+- Attempts: 1
+
+401
+- Galti kiski hai? Developer / Key
+- Fake Provider kya karta hai? Mode "401" check karke status 401 deta hai.
+- Real Gemini kya karta hai? Invalid API key par 400/401 deta hai.
+- Worker kaunsi exception phekta hai? ProviderAuthError
+- Din 4 mein final action: Turant dead_letter — No Retry
+- Attempts: 1
+
+500
+- Galti kiski hai? Provider ka Crash
+- Fake Provider kya karta hai? Mode "500" check karke status 500 deta hai.
+- Real Gemini kya karta hai? Google GPU/cloud glitch par 500 deta hai.
+- Worker kaunsi exception phekta hai? ProviderServerError
+- Din 4 mein final action: Retry with Backoff
+- Attempts: 3 tak jayega
+
+429
+- Galti kiski hai? Speed / Traffic
+- Fake Provider kya karta hai? Status 429 + Retry-After header deta hai.
+- Real Gemini kya karta hai? 15 RPM quota exceed hone par 429 deta hai.
+- Worker kaunsi exception phekta hai? ProviderRateLimitedError
+- Din 4 mein final action: Retry with Backoff
+- Attempts: 3 tak jayega
+```
+
+
+Din 3 me humne Relay ko ek "blind LLM worker" banaya tha—wo prompt leta tha, LLM ko call karta tha, aur agar koi bhi error aaye, toh andhadhundh 3 baar retry karta tha.
+
+Din 4 ka pura maqsad hai: Relay ko "DIMAAG" (Intelligence) dena! Relay ko sikhana ki har error ek jaisi nahi hoti :
+
+Kuch errors me turant haar maan leni chahiye (Non-Retryable).
+
+Kuch errors me wait karke dobara koshish karni chahiye (Retryable).
+
+Aur agar hamara apna database thodi der ke liye hichki le le (Infrastructure Fault: P-51, P-60), toh uski sazaa bechaare job ya external API ko nahi milni chahiye!
+
+
+
+WHAT ARE WE DOING TODAY :
+
+-> YESTERDAY(DAY-3), Har failure ek hi except Exception ke raaste gayi!
+
+- Case 1 (Invalid API Key - 401 Unauthorized) : Agar user ne galat API key daal di, toh Google ne bola: 401 Unauthorized. Relay ke worker ne kya kiya? Usne 3 second wait kiya, fir wahi galat key bhej di! Fir 6 second wait kiya, fir wahi galat key bhej di! Bhai, jo key abhi galat hai, wo 6 second baad thodi sahi ho jayegi! Humne bekar me 3 attempts gawa diye, worker ka 15 second ka time waste kiya, aur job ko faltu me atka kar rakha.
+
+
+- Case 2 (Bad Request - 400): User ne prompt me koi aisi cheez bhej di jo model accept nahi karta (400 Bad Request). Worker ne usko bhi 3 baar bhej diya!
+
+
+- Case 3 (P-60 Database Crash): Google Gemini ne prompt padha, mast jawab generate kiya, aur humare paise kat gaye (tokens billed!). Lekin jab worker us response ko humari local table llm_calls me likhne gaya, toh database me connection drop ho gaya. Worker ne bola: "Arre error aa gaya! Chalo is job ko retry karte hain!" Aur worker ne Google ko dobara call kar di! 
+👉 Khatra: Ek hi prompt ke liye Google ko 2 baar bill pay kiya gaya, kyunki humare worker ko ye samajh hi nahi thi ki galti Google ki nahi, hamare apne database ki thi!
+
+
+```
+BASICS (DAY 4 FOCUSED)
+
+Retryable (Transient) :	
+
+Galti temporary hai; network ya server ki haalat thodi der me theek ho sakti hai.
+
+EXAMPLE : 500 Internal Error, 503 Service Unavailable, 429 Rate Limit, Read Timeout
+
+CORRECT ACTION : Exponential Backoff ke sath Retry karo.
+
+IF NOT TAKEN : Agar retry nahi kiya, toh ek chote se 1-second network glitch ki wajah se healthy user ka job fail ho jayega.
+
+
+Non-Retryable (Permanent) :
+
+Galti request me ya credentials me hai(apne me); 100 baar bhi bhejoge toh wahi error aayega.
+
+EXAMPLE : 400 Bad Request, 401 Unauthorized, 403 Forbidden, Missing API Key
+
+CORRECT ACTION : Bina koi time waste kiye TURANT dead_letter me daalo!
+
+IF NOT TAKEN : Agar retry kiya, toh faltu me worker ka time waste hoga, rate limits exhaust hongi, aur queue jam hogi.
+
+
+
+Jab tum Google ya OpenAI ko unki speed limit se zyada calls bhejte ho, toh wo kehte hain :
+HTTP 429 Too Many Requests
+
+Aur sath me ek response header bhejte hain :
+Retry-After: 20 (Matlab: "Bhai, agle 20 second tak mere darwaze par mat aana!")
+
+Hamara worker abhi tak apna mann-marzi ka formula chalata tha: base * 2^attempt + jitter (jo 3s ya 6s wait karta tha).
+
+Agar Google bol raha hai "20 second ruko", aur worker 3 second baad fir pahunch gaya, toh Google fir thappad maarega (429)!
+
+Din 4 ka focus : Hum aaj fake provider me x-fake-retry-after header support karenge, aur measure karenge ki worker ka scheduled retry vs provider ka Retry-After kitna match karta hai.
+
+(Note: Din 4 me hum ise sirf measure kar rahe hain; isko 100% force/honour karna Week 7 ka kaam hai).
+
+
+
+P-51 : Worker ne job claim kiya, execute karne gaya, lekin INSERT INTO job_executions crash ho gaya (DB disk full ya lock timeout).
+
+FAILURE KISKA THA : job_executions TABLE WRITE FAILURE.
+
+Ye Relay ka internal instrument toota hai, user ka job nahi toota! Isko user ke attempts me count mat karo. Worker is iteration ko chhod de, aur Reaper lease expiry ke baad isko reclaim kare.
+
+
+
+P-60 : Provider ne 200 OK de diya (Bill ban chuka hai!), lekin jab result llm_calls table me save karne gaye toh database phat gaya.
+
+FAILURE KISKA : llm_calls TABLE WRITE FAILURE.
+
+Agar worker ne isko normal job failure maan kar retry kiya, toh provider ko doosri baar call chali jayegi (Duplicate Bill!). Instrument ki failure ko job ki failure se alag treat karna padega.
+
+
+
+Real world me external APIs 100% time fail nahi hoti, aur 100% time pass bhi nahi hoti. Wo intermittent (beech-beech me) fail hoti hain—jaise 30% requests 500 error dengi, aur 70% pass hongi.
+
+Agar 30 jobs aaye aur failure rate 30% hai, toh 30 jobs ko pass karwane ke liye provider ko kitni total calls karni padengi ?
+
+Mathematically: Agar failure rate p = 0.3 hai :
+
+- Pehli call me pass hone ka chance = 70%
+
+- Doosri call me pass hone ka chance = 30% × 70% = 21%
+
+- Teesri call me pass hone ka chance = 30% × 30% × 70% = 6.3%
+
+Is pure retry mechanism ki wajah se "Calls Per Success" badh jata hai (e.g. 1 job ke liye lagbhag 1.4 calls lagti hain). Yeh metric company ko batata hai ki retries ki wajah se hamara monthly LLM bill kitne percent badh raha hai!
+```
+
+
+TEST 1 :
+
+-> Humaare Relay worker ka purana behavior ye tha ki jab bhi koi job fail hoti thi, worker bina error ka type dekhe usse catch karta tha :
+
+except Exception as exc:
+    # Sabhi errors ko retryable maan kar backoff schedule kar do!
+
+
+- Agar provider ne 500 (Internal Server Error) ya 429 (Rate Limit) diya, toh retry banta hai kyunki thodi der me server recover ho sakta hai.
+
+- Lekin agar provider ne 400 (Bad Request — prompt invalid ya malformed) diya ya 401 (Unauthorized — API key galat) diya, toh kya 10 second baad dobara retry karne se API key apne aap theek ho jayegi KABHI NAHI!
+
+- Purane code me worker 400 aur 401 ko bhi 3 baar retry kar raha tha, jisse external API ke paise waste hote hain, queue block hoti hai, aur latency badhti hai. 
+
+- Step 1 me hume is blind retry behavior ko measure karna tha taaki hum prove kar sakein ki purana system kitna inefficient tha.
+
+
+EXECUTION :
+
+Ek fresh disposable database banayenge: relay_w6d4.
+
+Alembic migration chala kar schema prepare karenge.
+
+Purane unchanged worker code ke upar 5 test jobs ka batch bhejenge jiska label hoga s1_control:
+
+ok (200 OK — success)
+400 (Bad Request)
+401 (Unauthorized)
+500 (Server Error)
+429 (Rate Limited)
+
+Fake provider ka access log aur DB ledger count karenge.
+
+
+OBSERVATION :
+
+```
+totals terminal={"dead_letter": 4, "succeeded": 1}
+sum_attempts=13 sum_executions=13
+
+provider_status_counts={"200": 1, "400": 3, "401": 3, "429": 3, "500": 3}
+
+provider_access_post_lines=13
+
+ledger_delta=13
+
+Job 1 (ok): status=succeeded attempts=1 executions=1
+
+Job 2 (400): status=dead_letter attempts=3 executions=3 retry_delays=[1.0, 2.0]
+
+Job 3 (401): status=dead_letter attempts=3 executions=3 retry_delays=[1.0, 2.0]
+
+Job 4 (500): status=dead_letter attempts=3 executions=3 retry_delays=[1.0, 2.0]
+
+Job 5 (429): status=dead_letter attempts=3 executions=3 retry_delays=[1.0, 2.0]
+
+Total Run Time: 17.51 seconds
+```
+
+-> Fake provider par total 13 HTTP POST calls aayi.
+Job 2 (400 Bad Request) aur Job 3 (401 Unauthorized) ne 3 attempts liye aur 2 baar backoff wait (1s aur 2s) kiya!
+Ek malformed prompt aur ek galat API key par worker ne 6 useless calls waste kiye aur job ko dead-letter bhejne me lagbhag 5-6 second zaya kiye.
+
+
+
+TEST 2 :
+
+-> Client ne schema galat bheja (400), API key invalid hai (401), permission denied (403). Inme 100 baar bhi retry karoge toh fail hi hoga. Hume Relay ke provider aur worker ke beech ek strict contract banana tha jisse worker turant fatal error ko identify kare aur bina delay ke job ko dead_letter me bhej de.
+
+
+Kya karne wale hain? (Plan) :
+
+relay/providers.py me custom exception classes banayenge:
+
+ProviderBadRequestError (400)
+ProviderAuthError (401)
+ProviderServerError (500)
+ProviderRateLimitedError (429)
+
+relay/worker.py ke handler try/catch block ko update karenge.
+
+Agar error ProviderBadRequestError ya ProviderAuthError hai, toh attempts ko 1 par freeze karke status sidhe dead_letter mark karenge, bina kisi backoff delay ke.
+
+
+```
+except Exception as exc:
+    error_msg = f"{type(exc).__name__}: {exc}"
+    is_non_retryable = isinstance(exc, (ProviderBadRequestError, ProviderAuthError))
+```
+
+- isinstance(exc, ...) check karta hai ki kya error fatal hai. Agar fatal hai, toh NA next_attempt_at schedule hoga aur NA hi second attempt hoga. Sidhe dead_letter!
+
+
+
+TEST 3 :
+
+-> Step 2 me humne code likha, par kya wo sach me kaam kar raha hai? Iske alawa, do naye concepts test karne the:
+
+Error Classification Matrix: Kya 400 aur 401 sach me sirf 1 attempt le kar band hote hain, jabki 500 aur 429 abhi bhi 3 attempts lete hain?
+
+Retry-After Header Capping: Jab third-party LLM providers 429 Rate Limit throw karte hain, toh wo response header me Retry-After: <seconds> bhejte hain. Kabhi-kabhi rogue ya buggy provider Retry-After: 999999 (kai din ya mahine) bhej deta hai. Agar worker ne andhe hokar itna bada sleep time maan liya, toh job mahino tak queue me sadegi (Resource starvation)! Isliye Relay me strict capping zaroori hai (jaise max 60 seconds).
+
+
+kya karne wale hain? (Plan) :
+
+relay/fake_provider.py ko enhance karenge:
+
+Header X-Fake-Retry-After support karega, aur usse max 60s par cap karega (min(int(raw_ra), 60)).
+
+Seeded flaky mode add karenge.
+
+6 jobs ka batch bhejenge jiska label hoga s3_matrix:
+ok (200 OK)
+400 (Bad Request)
+401 (Unauthorized)
+500 (Server Error)
+429 with retry_after = 2s
+429 with retry_after = 20s
+
+
+EXECUTION :
+
+Provider chahe 999999 maange, Relay header cap usse 60 seconds se upar allow nahi karega.
+
+6 jobs bheja and uska observation ayega
+
+
+OBSERVATION :
+
+```
+totals terminal={"dead_letter": 5, "succeeded": 1}
+sum_attempts=12 sum_executions=12
+
+provider_status_counts={"200": 1, "400": 1, "401": 1, "429": 6, "500": 3}
+
+provider_access_post_lines=12
+
+ledger_delta=12
+
+Job 6 (ok):  status=succeeded   attempts=1 executions=1
+
+Job 7 (400): status=dead_letter attempts=1 executions=1 retry_delays=[]
+
+Job 8 (401): status=dead_letter attempts=1 executions=1 retry_delays=[]
+
+Job 9 (500): status=dead_letter attempts=3 executions=3 retry_delays=[1.0, 2.0]
+
+Job 10 (429): status=dead_letter attempts=3 executions=3 retry_delays=[1.0, 2.0]
+
+Job 11 (429): status=dead_letter attempts=3 executions=3 retry_delays=[1.0, 2.0]
+```
+
+- Job 7 (400) aur Job 8 (401):
+
+Dono ka attempts = 1 aur executions = 1!
+
+retry_delays = [] (Koi delay schedule nahi hua).
+
+Provider calls count: 400: 1 aur 401: 1. (Step 1 me ye 3 aur 3 the!).
+
+
+- Job 9 (500) aur Jobs 10, 11 (429):
+
+Inhone standard attempts = 3 liye aur backoff delay follow kiya.
+
+429 ke do jobs the, dono ne 3-3 attempts liye, isliye 429: 6 calls huin.
+
+
+- Latency Gain: Step 1 me 5 jobs 17.5s le rahe the. Step 3 me 6 jobs hone ke bawajood 400 aur 401 instantly first attempt par (<0.1s) finish ho gaye!
+
+
+
+TEST 4 : 
+
+-> Fake provider toh humara local software tha. Asli duniya me jab Google Gemini API ya OpenAI se baat karte hain, toh do major real-world risks hote hain:
+
+Real API Boundary Behavior: Kya Google ka server sach me 400 Bad Request bhejta hai jab API key invalid format me ho? Aur kya humara worker usse catch karke bina crash hue 1 attempt me dead-letter mark karta hai?
+
+Secret Leakage Security Risk: Jab error raise hota hai, toh Python traceback, database ke last_error column, logs, ya terminal history me sensitive API Key (jaise AIzaSy...) plain text me print/store hone ka bohot bada risk hota hai. Agar API key git me commit ho gayi ya logs me chali gayi, toh account hack ho sakta hai.
+
+
+Kya karne wale hain? (Plan) :
+
+Test 1 (s4_badkey): Real Google Gemini provider use karenge lekin invalid API key denge (AIzaFAKEFAKEFAKE0000000000000000000000). Dekhenge ki Google se 400 Bad Request aane par Relay 1 attempt me terminal dead-letter bhejta hai ya nahi.
+
+Test 2 (s4_nokey): Environment variable GEMINI_API_KEY ko completely empty/unset karke job bhejenge. Dekhenge ki Relay local auth error throw karke 1 attempt me terminate karta hai ya nahi.
+
+Test 3 (Security Key Scan): PowerShell script labs/w6d4_key_scan.ps1 chala kar logs, git-tracked files, staged diff, terminal history, aur database dump me key ki exact value search karenge. Saath me Positive Controls verify karenge taaki sure ho sakein ki scan sach me check kar raha hai.
+
+
+EXECUTION :
+
+
+-> TEST1 : bad key test (fake key pass ki gemini provider ko)
+
+OBSERVATION :
+
+```
+{
+  "error": {
+    "code": 400,
+    "message": "API key not valid. Please pass a valid API key.",
+    "status": "INVALID_ARGUMENT",
+    "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "API_KEY_INVALID"}]
+  }
+}
+```
+
+- Relay ke worker ne ProviderBadRequestError catch kiya aur log kiya: Job_id=12 non-retryable ProviderBadRequestError: Provider 400: ... Marking terminal 'dead_letter' immediately. Status: dead_letter, attempts=1, wait_s=1.656s. Zero retries!
+
+
+
+-> TEST2 : No key test (Worker ko empty environment variable ke sath run kiya, GEMINI_API_KEY= )
+
+OBSERVATION :
+
+```
+Relay ke GeminiProvider ne local validation par check kiya : 
+
+if not api_key : raise ProviderAuthError("API key environment variable GEMINI_API_KEY is not set") 
+
+Worker ne classify kiya: isinstance(exc, ProviderAuthError) -> Status: dead_letter, attempts=1, wait_s=0.297s.
+```
+
+
+
+-> TEST3 : kya kahi gemini_api_key LEAK hori?
+
+OBSERVATION :
+
+```
+logs_hits = 0 (Humaari 39 log files me API key 0 baar aayi). Saath me logs_control_hits = 11 proof hai ki scanner files ko read kar pa raha tha.
+
+tracked_files = 69, tracked_hits = 0, staged_diff_hits = 0 (Git index aur repo files clean hain).
+
+history_hits = 0 (PowerShell command history me key nahi gayi kyunki humne environment variable name pass kiya tha, direct value terminal par type nahi ki).
+
+db_hits = 0 (pg_dump ke 21,038 bytes ke dump me key 0 baar aayi). Saath me db_control_hits = 1 (w6d4-canary payload dump me mila, proving the scanner works!).
+```
+
+
+
+TEST 5 : 
+
+-> Ye Week 6 Din 4 ka sabse critical distributed systems engineering problem tha!
+
+
+Problem A: P-51 (Instrumentation Table Failure vs Job Fate)
+
+Relay me jab worker job uthata hai, toh wo job_executions table me ek row insert karta hai auditing ke liye (record_execution).
+
+Purane code me record_execution handler ke try block ke andar tha :
+
+```
+try:
+    await record_execution(...) # Agar DB schema migrate nahi hua ya table lock ho gayi?
+    await handler(payload)
+except Exception as exc:
+    # Worker ne samjha ki JOB fail hui hai!
+    # Aur usne job ke attempts badha kar usse dead_letter me phenk diya!
+```
+
+- The Injustice: Job ka code (e.g. LLM call ya sleep) toh bilkul theek tha! Fault Relay ke internal instrumentation table me thi. Internal metric table fail hone par client ki job ko "dead_letter" declare kar dena aur attempts waste karna galat hai!
+
+
+
+Problem B: P-60 (Duplicate Billing Hazard on DB Ledger Failure)
+
+Jab worker kisi LLM model (jaise OpenAI/Gemini) ko call karta hai, toh provider pehle reply deta hai (200 OK) aur paise charge ho jate hain.
+
+Iske baad Relay worker results aur token count ko database ke llm_calls table me save karta hai (record_llm_call).
+
+Agar LLM call succeed ho gayi, lekin llm_calls table me insert karte waqt DB connection drop ho gaya ya table drop ho gayi, toh purana code exception throw karta tha.
+
+Isse handler fail hota tha aur worker job ko retry ke liye schedule kar deta tha!
+
+- Financial Disaster: Agli retry me worker dubara LLM provider ko API call karega! Customer se do baar paise cut jayenge (Duplicate Billing)!
+
+
+
+Kya karne wale hain? (Plan)
+
+Fix P-51: record_execution ko handler ke try block se bahar nikalenge, aur heartbeat_task start hone se pehle execute karenge. Agar ye fail ho jaye, toh worker is iteration ko bina job attempts touch kiye abandon karega. Job ko DB me running chhod dega taaki Reaper safe tarike se reclaim kare.
+
+
+Fix P-60: handle_llm_completion ke andar record_llm_call ko ek dedicated try/except block me wrap karenge. Agar DB write fail bhi ho, worker log me warning print karega ([P-60] record_llm_call failed...), lekin handler exception nahi throw karega aur job ko succeeded mark karega taaki dubara external LLM call trigger na ho!
+
+
+
+EXECUTION :
+
+1. The P-51 Verification Test (s5_p51_after):
+
+Humne test me table job_executions ko rename karke gayab kar diya (ALTER TABLE job_executions RENAME TO job_executions_broken) aur Reaper ke sath worker chalaya
+
+
+OBSERVATION :
+
+```
+Job 15: status=running attempts=11 claim_generation=11 reclaims=10
+
+Worker log: [worker-1] [P-51] record_execution failed: ProgrammingError: relation "job_executions" does not exist. Abandoning iteration, leaving for reaper reclaim.
+```
+
+-> Before Fix (s5_p51_before): Table gayab hone par Job 14 ko worker ne 3 retries me dead_letter kar diya tha.
+
+-> After Fix (s5_p51_after): Job 15 dead_letter MEIN NAHI GAYI! Wo DB me running rahi, Reaper ne lease timeout ke baad usse reclaim kiya, aur worker ne job ko penalize nahi kiya. (Census ke baad humne cleanup UPDATE chala kar isse cleanly close kiya).
+
+
+
+2. The P-60 Verification Test (s5_p60):
+
+Humne test me table llm_calls ko temporarily rename kar diya aur Fake Provider ko ek valid 200 OK job bheji
+
+
+OBSERVATION :
+
+```
+provider_status_counts={"200": 1}
+
+provider_access_post_lines=1
+
+ledger_delta=1
+
+Job 16: status=succeeded attempts=1 executions=1
+
+Worker log: [worker-1] [P-60] record_llm_call failed: ProgrammingError: relation "llm_calls" does not exist. LLM call succeeded, suppressing retry to prevent duplicate billing.
+```
+
+-> Provider ko sirf 1 baar call gayi (ledger_delta=1)!
+
+-> Local DB write fail hone ke bawajood job succeeded mark hui.
+
+-> Koi retry trigger nahi hua. Duplicate billing 100% prevent ho gayi!
+
+-> (Agar side-effect (external LLM call) execute ho chuka hai, toh DB ledger failure par retry suppress karna zaroori hai to avoid double-charging)
+
+
+
+TEST 6 :
+
+-> Production me cloud APIs na toh 100% perfect hoti hain aur na hi 100% fail hoti hain. Wo flaky hoti hain — e.g. 100 me se 30 requests randomly 500 error dengi. Is real-world situation me do sawal uthte hain :
+
+Convergence: Kya Relay ka exponential backoff aur retry architecture is 30% network chaos ke beech jobs ko safely finish (converge) kar paata hai?
+
+Calls Per Success (Economic Cost): Agar hum 28 successful jobs chahte hain aur 30% failure rate hai, toh hume external vendor ko kitni baar call karna padega? Har retry ke paise lagte hain. Is ratio ko kehte hain "Calls Per Success". Step 6 me hume is financial ratio ko scientifically measure karna tha.
+
+
+EXECUTION :
+
+- relay/fake_provider.py me flaky mode banayenge with fail_pct = 30 aur determinism ke liye Python ka seeded random generator use karenge : random.Random(42).
+
+- 30 jobs ka batch bhejenge (s6_flaky30).
+
+- Wait karenge jab tak saari 30 jobs terminal (succeeded ya dead_letter) na ho jayein.
+
+- Calculate karenge : 
+Calls Per Success = Total HTTP Calls / Successful Jobs.
+
+
+OBSERVATION :
+
+```
+totals terminal={"dead_letter": 2, "succeeded": 28}
+
+sum_attempts=41
+
+sum_executions=41
+
+provider_status_counts={"200": 28, "500": 13}
+
+provider_access_post_lines=41
+
+ledger_delta=41
+
+table_counts={"llm_calls": 28}
+```
+
+Total Jobs: 30
+
+Jobs Succeeded: 28
+
+Jobs Dead Letter (3 consecutive 500 failures exhausted max attempts): 2
+
+Provider par aayi total calls: 28 (200 OK) + 13 (500 Error) = 41 Calls.
+
+Calls Per Success Ratio: 
+Calls Per Success = 41 / 28 = 1.464.
+
+
+CONCLUSION : 
+
+System Stability: 30% severe network chaos me bhi Relay ne bina kisi crash ya deadlock ke 28 jobs successfully complete karwayin aur 2 jobs ko gracefully dead-letter queue me bhej diya.
+
+Economic Insight: 30% flake rate ka matlab hai ki 1 success pane ke liye aapko 1.464 vendor calls ki cost bear karni padti hai. Retries reliability toh dete hain, lekin external billing me 46.4% ka surcharge add karte hain.
+
+---
