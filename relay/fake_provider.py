@@ -1,10 +1,12 @@
 import asyncio
 import json
 import random
+import time
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 flaky_rng = random.Random(42)
+storm_start_time: float | None = None
 
 app = FastAPI(title="Fake LLM Provider")
 
@@ -14,7 +16,7 @@ print("[fake_provider] listening on 127.0.0.1:8002 ledger=in_memory", flush=True
 
 @app.get("/v1/ledger")
 async def get_ledger():
-    return {"count": call_count}
+    return {"calls": call_count, "count": call_count}
 
 
 @app.post("/v1/complete")
@@ -42,6 +44,37 @@ async def complete(request: Request):
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
         }
+
+    elif mode == "storm":
+        global storm_start_time
+        now = time.monotonic()
+        if storm_start_time is None:
+            storm_start_time = now
+
+        raw_storm = request.headers.get("X-Fake-Storm-S", "20")
+        try:
+            storm_duration = min(float(raw_storm), 60.0)
+        except Exception:
+            storm_duration = 20.0
+
+        raw_ra = request.headers.get("X-Fake-Retry-After") or request.headers.get("Retry-After") or "20"
+        try:
+            ra_int = min(int(raw_ra), 60)
+        except Exception:
+            ra_int = 20
+
+        if now - storm_start_time < storm_duration:
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(ra_int)},
+                content={"error": "storm_rate_limit_exceeded"},
+            )
+        else:
+            return {
+                "text": "simulated storm passed response",
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+            }
 
     elif mode == "429":
         raw_ra = request.headers.get("X-Fake-Retry-After") or request.headers.get("Retry-After") or "2"
@@ -81,7 +114,7 @@ async def complete(request: Request):
     elif mode in ("slow", "slow_below", "slow_above"):
         raw_sec = request.headers.get("X-Slow-Seconds", "3.0")
         try:
-            seconds = min(float(raw_sec), 30.0)
+            seconds = min(float(raw_sec), 60.0)
         except Exception:
             seconds = 3.0
         await asyncio.sleep(seconds)

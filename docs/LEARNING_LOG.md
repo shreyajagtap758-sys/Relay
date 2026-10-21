@@ -7237,7 +7237,7 @@ Status wapas 'pending' hota hai.
 Exponential backoff schedule hota hai.
 
 Job dobara attempt hoga jab provider ki speed limit reset ho jayegi!
-```
+````
 
 ```
 400
@@ -7771,3 +7771,491 @@ System Stability: 30% severe network chaos me bhi Relay ne bina kisi crash ya de
 Economic Insight: 30% flake rate ka matlab hai ki 1 success pane ke liye aapko 1.464 vendor calls ki cost bear karni padti hai. Retries reliability toh dete hain, lekin external billing me 46.4% ka surcharge add karte hain.
 
 ---
+
+
+WEEK 6 - DAY 5
+
+
+Kal (Din 4) humne har job ko uska error type pehchanna sikhaya: 400 aur 401 aaye toh turant ruko, 500 ya 429 aaye toh retry karo. Lekin production me teen bade dhokhe hote hain :
+
+1. Aggregate Rate vs Per-Job Backoff : 
+
+- Agar 30 jobs ek saath rate-limited provider (429) se takrayein, aur har job apna 2s, 4s ka backoff kare — toh kya provider par padne wala load kam hoga? Nahi! Provider ke sar par 30 jobs ka aggregate toofan tootega.
+
+2. Async Yield vs Blocking Client (The Lying Lease): 
+
+- Hum sochte hain ki worker ka background heartbeat task har 10 second me chal kar lease ko zinda rakhta hai. Lekin agar worker ke code me kisi ne ek synchronous/blocking HTTP client (httpx.Client) chala diya jo 40 second tak thread ko hold karke baith gaya — toh Python ka event loop freeze ho jayega! Heartbeat ko chalne ka mauka (yield) hi nahi milega! 
+- Reaper samjhega worker mar gaya aur zinda worker ki job chura lega!
+
+3. The Crash Window (Ek Job, Do Bill): 
+
+- Provider ne 200 OK de diya aur paise kaat liye, par Relay ke local database me llm_calls likhne se theek 1 millisecond pehle worker process crash ho gaya (os._exit(1)). Provider ke ledger me call count ho chuki hai, par Relay ke DB me koi record nahi. Agla worker us job ko firse chala dega → Ek hi job ke do baar bill cut jayenge!
+
+4. Bug P-62: 
+
+- Python me if payload.get("fail_pct"): likhne se agar user ne fail_pct: 0 bheja, toh Python 0 ko False maan kar ignore kar deta tha aur provider default 30% failure chalata tha. Isko theek karna hai.
+
+
+````
+BASIC TERMS :
+
+throughput : ek second me provider tk kitni calls pohchti he : 
+```
+(workers x 1 / ek iteration ka time)
+```
+
+peak_calls_in_any_1s : Harness script har 0.25s me provider ka ledger sample karti hai. Kisi bhi 1-second ki rolling window me maximum kitni calls aayi, ye wo peak number hai.
+
+
+first_call_s : Database me jobs insert hone ke kitne second baad pehli call provider ke darwaze par pahunchi.
+
+
+Aggregate rate : Ek akele job ka backoff nahi, balki saare jobs aur workers milakar provider par per-second kitna aggregate pressure daal rahe hain.
+
+
+exec_gaps_below_threshold : Database me job_executions ke time gaps me se kitne gaps threshold (jaise 20s) se chhote hain — yani kitni baar worker provider ke kahe huye Retry-After time se pehle hi muh uthakar wapas aa gaya.
+
+
+Blocking Call : Synchronous call jo poore OS thread / event loop ko pakad kar baith jaati hai. Jab tak response na aaye, Python kuch aur execute nahi kar sakta.
+
+
+Async Yield : Asynchronous execution (await). Jab network I/O ka wait ho raha hota hai, Python control wapas event loop ko de deta hai taaki background tasks (jaise heartbeat) chal sakein.
+
+
+asyncio.create_task Execution Timing : Task schedule toh ho jata hai, lekin wo pehli baar tabhi run hota hai jab current coroutine pehla await (yield) kare! Agar code block ho gaya, toh task kabhi shuru hi nahi hoga.
+
+
+mark_conflicts : Jab worker job khatam karke status update karne jaye (WHERE status='running' AND claim_generation=X) aur rowcount 0 aaye — kyunki Reaper ne lease expire hone par generation badal di (Mark fenced) ya status pending kar diya (Conflict on mark).
+
+
+os._exit(1) : Hard process kill. Ye standard sys.exit() jaisa nahi hota — ye Python ke finally blocks, atexit hooks aur buffered prints sabko bypass karke process ko usi millisecond me mita deta hai.
+````
+
+
+TEST 1 :
+
+```
+SUMMARY OF P-62)
+
+-> Soch tune kisi online shopping app par coupon lagaya: "Mujhe 0% donation karni hai" (fail_pct: 0). Par app ke coder ne ganda code likha tha:
+
+
+if user_donation: # Python me 0 ko "False" ya "Kuch nahi" maana jata hai!
+    apply_donation()
+else:
+    apply_default_30_percent_donation() # Default 30% daal do!
+
+
+-> Tune maanga tha 0%, par Python ne 0 ko False samjha, aur app ne tere se 30% donation kaat li!
+
+Relay me kya hua tha?
+
+Step 1 me humne test kiya ki hum Fake Provider ko bolte hain: "Bhai ek bhi error mat dena, fail_pct = 0 rakhna" (fail_pct: 0).
+
+Par purane worker me likha tha: if payload.get("fail_pct"):.
+
+Python me 0 dekhte hi if statement fail ho gaya! Worker ne provider ko fail_pct bheja hi nahi.
+
+Provider ko laga user ne kuch nahi maanga, toh usne apna default 30% failure rate chala diya aur 10 me se 9 jobs ko 500 server error dekar maar diya!
+
+FIX : code me kiya
+```
+
+-> Problem A: Bug P-62 (The Python Falsy 0 Trap)
+
+Humne kal flaky mode banaya tha jisme user payload me fail_pct bhejta hai (jaise fail_pct: 30 matlab 30% failure).
+
+Agar koi customer ya test payload me fail_pct: 0 bhejta hai (yani "mujhe 0% failure chahiye, ek bhi error mat dena"), toh code me purana logic tha:
+
+```
+if payload.get("fail_pct"):
+    params["fail_pct"] = payload.get("fail_pct")
+```
+
+The Disaster: Python me integer 0 ki boolean value False hoti hai (bool(0) == False)! 
+
+Isliye if payload.get("fail_pct"): evaluate hua False! Worker ne fail_pct parameter ko discard kar diya.
+
+Fake provider ke paas koi fail_pct header nahi gaya, toh usne default 30% failure assume kiya aur 0% maangne wale user ke jobs ko andhadhundh 500 Server Errors fek kar maar diya!
+
+
+
+EXECUTION :
+
+BEFORE FIX : Pehle code ko touch kiye bina 10 jobs bheji gayi jisme fail_pct: 0 maanga gaya:
+
+```
+python -u labs/w6d5_jobs_run.py --label s1_zero_before --fake --count 10 --deadline 60 --table llm_calls --payload '{"prompt": "job __I__ quick brown fox", "fake_mode": "flaky", "fail_pct": 0, "tag": "w6d5-canary"}'
+```
+
+
+FIX : Agar payload ke dictionary me "fail_pct" key exist karti hai (chahe uski value 0 ho ya 0.0), tab bhi wo extract hogi aur provider tak jayegi!
+
+```
+ PURANA (BROKEN): if payload.get("fail_pct"):  -> 0 evaluates to False!
+# NAYA (FIXED P-62):
+if "fail_pct" in payload:
+    params["fail_pct"] = payload["fail_pct"]
+```
+
+
+OBSERVATION :
+
+1. Before Fix (s1_zero_before) :
+
+```
+provider_status_counts={"200": 9, "500": 9}
+
+totals terminal={"dead_letter": 1, "succeeded": 9}
+
+sum_attempts=18 sum_executions=18
+
+Job 3: status=dead_letter attempts=3 last_error_class=ProviderServerError
+```
+
+Proof: User ne fail_pct: 0 maanga tha, lekin provider ne 9 baar 500 error diya aur Job 3 ko dead-letter kar diya! Falsy 0 bug physically expose ho gaya.
+
+
+2. After Fix (s1_zero_after) :
+
+```
+provider_status_counts={"200": 10, "500": 0}
+
+totals terminal={"succeeded": 10}
+
+sum_attempts=10 sum_executions=10
+
+wait_s=4.812s
+```
+
+Proof: 500 errors gir kar 0 ho gaye! Saare 10 jobs 1 attempt me 4.8 second me succeed ho gaye.
+
+
+
+
+Problem B: Throughput Baseline (s1_control)
+
+Hume naapna tha ki jab 2 workers ek saath 30 normal jobs uthate hain, toh Relay ek second me provider tak maximum kitni calls bhej sakta hai (peak_calls_in_any_1s).
+
+Ek worker ki iteration me database se FOR UPDATE SKIP LOCKED claim hota hai, instrumentation write hota hai, HTTP call hoti hai, aur succeeded status mark hota hai. Ye baseline naape bina hum Step 2 ke 429 storm ka impact nahi samajh sakte the.
+
+
+EXECUTION :
+
+s1_zero_after: Wahi 10 jobs dobara chalayi.
+
+s1_control: 2 workers ke sath 30 normal ok jobs chalayi (--workers 2 --count 30 --window 20).
+
+
+
+OBSERVATION :
+
+-> 3. Control Run (s1_control — 2 Workers, 30 Jobs):
+
+```
+wait_s=9.297s
+
+all_terminal=True (30/30)
+
+ledger_delta=30
+
+peak_calls_in_any_1s=4
+
+window_avg_calls_per_s=1.50 calls/sec
+
+first_call_s=1.032s
+
+worker_exit=alive,alive
+```
+
+Normal condition me 2 workers milakar 1 second me maximum 4 calls bhejte hain, aur average speed 1.5 calls/sec rehti hai. 30 jobs khatam hone me kul 9.3 second lage.
+
+
+CONCLUSION :
+
+Python me configurations aur limits pass karte waqt kabhi bhi if var: ya or use mat karo; hamesha if "key" in dict: ya if var is not None: use karo, warna 0, False, ya empty string silent bugs ban jaate hain.
+
+2 workers ka normal baseline throughput naap liya gaya: peak = 4 calls/s, avg = 1.5 calls/s.
+
+
+
+TEST 2 :
+
+```
+SUMMARY :
+
+Provider ne bola: 429 Too Many Requests, Retry-After: 20s (20 second ruko).
+
+Par Relay ke har job ne provider ki baat ko dustbin me phenka aur apna khud ka 2s, 4s wala backoff chala diya! (provider ki tarf se jo retry after he wo humare relay me abi dekhte hi nhi he, uska koi mechanism hi nhi he, week 7 me ayega).
+
+30 jobs lagatar har 2.5s se 6s ke andar provider ke darwaze par hammer karti rahin.
+
+Nateeja: Storm 20 second chalna tha. Par pehli 13 jobs ne 10 second ke andar hi apne 3 attempts khatam kar liye aur dead-letter me jakar mar gayin!
+
+Conclusion: Har job ka apna-apna retry delay provider ko nahi bacha sakta. Hume pure system ke upar ek Centralized Rate Limiter lagana padega jo pure queue ko ek sath roke.
+```
+
+-> The Core Question: Jab third-party LLM provider (jaise OpenAI ya gemini) overloaded hota hai, toh wo rate limit lagata hai : 
+
+429 Too Many Requests + Retry-After: 20 (matlab "agli 20 second tak request mat bhejna").
+
+Kal Din 4 me humne har job ko apna retry delay khud chunne diya tha (exponential backoff with jitter: 1s, 2s, 4s).
+
+The Distributed Illusion: Developer sochta hai: "Har job apna backoff kar rahi hai, toh system safe hai." Lekin provider ke perspective se socho! Agar queue me 30 jobs hain, aur 2 workers hain: 
+
+Job 1 fail hui → usne 1s wait kiya. Theek us 1 second me Job 2 aayi! Fir Job 3 aayi! Fir Job 1 ka 1s khatam hua aur wo dubara provider ke darwaze par aayi! 
+
+Provider ke sar par per-second kitni calls padengi? Kya per-job backoff provider ke rate-limit ko respect kar pata hai? KABHI NAHI!
+
+
+EXECUTION :
+
+fake provider me strom moe lagaya, 2 workers, 30 jobs, storm duration = 20sec, provider bol rha he retry after = 20sec.
+
+
+
+OBSERVATION :
+
+```
+totals terminal={"dead_letter": 13, "succeeded": 17}
+
+sum_attempts=77 sum_executions=77
+
+provider_status_counts={"200": 17, "429": 60}
+
+exec_gaps_below_threshold=47/47 (threshold=20.0s, min=2.539s, max=6.987s)
+
+window_avg_calls_per_s=3.00 calls/sec (calls_in_window=60)
+
+calls_after_window=17
+
+wait_s=26.734s
+```
+
+MEANING :
+
+- Provider ne chillakar bola tha "20 second ruko", lekin Relay ke worker ne exec_gaps_below_threshold=47/47 diya! Matlab 47 me se 47 retries 2.5s se 6.9s ke andar hi wapas aa gaye! Ek bhi job 20 second nahi ruki!
+
+- Control run me speed 1.5 calls/s thi. Storm ke dauran speed 3.0 calls/s ho gayi — yani rate kam hone ki jagah DOUBLE ho gayi! Kyunki jobs fail ho-hokar bar-bar queue me ghoom rahi thi!
+
+- Job 1 ne attempt 1 liya (0th sec pe) → 429 mila.
+Job 1 ne attempt 2 liya (2.5th sec pe) → 429 mila.
+Job 1 ne attempt 3 liya (8.9th sec pe) → 429 mila.
+3 attempts khatam! Job 1 dead-letter me chali gayi theek 9th second par, jabki storm 20th second tak chalna tha!
+Jobs 1 se 13 sabhi storm ke andar hi 3 attempts waste karke mar gaye.
+
+- Sirf wahi jobs bachi jinka pehla ya doosra attempt queue me late hone ki wajah se 20th second ke baad execute hua. Jaise hi storm khatam hua, unhe 200 OK mil gaya aur wo succeed ho gayi!
+
+
+
+CONCLUSION :
+
+Per-job backoff aggregate rate ko control NAHI kar sakta! Agar aapke paas 100 jobs hain aur har job apna 2s backoff kar rahi hai, toh provider par per-second 50 calls girti rahengi. Provider ko bachane ke liye aur jobs ko dead-letter hone se rokne ke liye ek Centralized Global Rate Limiter (Token Bucket / Redis limiter) chahiye jo Week 7 me banega. Aaj ka number (429: 60, 13 dead-letter, 47/47 gaps < 20s) uska scientific baseline ban gaya.
+
+
+
+TEST 3 :
+
+-> Distributed systems me ek universal doctrine maana jata hai: "Worker ke background me Heartbeat task chal rahi hai jo har 10s me lease refresh karti hai, isliye slow jobs safely complete ho sakti hain." Lekin kya ye doctrine hamesha sach hota hai?
+
+Python me asyncio ek single-threaded cooperative multitasking model par chalta hai.
+
+Agar kisi developer ne worker ke code me galti se koi third-party library ya synchronous blocking HTTP call (requests ya httpx.Client) chala di jo 40 second tak internet ke jawab ka intezaar karti hai — toh thread physically freeze ho jata hai!
+
+Jab thread hi freeze hai(event loop freeze = no heartbeat), toh background heartbeat task ko execute hone ke liye CPU milega hi nahi!
+
+Hume mathematically compare karna tha:
+
+Arm A (s3_async): Async non-blocking call (httpx.AsyncClient) → Heartbeat chalti hai ya nahi?
+
+Arm B (s3_sync): Synchronous blocking call (httpx.Client) → Lease expire hoti hai? Reaper reclaim karta hai? kya provider ke bill duplicate bante hain? kya attempts infinite hote he ya max attempt tk jate he?
+
+
+
+OBSERVATION :
+
+-> ARM A : async call
+
+```
+succeeded
+attempts = 1
+heartbeat sent = 4(each 10s send)
+reaper reclaims = 0
+mark conflicts = 0
+provider calls(200 OK) = 1
+llm_calls Rows = 1
+wait time = 40.75sec
+```
+
+-> ARM B : sync call
+
+humare script me --deadline 500 rakhi(500 second hote hi test zabardasti bandh), har blocking call 40 sec lega, toh attempts infinite chalege ya 3 tk hi jayege?
+
+```
+running (forever)
+attempts = 12 (each call of 40s)
+heartbeat sent = 0
+reaper reclaims = 11
+mark conflicts = 11
+provider calls(200 OK) = 12(same work! duplication)
+llm_calls Rows = 12
+wait time = 
+```
+
+- event loop hi freeze he toh heartbeat bhi nhi bheji jayegi, reaper bar bar reclaim krega, job bar bar fail krke attempts badhayegi, provider call ache se hora jisse bar bar paise katenge, and exception block ayega hi nhi jaha attempts <= MAX_ATTEMPTS dekhe (Fake Provider ne 200 OK diya tha! Provider ne koi Exception throw hi nahi ki! Isliye code except block me kabhi ghusta hi nahi hai!)
+
+- Worker ka if current_attempts >= MAX_ATTEMPTS: dead_letter wala check sirf tab chalta hai jab handler me koi Python Exception (except Exception:) aaye.
+
+- Par yahan toh koi Exception aayi hi nahi! Provider ne 200 OK diya tha!
+
+- Job ka status 'succeeded' nahi hua, par job DB me wapas 'pending' ho chuki thi.
+
+- Worker loop ke agle round me gaya. Usne dekha Job 1 'pending' hai.
+
+- Worker ne usse dubara claim kiya: attempts = attempts + 1 (Attempts 2 ho gaye!).
+
+- Worker dubara 40 second ke liye freeze ho gaya...Reaper ne dubara chura liya...Worker ne dubara claim kiya: attempts = 3. Reaper ne dubara chura liya... wapis claim kiya...
+
+- Reaper ka code attempts column dekhta hi nahi! Reaper ka SQL query sirf ye dekhta hai: WHERE claimed_at < now() - 30s. Wo andhon ki tarah job ko hamesha pending karta rahega!
+
+- agar hum harness deadline 500 na lagaye toh attempts infinite chalege har 40 sec me, provider har baar paise kaatega and loop infinite hoga.
+
+
+
+CONCLUSION :
+
+Agar koi handler freeze ho jaye ya blocking call kare, toh system ko attempts ya exception ke bharose nahi chhod sakte. System ko ek Hard Deadline (Process Watchdog) chahiye jo 30 second hote hi us process ko physically kill (SIGKILL) kar de, taaki infinite billing loop na ban sake. (month 3 me ayega)
+
+
+
+
+TEST 4 :
+
+-> Distributed systems me ek classic failure window hoti hai jise bolte hain "The In-Between Crash Window":
+
+Worker ne external LLM API ko call kiya.
+
+Provider ne response return kar diya (200 OK) aur apne billing ledger me paise kaat liye.
+
+Ab worker apne local database me llm_calls table me row likhne hi ja raha tha ki theek usi millisecond me:
+
+Server ka power chala gaya, ya
+Kubernetes ne container ko SIGKILL maar diya, ya
+Worker out-of-memory (OOM) me mar gaya (os._exit(1)).
+
+The Core Risk: Provider ke paas receipt ban chuki hai ki call ho gayi. Lekin Relay ke database me 0 record hai! Jab agla worker aayega, usko toh pata hi nahi chalega ki call ho chuki thi. Wo dubara LLM ko call karega! 
+
+Isko kehte hain "Ek Job ke Do Bill" (The Phantom Double Bill). Hume is window ko physically trigger karke naapna tha.
+
+
+EXECUTION :
+
+Relay ka job submit karne wala endpoint (POST /jobs) unauthenticated hai (yani koi bhi user ya script bina password ke jobs daal sakti hai).
+
+Socho humne Step 4 me ek test hook lagaya: "Agar payload me crash_at: "after_provider" likha ho, toh worker ko os._exit(1) karke maar do."
+
+
+ye chiz koi bhi user ya hacker reuest bhejne me kr sakta he : Ek simple JSON payload se koi bhi bahar ka banda humare saare production workers ko ek second me down kar sakta tha! Isse kehte hain "Remote Kill-Switch Vulnerability" (jo humne Week 6 Din 2 me /slow-hold ke sath dekha tha).
+
+
+SAFETY GATE : os.getenv("RELAY_TEST_HOOKS") == "1"
+
+- Chahe payload me koi 1000 baar bhi crash_at: "after_provider" likh kar bhej de, worker tab tak nahi marega jab tak server ke machine environment me RELAY_TEST_HOOKS=1 set na ho! Production servers me ye variable kabhi set nahi hota (unset/None rehta hai).
+
+
+OBSERVATION :
+
+ARM 1 : no safety gate (hacker) :
+
+Humne payload me bheja: crash_at: "after_provider".
+
+Lekin environment variable RELAY_TEST_HOOKS nahi diya (unset rakha).
+
+Result:
+
+```
+worker_exit = alive, alive
+status = succeeded
+attempts = 1
+```
+
+Worker ne crash hook ko poori tarah ignore kiya! Worker zinda raha aur job normal complete ho gayi. Is test ne 100% prove kar diya ki agar koi production me ye payload bhejega, toh Relay crash nahi hoga.
+
+
+ARM 2 : CRASH (Authorized) :
+
+Sirf tab jab humne explicitly terminal se worker ko diya: --env RELAY_TEST_HOOKS=1.
+
+Tab worker ne pehchaan liya: "Ye ek authorized testing run hai(koi user ya hacker nhi), ab mujhe hook allow karna hai."
+
+Aur tab worker ne crash karke Arm ko measure karwaya.
+
+-> Saath hi, current_attempts == 1 ke gate ne ye ensure kiya ki sirf pehla worker mare. Agar ye check na hota, toh jab Reaper job ko doosre worker ko deta, toh doosra worker bhi mar jata, aur poori queue hamesha ke liye deadlock ho jaati!
+
+```
+worker_exit=alive,1
+wait_s=32.953s
+ledger_delta=2
+provider_status_counts={"200": 2}
+totals terminal={"succeeded": 1} sum_attempts=2 sum_executions=2 sum_llm_calls_rows=1
+llm_calls_gens=[2]
+reclaims=1
+exec_gaps_s=['30.310']
+```
+
+worker_exit=alive,1: Worker 1 ko provider ka 200 OK mila aur usne theek wahi par os._exit(1) karke jaan de di!
+
+llm_calls_gens=[2] (Generation 1 Missing!):
+
+Worker 1 ne provider ko call kiya tha, par DB me likhne se pehle mar gaya. Isliye llm_calls table me Generation 1 ka koi wajood hi nahi hai!
+
+ledger_delta=2: Provider ke ledger me 2 calls record hui hain! Provider ne 2 baar bill banaya!
+
+reclaims=1 & exec_gaps_s=['30.310']:
+
+Worker 1 ke marne ke baad job 30 second tak DB me 'running' padi rahi.
+
+30.3 second par Reaper ne dekha worker mar chuka hai, aur job ko reclaim kiya.
+
+Worker 0 ne job ko Generation 2 me uthaya, dubara provider ko call ki, aur job ko succeeded mark kiya.
+
+
+The Proof of D-34: Pehli call ka answer aur token data humesha ke liye gayab ho gaya, lekin provider ne uska bill zaroor kaat liya. (hacker se to bacha liya lekin authorized mistake nhi bacha paya)
+
+
+
+CONCLUSION :
+
+External side-effects (jaise third-party LLM calls ya card payments) aur local database commits ke beech hamesha ek crash window hoti hai. Local database kabhi guarantee nahi de sakta ki bahar ka API call sirf ek baar hua hai. Is problem ko mathematically handle karne ke liye external API ka Idempotency Key support karna zaroori hota hai (Month 3).
+
+- Relay ke paas koi rasta nahi hai ye jaan-ne ka ki call ho chuki thi! Iska ek hi ilaj hota hai: Provider (Google/OpenAI) ko call karte waqt ek Unique Key bhejna (Idempotency-Key: job-42), taaki agar worker mar bhi jaye aur doosra worker dubara wahi call kare, toh Google bole: "Arre ye toh wahi call hai, main doosri baar paise nahi kaatunga, purana answer hi le le!"
+
+
+
+TEST 5 : 
+
+-> Week 6 ke saare experiments ke baad hume timeouts ka aapas me rishta ek exact mathematical equation me document karna tha — bina kisi assumption ya prediction ke, sirf measured numbers ke hisaab se.
+
+
+```
+Lease Timeout : 30.0s : Itne time tak heartbeat na aaye toh Reaper job chura lega
+
+Heartbeat Interval : 10.0s : Worker har 10s me lease refresh bhejta hai
+
+Reaper Poll : 2.0s : Reaper har 2 second me stale leases check karta hai
+
+Default Provider Timeout : 30.0s : Per-call HTTP timeout
+
+s3_async Span : 40.617s : 40s slow call async hone par succeed hui (heartbeats=4)
+
+s3_sync First Reclaim : 30.2s : Sync call me exactly lease timeout (30.2s) pe job chori hui
+
+s4_crash Recovery Gap : 30.310s : Worker crash ke baad recovery time exactly lease bounded tha
+```
+
+---
+
+
+WEEK 6 - DAY 6
+
+

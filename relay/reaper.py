@@ -14,7 +14,7 @@ from relay.models import Job
 
 
 POLL_INTERVAL_SECONDS = 2.0
-CLAIM_TIMEOUT_SECONDS = 5.0
+CLAIM_TIMEOUT_SECONDS = 30.0
 REAPER_ID = f"reaper-{os.getpid()}"
 SHUTDOWN_REQUESTED = False
 

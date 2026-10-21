@@ -176,6 +176,12 @@ async def handle_llm_completion(payload: dict) -> tuple[str, int, int]:
         params["delay"] = payload["delay"]
     if "fake_retry_after" in payload:
         params["fake_retry_after"] = payload["fake_retry_after"]
+    if "fake_storm_s" in payload:
+        params["fake_storm_s"] = payload["fake_storm_s"]
+    if "fake_delay" in payload:
+        params["fake_delay"] = payload["fake_delay"]
+    if "fake_client" in payload:
+        params["fake_client"] = payload["fake_client"]
     if "fail_pct" in payload:
         params["fail_pct"] = payload["fail_pct"]
 
@@ -183,6 +189,17 @@ async def handle_llm_completion(payload: dict) -> tuple[str, int, int]:
     job_id = payload.get("job_id", 0)
     claim_gen = payload.get("claim_generation")
     print(f"[{WORKER_ID}] [llm] job_id={job_id} tokens_in={tokens_in} tokens_out={tokens_out}", flush=True)
+
+    if (
+        os.getenv("RELAY_TEST_HOOKS") == "1"
+        and payload.get("crash_at") == "after_provider"
+        and payload.get("current_attempts", 1) == 1
+    ):
+        print(
+            f"[{WORKER_ID}] [crash_hook] Crashing via os._exit(1) after provider response (job_id={job_id}, attempt=1)",
+            flush=True,
+        )
+        os._exit(1)
 
     try:
         await record_llm_call(
@@ -401,6 +418,7 @@ async def run_worker() -> None:
 
                 payload["job_id"] = job_id
                 payload["claim_generation"] = current_generation
+                payload["current_attempts"] = current_attempts
                 await handler(payload)
                 print(f"[{WORKER_ID}] Finished execution for job_id={job_id} worker_id={WORKER_ID} claim_generation={current_generation}.", flush=True)
                 new_status = "succeeded"
