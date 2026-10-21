@@ -45,6 +45,9 @@ async def complete(request: Request):
             "tokens_out": tokens_out,
         }
 
+    elif mode == "badjson":
+        return Response(content="not json", media_type="text/plain", status_code=200)
+
     elif mode == "storm":
         global storm_start_time
         now = time.monotonic()

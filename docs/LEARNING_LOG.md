@@ -8259,3 +8259,414 @@ s4_crash Recovery Gap : 30.310s : Worker crash ke baad recovery time exactly lea
 WEEK 6 - DAY 6
 
 
+```
+BASICS
+
+SUPERVISOR DOES WHAT?
+
+-> dekhega ki uska koi bhi child process(worker, reaper and dispatcher) mare, toh usko restart krna supervisor ka kaam.
+
+
+- Agar ek worker me koi fatal bug hai ya poison pill hai, toh socho kya hoga :
+
+Worker chalu hua -> 0.1 second me crash ho gaya -> Supervisor ne turant restart kiya -> Fir 0.1 second me crash ho gaya -> Fir restart...
+Isse kehte hain Crash Loop (Restart Storm). Ek second me 50 baar process restart hone lagega, CPU 100% ho jayega, aur logs se hard disk bhar jayegi!
+
+Is storm ko rokne ke liye supervisor Backoff lagata hai :
+
+"Pehli baar mara? Thoda ruko (1 second sleep), fir chalu karunga."
+"Doosri baar bhi turant mara? Ab 2 second ruko."
+"Teesri baar bhi turant mara? Ab 4 second ruko (1s -> 2s -> 4s -> 8s... max 30s)."
+
+
+Par Supervisor ko kaise pata chalega ki process "theek" ho gaya?
+
+Iske liye supervisor ne ek rule banaya: 5-Second Uptime Rule
+
+Uptime = Process start hone se lekar uske marne tak ka waqt.
+
+Agar Uptime < 5 second hai: Supervisor sochega: "Arey! Yeh toh aate hi mar gaya! Matlab abhi bhi crash loop chal raha hai. Penalty badhao (backoff double karo)!"
+
+Agar Uptime ≥ 5 second hai: Supervisor sochega: "Yeh process 5 second se zyada chal gaya! Matlab problem temporary thi, ab system theek ho gaya hai. Toh saari penalty hata do aur backoff ko wapas RESET karke 1 second kar do!"
+
+
+DAY 5 FINDING (ARCHITECTURE HOLE):
+
+-> humare relay me abhi do specific chize he jisse attempts infinite chal sakte he :
+
+1. crash-after-provider : 
+
+- jab provider se response 200 mila lekin DB me commit hone ke just pehle worker crash.
+
+- DB ki claim uery and reaper me nhi likha ki attempts should be smaller than MAX_ATTEMPTS.
+
+- worker claim ke wat sirf job status pending and next_attempt_at dekhta he, and usko update krke sirf atempt+1 and status running set krta he, attempts <= max_attempts ek exception block me he!! (except block me isliye bcz agar error aye to hi attempts badhane he har ek particular job keliye, toh isko normal worker flow me nhi likha jata).
+
+- except ke pehle hi mar ya worker, toh ab status running hi reh jayegi, provider ne already paise kaat diye he, and reaper usko infinite times pending krta rhega.
+
+
+2. sync-blocking-call :
+
+- ek job 40sec locking call le rhi he, toh har worker usko chalayega, reaper 30 sec me wapis daal dega, and wese hi har worker chalate rhenge, jisse mark hamesha running reh jayega and provider bhi bar bar same call leta rhega, attempts infinite.
+
+- since except block chalega hi nhi, to max attempt b check nhi hoga, reaper job ko khatm hone se Pehle hi bar bar 30sec pr pending krega, jisse provider ko bar bar call jayegi jab ki previous worker bhi zinda he, and conflict on mark hota rhega jisse status hamesha running hi rha.
+```
+
+
+
+`````
+MORE PROBLEMS EXISTING TODAY IN RELAY FOR INFINITE LOOPS (FIX BAAD ME):
+
+
+Situation 1: OOM Killer (Out Of Memory) ya Forced Kill (SIGKILL)
+Scene:
+
+Maan lo worker ke paas koi bohot bada LLM prompt ya 50MB ka data payload aaya. Worker ne usko memory me load kiya aur server ki RAM 100% bhar gayi.
+
+Kya hota hai: Operating System (Linux/Windows) turant OOM Killer bhejta hai aur process ko seedha SIGKILL (kill -9) maar deta hai.
+Worker ke sath kya hua: os._exit(1) ki tarah process ek millisecond me gayab! Python ka try...except block dekhne tak ka mauka nahi milta.
+DB me kya hua: Status running reh gaya. 30s baad Reaper ne usko wapas pending kar diya.
+Natija: Naya worker aayega, wahi 50MB ka payload uthayega, fir OOM se marega, Reaper fir pending karega... Ye tab tak chalega jab tak server crash na ho jaye!
+
+agar koi user API pe 50MB ka payload bhejega, toh Relay ka payload middleware usse gate pe hi 413 Payload Too Large dekar bhaga dega.
+
+Lekin OOM (Out Of Memory) sirf payload se nahi hota! Dekho OOM aur kahan se aa sakta hai:
+
+Response ka bada hona: User ne prompt bheja sirf 20 words ka: "Give me 100,000 lines of fake JSON data". Payload chhota tha (middleware ne aane diya), lekin LLM provider ne jo response bheja wo 100MB ka tha! Jab worker ne usko memory me parse kiya — BOOM! OOM!
+Memory Leak: Worker ke kisi loop me koi object memory se delete nahi hua aur RAM dheere-dheere bhar gayi.
+Server par doosre processes: Server par Postgres ya kisi aur process ne achanak saari RAM le li, aur Relay ke worker ke paas sirf 10MB RAM bachi — OS ne worker ko maar diya!
+
+Toh middleware input darwaze par pehra deta hai, lekin process ke andar hone wale memory blast ko nahi rok sakta.
+
+
+
+Situation 2: DB Connection Cut ho jana (Network Glitch during Error Handling)
+Scene:
+
+Worker handler chala raha tha, tabhi Postgres database ka connection 2 second ke liye disconnect ho gaya (jaise Docker container restart ya network spike).
+
+Worker ke sath kya hua: Code except Exception: me ghusa! Usne dekha current_attempts = 3. Worker ne socha: "Main ab isko dead_letter mark karunga!"
+Lekin twist: Line 503 pe jab worker DB ko bolne gaya:
+sql
+UPDATE jobs SET status = 'dead_letter' WHERE id = ...;
+Toh DB connection band tha! Update query fail ho gayi!
+DB me kya hua: Kyunki update query chali hi nahi, database me status abhi bhi purana wala hi reh gaya (running).
+Reaper kya karega: 30s baad jab DB wapas aayega, Reaper dekhega: "Arey ye job 30s se running hai, chalo isko pending kar deta hoon!"
+Natija: Worker ne dead_letter karne ki koshish ki thi, par DB tak baat pahunchi hi nahi, aur Reaper ne usse wapas zinda kar diya!
+
+
+
+Situation 3: Outbox Dispatcher Table (P-35 Bug)
+
+Ye toh worker se bhi bada loophole hai jo tumhare relay/dispatcher.py me maujood hai!
+
+Scene:
+
+Job successfully complete ho gayi aur usne ek webhook outbox me daal diya (e.g. customer ko email ya notification bhejna).
+
+Lekin: Agar customer ka receiver server (sink) down hai:
+Twist: outbox table ke andar MAX_ATTEMPTS ka koi column hi nahi hai!
+Natija: Dispatcher har 1 second me us failed webhook ko retry karta rehta hai — 100 baar, 1000 baar, 10,000 baar... FOREVER! Wo kabhi dead letter me jaata hi nahi kyunki wahan bound ka koi concept hi nahi banaya gaya.
+
+
+
+Situation 4: Third-Party C-Extension Crash (Segmentation Fault)
+Scene:
+
+Python me hum jo libraries use karte hain (jaise database ke liye asyncpg ya SSL ke liye C-bindings), agar unke andar koi memory corruption ya Segmentation Fault (Core Dump) ho jaye:
+
+Python ka except Exception: sirf Python level ke exceptions ko catch karta hai.
+C-level ka crash (Segfault) seedha process ko terminate kar deta hai bina kisi Python traceback ke.
+Natija wahi: Reaper 30s baad wapas pending karega aur agla worker dobara segfault karega.
+
+
+
+-> Worker ek kamzor insaan hai — wo mar sakta hai, freeze ho sakta hai, memory khatam ho sakti hai. Jab tak Reaper (jo ki bahar khada hua chowkidar hai) DB me ye check nahi karega:
+"Agar kisi job ke attempts >= 3 ho chuke hain, toh main usko pending nahi, seedha dead_letter karunga!"
+Tab tak aise kisi bhi crash me jobs hamesha infinite loop me phasti rahengi!
+`````
+
+
+
+TEST 1 : (P-61)
+
+-> LLM providers (Gemini, OpenAI, Anthropic wagera) HTTP level pe charge karte hain.
+
+Agar prompt gaya aur provider ne HTTP status 200 OK return kiya, toh provider ke billing ledger me wo call bill ho chuki hai.
+
+Lekin kai baar upstream proxy crash, streaming cut, ya gateway corruption ki wajah se response body JSON hone ke bajaye corrupted plain text aati hai (jaise "not json" ya HTML error page).
+
+Relay ki puraani khami (The Bug): 
+
+Jab worker r.json() call karta tha, toh Python me json.decoder.JSONDecodeError raise hota tha.
+
+Worker ke try...except block me ye generic exception ban jaata tha. 
+
+Worker sochta tha: "Oh, exception aaya hai, main isko retry karunga!"
+
+Result: Worker ne attempt 1 retry kiya, attempt 2 retry kiya, attempt 3 retry kiya! Teeno baar provider ne 200 OK diya aur 3 baar bill kiya, par teeno baar parse fail hua aur job aakhir me dead_letter ho gayi.
+
+Nuksan: Ek deterministic corrupted payload pe humne provider ko 3 guna paise de diye bina kisi output ke!
+
+
+EXECUTION :
+
+-> hum isko badjson_before fix and badjson_after fix dekhenge :
+
+fake_provider.py me badjson mode banaya, jisme response "not json", media type "text/plain", status_code = 200 ayega.
+
+FIX : providers.py me non-retryable exception banaya jab error type ho : ProviderResponseParseError. AND geminiprovider and fakeprovider me agar status 200 ho to try except lagaya check krne ki valid json he ya nahi, warna except ProviderResponseParseError kro.
+
+
+OBSERVATION :
+
+1. badjson_before fix :
+
+```
+run_id = w6d6_s1_badjson_before_20261021_170458_088919
+
+job id=1 status=dead_letter attempts=3 gen=3 executions=3
+
+last_error_class = JSONDecodeError
+ledger_delta = 3
+
+provider_status_counts = {"200": 3, "400": 0, "401": 0, "429": 0, "500": 0}
+
+llm_calls_rows = 0
+
+wait_s = 13.828s
+```
+
+-> Provider ne 3 baar 200 OK return kiya (provider_status_counts={"200": 3}). Provider ledger ne 3 calls count ki (ledger_delta=3). Relay ne 3 baar execute kiya aur 13.8 seconds tak backoff wait kiya. Aur aakhir me llm_calls_rows = 0 (kyunki bas json body parse hi nahi hui). Teen billed calls waste hui!
+
+
+2. badjson_after fix :
+
+```
+run_id = w6d6_s1_badjson_after_20261021_170838_981864
+
+job id=2 status=dead_letter attempts=1 gen=1 executions=1
+
+last_error_class = ProviderResponseParseError
+
+ledger_delta = 1
+
+provider_status_counts = {"200": 1, "400": 0, "401": 0, "429": 0, "500": 0}
+
+llm_calls_rows = 0
+
+wait_s = 2.657s
+```
+
+-> Fix ke baad jaise hi pehla 200 OK parse fail hua, worker ne dekha ki last_error_class = ProviderResponseParseError non-retryable hai (retryable = fasle). Job turant Attempt 1 pe hi dead_letter mark ho gayi! Provider calls: Sirf 1 (ledger_delta=1). Execution time 13.8s se girkar 2.6s ho gaya! Duplicate billing 100% band ho gayi!
+
+
+
+CONCLUSION :
+
+-> Provider ka HTTP 200 return karna is baat ki guarantee nahi hai ki response valid hai. Agar body unparseable hai, toh wo deterministic data format issue hai. Usko retry karne ka matlab hai provider ko free me duplicate paise dena. ProviderResponseParseError with retryable = False ne system ko duplicate billing se bachaya.
+
+-> har ek status_code esa chalega :
+
+```
+job id=3 fake_mode="ok"      -> status=succeeded   attempts=1  llm_calls_rows=1
+
+job id=4 fake_mode="400"     -> status=dead_letter attempts=1  last_error=ProviderBadRequestError
+
+job id=5 fake_mode="500"     -> status=dead_letter attempts=3  last_error=ProviderServerError
+
+job id=6 fake_mode="429"     -> status=dead_letter attempts=3  last_error=ProviderRateLimitedError
+
+job id=7 fake_mode="badjson" -> status=dead_letter attempts=1  last_error=ProviderResponseParseError
+```
+
+
+
+TEST 2 :
+
+-> Jab external paid API aati hai, toh agar koi developer bina soche-samjhe retry = True likh de, toh har retry par credit card se paise katte hain. Rate limits hit hoti hain. Duplicate responses create hote hain.
+
+Toh Step 2 ka maksad hai: Relay ke pure system me jitni bhi tarah ke failures ho sakte hain, unka ek pakka Kanoon (Rules & Cost Matrix) banana. Taaki koi bhi developer kal ko andaze se code na likhe.
+
+-> Distributed systems me agar aapke paas failure classification ka explicit formal matrix nahi hai, toh developers guess karte hain ki kya retry hona chahiye aur kya nahi. and galat choose krne se two cost ati he :
+
+1. (Retry on Non-Retryable): Duplicate provider billing + cascade rate limiting (e.g., badjson pe 3 calls).
+
+2. (No-Retry on Transient): Transient glitch (jaise momentary 500 ya 429) pe job sidha DLQ me mar jaati hai jabki 2 second baad wo succeed ho sakti thi.
+
+
+DECISION 1 :
+
+-> Worker ko kaise pata chale ki kaunsi error retry karni hai aur kaunsi nahi? Humare paas 3 options the:
+
+Option A (Status Code Table worker me rakhna) : 
+
+- Worker me ek dictionary bana do {400: False, 500: True}.
+
+- Kyu reject hua? Kyunki provider kal ko gRPC ho sakta hai, ya status 200 aane par bhi body corrupt ho sakti hai (badjson). Worker ko HTTP status codes se matlab nahi hona chahiye.
+
+Option B (Sab kuch retry karo, 3 attempts tak): Purana tareeka.
+
+- Kyu reject hua? Kyunki s1_badjson_before me humne dekha ki 200 non-JSON aane par usne 3 baar retry kiya aur 3 baar faltu paise katwaye!
+
+Option C (CHOSEN - Exception class pe retryable attribute): 
+
+- Provider module khud exception fekega (ProviderResponseParseError(retryable=False) ya ProviderServerError(retryable=True)). Worker bas getattr(exc, "retryable") dekhega.
+
+- Kyu chuna? Worker ko provider ke internal protocol ki chinta nahi karni padti.
+
+
+
+DECISION 2 :
+
+-> Hume ek formal table banana hai jisme system ke 12 failure modes ko unke measured real numbers ke saath darj karna hai.
+
+- Is table ka maksad: Har failure ka ek hisaab-kitaab ho ki company ke kitne paise lagte hain aur DB me kya bachta hai.
+
+```
+Failure Mode	Kya hua tha?	Retryable?	Provider Calls        Job ka End
+                                                 kitni hui?             State
+       ---------------------------------------------------------------------
+Healthy 200    Sab sahi chala	  No (Done)	     1 call	      succeeded
+
+400 Bad Request	 Prompt galat tha  False (DLQ in 1 att)	  1 call     dead_letter
+
+401/403 Auth	API key galat thi  False (DLQ in 1 att)	  1 call     dead_letter
+
+500 Server Error.  Provider        True(retry after 3     3 calls    dead_letter
+                  temporarily down        times)
+
+429 Rate Limit.	 Provider ne bola   True(retry with       3 calls    dead_letter
+                  retry after x sec       delay)
+
+Timeout(>35s).	Network hang ho gaya  True (Retry)	3 calls	     dead_letter
+
+badjson(200 OK).  Response parse      False (P-61 fix)	 1 call	     dead_letter
+                    nhi hua.
+
+Sync Blocking Call. 40s call ne       Unbounded	     2-12 calls     Stuck in running
+                     lease tod di                 (Duplicate bill!)
+
+Crash after Provider.  Jawab aane      Unbounded    1 call billed   Stuck in running
+                      ke baad worker mara             per crash 
+
+ConnectError.    DNS / Internet band hai    True      3 calls	      dead_letter
+
+ReadError(Post-send).	Prompt gaya,       True       Not Run(dangerous)    Unknown
+                        cut ho gaya
+
+Unknown Exception.    code me achank bug.  default False   1 call        dead_letter
+``` 
+
+
+
+TEST 3 :
+
+-> PROBLEM 1 :
+
+Har software engineer sochta hai ki: "Maine code me MAX_ATTEMPTS = 3 likh diya hai, toh koi bhi job 3 baar se zyada nahi chalegi."
+
+Lekin asal me worker.py me ye check sirf Python ke except Exception: block ke andar laga tha. Agar koi aisi job aaye jo process ko hi seedha crash kar de (jaise os._exit(1), OOM killer, ya segfault) — toh process mar jaata hai aur Python ka except block kabhi chalta hi nahi.
+
+DB me wo job running status me atki reh jaati hai. 30s baad Reaper usko wapas pending kar deta hai. Naya worker usse dobara claim karta hai aur fir crash hota hai.
+
+Hume ye test karke prove karna tha: Kya application-level ka MAX_ATTEMPTS = 3 process-level ke crash ko rok sakta hai, ya attempts 3 se aage infinite nikal jayenge?
+
+
+EXECUTION :
+
+1. Poison Pill Jobs daali: Humne disposable database relay_w6d6 me 3 aisi jobs insert keen jisme hook tha:
+
+```
+{"seconds": 1, "crash_at": "before_commit"}
+```
+
+(Matlab: Worker 1 second chalega aur DB commit se theek pehle os._exit(1) se process ko kill kar dega). 120 Seconds ka Test Run: Supervisor aur Reaper ko on karke is test ko poore 120 seconds tak chalaya (labs/w6d6_crashloop_run.py).
+
+
+OBSERVATION :
+
+120 seconds ke baad database me teeno jobs ka ye record nikla:
+
+```
+job id=8  status=running  attempts=4  gen=4  executions=4  reclaims=3
+
+job id=9  status=running  attempts=4  gen=4  executions=4  reclaims=3
+
+job id=10 status=running  attempts=4  gen=4  executions=4  reclaims=3
+```
+
+MEANING :
+
+MAX_ATTEMPTS = 3 toot gaya: Har job ka attempts = 4 ho chuka tha!
+
+Reaper ka Loop: Har job ko Reaper ne 3 baar chhudaya (reclaims=3) aur har baar status pending banaya.
+
+Dead Letter Kabhi Nahi Hua: Job kabhi dead_letter me gayi hi nahi! Kyunki dead_letter karne wala code Python ke except me tha jo chala hi nahi.
+
+Agar hum test band na karte: Toh ye attempts 4, 5, 6, 7... infinite chalta rehta!
+
+
+CONCLUSION (FIX BAAD ME AYEGA):
+
+Application-level retries process death ko nahi rok sakte: Agar process hi mar gaya, toh application ka code retry limit enforce nahi kar sakta.
+
+Reaper ko power deni padegi: Job ko dead_letter karne ka check sirf worker ke haath me nahi hona chahiye. Reaper ke haath me bhi hona chahiye: "Agar kisi job ke attempts >= 3 ho chuke hain, toh Reaper usko pending nahi, seedha dead_letter mark kare!"
+
+
+
+-> PROBLEM 2 : 
+
+Supervisor ka seedha rule kya hai?
+
+Agar worker 5s se jaldi mar jaye (< 5s): Supervisor sochta hai: "Arey crash ho gaya! Ruko, penalty badhao (1s -> 2s -> 4s -> 8s sleep)!"
+
+Agar worker 5s se zyada zinda rahe (≥ 5s): Supervisor sochta hai: "Arre wah! Process 5 second se zyada chal gaya! Matlab sab theek ho gaya hai, saari penalty hata do aur backoff ko wapas RESET karke 1s kar do!"
+
+- Hume ye check karna tha: Kya worker ka 5 second zinda rehna is baat ka sachha saboot hai ki system healthy hai? Ya fir worker sirf bekar (idle) baith kar supervisor ko bewakoof bana raha hai?
+
+
+EXECUTION :
+
+-> Wahi 120-second ka poison pill test chalaya aur supervisor ke log file me se har restart ke baad ka uptimes_s (worker kitni der zinda raha) aur backoffs_s (supervisor ne agle restart se pehle kitna sleep kiya) record kiya.
+
+
+OBSERVATION :
+
+```
+uptimes_s  = ['2.08', '1.25', '1.34', '21.52', '3.16', '1.16', '23.53', '5.25', '1.19', '23.50', '5.31', '3.28']
+
+backoffs_s = ['1.00', '2.00', '4.00', '1.00', '2.00', '1.00', '1.00']
+```
+
+MEANING :
+
+1. Pehle 3 Crash (Normal Backoff):
+
+Worker 1 mara (Uptime: 2.08s < 5s) -> Backoff: 1.00s
+Worker 2 mara (Uptime: 1.25s < 5s) -> Backoff badhkar: 2.00s
+Worker 3 mara (Uptime: 1.34s < 5s) -> Backoff badhkar: 4.00s (Yahan tak supervisor bilkul sahi kaam kar raha tha — penalty badha raha tha).
+
+2. The Trap (Worker 4 ka Idle Wait):
+
+Ab teeno jobs DB me running the.
+Worker 4 start hua. Uske paas koi kaam nahi tha, toh wo Reaper ke 30s lease timeout ka intezaar karte hue 21.52 seconds tak zinda baitha raha!
+21.52s ke baad Reaper ne job release ki, Worker 4 ne uthayi aur crash ho gaya.
+
+3. Supervisor ka Dhokha (Reset!):
+
+Supervisor ne dekha: Worker 4 ka uptime = 21.52s tha, jo ki 5s se bada hai!
+Supervisor ne socha: "Arre wah! Worker toh 21 second chala, system healthy ho gaya!"
+Supervisor ne backoff ko 8.00s karne ke bajaye wapas 1.00s par RESET kar diya!
+
+4. Wahi cycle baar-baar chali: Logs me dekho: 1.00 -> 2.00 -> 4.00 -> RESET to 1.00 -> 2.00 -> RESET to 1.00!
+
+
+CONCLUSION (FIX BAAD ME AYEGA):
+
+Uptime is NOT equal to Health: Worker ka zinda rehna is baat ki guarantee nahi hai ki wo theek hai. Wo sirf bekar baith kar agle poison pill ke aane ka intezaar kar raha tha.
+
+Supervisor ka Reset Logic galat hai: Supervisor ko backoff tabhi reset karna chahiye jab worker ne sach me koi job successfully complete (succeeded) ki ho (forward progress). Sirf bekar zinda rehne par backoff reset karna ek dangerous flaw hai.
+
+
+---

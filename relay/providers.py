@@ -31,6 +31,14 @@ class ProviderAuthError(ProviderError):
         super().__init__(message, status_code=401)
 
 
+class ProviderResponseParseError(ProviderError):
+    """Raised when provider returns HTTP 200 but the response body cannot be parsed as expected JSON (P-61). Non-retryable."""
+    retryable = False
+
+    def __init__(self, message: str):
+        super().__init__(message, status_code=200)
+
+
 class BaseProvider:
     async def complete(self, prompt: str, **kwargs) -> Tuple[str, int, int]:
         raise NotImplementedError
@@ -69,7 +77,10 @@ class FakeProvider(BaseProvider):
             with httpx.Client(timeout=timeout) as client:
                 r = client.post(f"{self.base_url}/v1/complete", headers=headers, json=payload)
                 if r.status_code == 200:
-                    data = r.json()
+                    try:
+                        data = r.json()
+                    except Exception as exc:
+                        raise ProviderResponseParseError(f"Provider 200 parse error: {exc}") from exc
                     return data["text"], int(data["tokens_in"]), int(data["tokens_out"])
                 elif r.status_code == 429:
                     raise ProviderRateLimitedError(f"Provider 429: {r.text}", retry_after=r.headers.get("retry-after"))
@@ -85,7 +96,10 @@ class FakeProvider(BaseProvider):
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(f"{self.base_url}/v1/complete", headers=headers, json=payload)
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = r.json()
+                except Exception as exc:
+                    raise ProviderResponseParseError(f"Provider 200 parse error: {exc}") from exc
                 return data["text"], int(data["tokens_in"]), int(data["tokens_out"])
             elif r.status_code == 429:
                 raise ProviderRateLimitedError(f"Provider 429: {r.text}", retry_after=r.headers.get("retry-after"))
@@ -123,7 +137,10 @@ class GeminiProvider(BaseProvider):
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(url, headers=headers, json=payload)
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = r.json()
+                except Exception as exc:
+                    raise ProviderResponseParseError(f"Gemini 200 parse error: {exc}") from exc
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 usage = data.get("usageMetadata", {})
                 tokens_in = int(usage.get("promptTokenCount", 0))

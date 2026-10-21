@@ -134,6 +134,7 @@ from relay.providers import (
     ProviderError,
     ProviderBadRequestError,
     ProviderAuthError,
+    ProviderResponseParseError,
     ProviderServerError,
     ProviderRateLimitedError,
 )
@@ -424,7 +425,10 @@ async def run_worker() -> None:
                 new_status = "succeeded"
             except Exception as exc:
                 error_msg = f"{type(exc).__name__}: {exc}"
-                is_non_retryable = isinstance(exc, (ProviderBadRequestError, ProviderAuthError))
+                is_non_retryable = (
+                    isinstance(exc, (ProviderBadRequestError, ProviderAuthError, ProviderResponseParseError))
+                    or getattr(exc, "retryable", True) is False
+                )
                 if is_non_retryable:
                     new_status = "dead_letter"
                     next_attempt_at = None
